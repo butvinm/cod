@@ -3,25 +3,29 @@
 //! It proves that input reaches the OS web view through AppKit without touching the user's keyboard or mouse: synthetic NSEvents are sent to the app's own NSWindow with `sendEvent:`, never posted to the system event stream.
 //! Page state is read back with JavaScript and logged, and WKWebView snapshots are saved as PNG files under /tmp/cod-spike.
 
-use std::{cell::Cell, rc::Rc, sync::Mutex, time::Duration};
+use std::{cell::Cell, path::PathBuf, rc::Rc, sync::Mutex, time::Duration};
 
 use anyhow::{Context as _, Result, bail};
+use command_palette::CommandPalette;
+use editor::Editor;
+use file_finder::FileFinder;
 use futures::channel::oneshot;
-use gpui::{AsyncWindowContext, Context, Entity, WeakEntity, Window};
-use objc2::rc::Retained;
+use gpui::{AsyncWindowContext, Context, Entity, Focusable as _, WeakEntity, Window};
+use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
-    NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags, NSEventType, NSImage,
-    NSView, NSWindow,
+    NSApplication, NSBitmapImageFileType, NSBitmapImageRep, NSEvent, NSEventModifierFlags,
+    NSEventType, NSImage, NSPasteboard, NSPasteboardItem, NSPasteboardTypeString,
+    NSPasteboardWriting, NSView, NSWindow,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGDisplayBounds, CGEvent, CGEventField, CGMainDisplayID, CGScrollEventUnit,
 };
-use objc2_foundation::{NSDictionary, NSError, NSString};
-use workspace::Workspace;
+use objc2_foundation::{NSArray, NSData, NSDictionary, NSError, NSString};
+use workspace::{OpenOptions, SplitDirection, Workspace};
 use wry::WebViewExtMacOS as _;
 
-use crate::web_view_item::{NativeWebView, WebView, open_url};
+use crate::web_view_item::{NativeWebView, WebView, open_url, open_url_in_split};
 
 const LOCAL_PAGE_URL: &str = "file:///tmp/cod-spike/textarea.html";
 const SNAPSHOT_DIRECTORY: &str = "/tmp/cod-spike";
@@ -292,6 +296,17 @@ fn point_in_window(view: &NSView, x: f64, y: f64) -> CGPoint {
 fn click(native: &NativeWebView, target: &Target) -> Result<()> {
     let (view, window) = native_window(native)?;
     let location = point_in_window(&view, target.x, target.y);
+    log::info!(
+        "spike driver: clicking {:?} at page ({:.0}, {:.0})",
+        target.label,
+        target.x,
+        target.y
+    );
+    click_at(&window, location)
+}
+
+/// Clicks a point in the window's base coordinates, through the window like AppKit does for a real click.
+fn click_at(window: &NSWindow, location: CGPoint) -> Result<()> {
     for event_type in [NSEventType::LeftMouseDown, NSEventType::LeftMouseUp] {
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
             event_type,
@@ -315,10 +330,7 @@ fn click(native: &NativeWebView, target: &Target) -> Result<()> {
         })
         .map(|view| view.class().name().to_string_lossy().into_owned());
     log::info!(
-        "spike driver: clicked {:?} at page ({:.0}, {:.0}) = window ({:.0}, {:.0}); key_window={} hit_view={hit_view:?} first_responder={:?}",
-        target.label,
-        target.x,
-        target.y,
+        "spike driver: clicked window ({:.0}, {:.0}); key_window={} hit_view={hit_view:?} first_responder={:?}",
         location.x,
         location.y,
         window.isKeyWindow(),
@@ -397,6 +409,11 @@ fn scroll(native: &NativeWebView, delta_y: i32, route: ScrollRoute) -> Result<()
 
 fn type_text(native: &NativeWebView, text: &str) -> Result<()> {
     let (_, window) = native_window(native)?;
+    type_into(&window, text)
+}
+
+/// Sends plain key presses through the window, which hands them to its first responder.
+fn type_into(window: &NSWindow, text: &str) -> Result<()> {
     for character in text.chars() {
         let characters = NSString::from_str(&character.to_string());
         for event_type in [NSEventType::KeyDown, NSEventType::KeyUp] {
@@ -525,4 +542,392 @@ fn save_png(image: &NSImage, path: &str) -> Result<()> {
     .context("no PNG data")?;
     std::fs::write(path, png.to_vec()).with_context(|| format!("writing {path}"))?;
     Ok(())
+}
+
+// Check 3 (COD_SPIKE_DRIVE=keys): keys and focus between an editor and the page.
+
+const SAMPLE_FILE: &str = "/tmp/cod-spike/sample/README.md";
+const EDITOR_TEXT: &str = "cod typed this ";
+const ESCAPE: &str = "\u{1b}";
+const KEY_CODE_ESCAPE: u16 = 53;
+
+const SELECT_FIRST_WORD_SCRIPT: &str = r#"(() => {
+  const field = document.getElementById('notes');
+  field.setSelectionRange(0, 5);
+  return JSON.stringify(field.value.slice(field.selectionStart, field.selectionEnd));
+})()"#;
+
+const CARET_TO_END_SCRIPT: &str = r#"(() => {
+  const field = document.getElementById('notes');
+  field.setSelectionRange(field.value.length, field.value.length);
+  return JSON.stringify(field.value.length);
+})()"#;
+
+const SELECTION_SCRIPT: &str = r#"(() => {
+  const field = document.getElementById('notes');
+  return JSON.stringify(field.selectionStart + '..' + field.selectionEnd + ' of ' + field.value.length);
+})()"#;
+
+/// With COD_SPIKE_SHOTS=1 the driver pauses until someone outside the app saves a screenshot of the window to the named file (screencapture -l <window number>), for at most 90 seconds.
+async fn window_shot(window: &NSWindow, name: &str, cx: &mut AsyncWindowContext) {
+    if !std::env::var("COD_SPIKE_SHOTS").is_ok_and(|value| value == "1") {
+        return;
+    }
+    let path = format!("{SNAPSHOT_DIRECTORY}/{name}");
+    log::info!(
+        "spike driver: SHOT window={} path={path}",
+        window.windowNumber()
+    );
+    for _ in 0..180 {
+        if std::path::Path::new(&path).exists() {
+            sleep_millis(cx, 500).await;
+            log::info!("spike driver: SHOT taken {path}");
+            return;
+        }
+        sleep_millis(cx, 500).await;
+    }
+    log::warn!("spike driver: SHOT not taken {path}");
+}
+
+async fn sleep_millis(cx: &mut AsyncWindowContext, millis: u64) {
+    cx.background_executor()
+        .timer(Duration::from_millis(millis))
+        .await;
+}
+
+pub(crate) fn start_keys(url: String, window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.spawn_in(window, async move |workspace, cx| {
+        match run_keys(workspace, url, cx).await {
+            Ok(()) => log::info!("spike driver: keys done"),
+            Err(error) => log::error!("spike driver: keys: {error:#}"),
+        }
+    })
+    .detach();
+}
+
+/// Logs where GPUI focus is, which modal is open and AppKit's first responder.
+struct Probe {
+    workspace: WeakEntity<Workspace>,
+    page: WeakEntity<WebView>,
+    editor: Entity<Editor>,
+    window: Retained<NSWindow>,
+}
+
+impl Probe {
+    fn log(&self, cx: &mut AsyncWindowContext, label: &str) -> Result<()> {
+        let line = self.workspace.update_in(cx, |workspace, window, cx| {
+            let page = self
+                .page
+                .upgrade()
+                .map(|page| page.read(cx).focus_handle(cx).is_focused(window));
+            let editor = self
+                .editor
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx);
+            let file_finder = workspace.active_modal::<FileFinder>(cx).is_some();
+            let palette = workspace.active_modal::<CommandPalette>(cx).is_some();
+            let pages = workspace.items_of_type::<WebView>(cx).count();
+            format!(
+                "gpui_focus page={page:?} editor={editor}; modal file_finder={file_finder} command_palette={palette}; web_view_items={pages}"
+            )
+        })?;
+        log::info!(
+            "spike driver: {label}: {line}; first_responder={:?}",
+            first_responder_name(&self.window)
+        );
+        Ok(())
+    }
+
+    fn log_editor_line(&self, cx: &mut AsyncWindowContext, label: &str) -> Result<()> {
+        let text = cx.update(|_, cx| self.editor.read(cx).text(cx))?;
+        let line = text.lines().find(|line| line.contains(EDITOR_TEXT.trim()));
+        log::info!("spike driver: {label}: editor buffer line with the typed text: {line:?}");
+        Ok(())
+    }
+}
+
+async fn run_keys(
+    workspace: WeakEntity<Workspace>,
+    url: String,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let open = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_abs_path(
+            PathBuf::from(SAMPLE_FILE),
+            OpenOptions::default(),
+            window,
+            cx,
+        )
+    })?;
+    let item = open.await?;
+    let editor = cx
+        .update(|_, cx| item.act_as::<Editor>(cx))?
+        .context("the sample file did not open in an editor")?;
+    let page = workspace.update_in(cx, |workspace, window, cx| {
+        open_url_in_split(workspace, url, SplitDirection::Right, window, cx)
+    })??;
+    let native = wait_for_load(&page, cx).await?;
+    sleep(cx, 2).await;
+    let (native_view, window) = native_window(&native)?;
+    let probe = Probe {
+        workspace: workspace.clone(),
+        page: page.downgrade(),
+        editor: editor.clone(),
+        window: window.clone(),
+    };
+    probe.log(cx, "page opened in a split")?;
+
+    // AC1: a click in the page moves GPUI focus to the item.
+    cx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        handle.focus(window, cx);
+    })?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC1 before clicking the page (editor focused first)")?;
+    let field = locate(&native, TEXT_FIELD_SCRIPT)
+        .await?
+        .context("no textarea on the page")?;
+    click(&native, &field)?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC1 after clicking the page")?;
+    type_into(&window, "hello page")?;
+    sleep(cx, 1).await;
+    log_state(&native, "AC1 page after typing").await?;
+    probe.log(cx, "AC1 after typing")?;
+    window_shot(&window, "t3-page-next-to-editor.png", cx).await;
+
+    // AC2: a click into the editor's text takes the keys back.
+    let bounds = cx
+        .update(|_, cx| editor.read(cx).last_bounds().copied())?
+        .context("the editor has not been laid out")?;
+    let content_view = window.contentView().context("no content view")?;
+    let point = point_in_window(
+        &content_view,
+        f64::from(bounds.origin.x) + 120.0,
+        f64::from(bounds.origin.y) + 30.0,
+    );
+    log::info!("spike driver: AC2 clicking the editor text, editor bounds {bounds:?}");
+    click_at(&window, point)?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC2 after clicking the editor")?;
+    type_into(&window, EDITOR_TEXT)?;
+    sleep(cx, 1).await;
+    probe.log_editor_line(cx, "AC2")?;
+    log_state(&native, "AC2 page after typing in the editor").await?;
+
+    // AC3: Zed shortcuts work in the editor.
+    send_shortcut(&window, "p", 35, NSEventModifierFlags::Command, "cmd-p")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC3 after cmd-p in the editor")?;
+    send_shortcut(&window, ESCAPE, KEY_CODE_ESCAPE, NSEventModifierFlags::empty(), "escape")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC3 after escape")?;
+
+    // AC5: edit shortcuts reach the page, Zed shortcuts still reach Zed.
+    let saved_pasteboard = save_pasteboard();
+    log::info!(
+        "spike driver: AC5 saved the user's pasteboard ({} items) to restore it afterwards",
+        saved_pasteboard.len()
+    );
+    let result = edit_shortcuts(&native, &window, &probe, cx).await;
+    restore_pasteboard(&saved_pasteboard);
+    log::info!("spike driver: AC5 restored the user's pasteboard");
+    result?;
+
+    send_shortcut(&window, "p", 35, NSEventModifierFlags::Command, "cmd-p")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC5 after cmd-p in the page")?;
+    log_visibility("AC5 page while the file finder is open", &native);
+    send_shortcut(&window, ESCAPE, KEY_CODE_ESCAPE, NSEventModifierFlags::empty(), "escape")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC5 after escape")?;
+    log_visibility("AC5 page after the file finder closed", &native);
+
+    // AC6: the command palette over a visible page.
+    send_shortcut(
+        &window,
+        "P",
+        35,
+        NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+        "cmd-shift-p",
+    )?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC6 after cmd-shift-p in the page")?;
+    log_visibility("AC6 page while the command palette is open", &native);
+    let shot = if std::env::var("COD_SPIKE_KEEP_PAGE_OVER_MODALS").is_ok_and(|value| value == "1") {
+        "t3-palette-over-page-unfixed.png"
+    } else {
+        "t3-palette-over-page.png"
+    };
+    window_shot(&window, shot, cx).await;
+    send_shortcut(&window, ESCAPE, KEY_CODE_ESCAPE, NSEventModifierFlags::empty(), "escape")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC6 after escape")?;
+    log_visibility("AC6 page after the command palette closed", &native);
+
+    // AC4: Cmd-W in the page closes the tab and removes the native view.
+    click(&native, &field)?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC4 before cmd-w")?;
+    log::info!(
+        "spike driver: AC4 native view superview before cmd-w: {:?}",
+        superview_name(&native_view)
+    );
+    drop(native);
+    drop(page);
+    send_shortcut(&window, "w", 13, NSEventModifierFlags::Command, "cmd-w")?;
+    sleep(cx, 2).await;
+    probe.log(cx, "AC4 after cmd-w")?;
+    log::info!(
+        "spike driver: AC4 native view superview after cmd-w: {:?}",
+        superview_name(&native_view)
+    );
+    probe.log_editor_line(cx, "AC4")?;
+    Ok(())
+}
+
+async fn edit_shortcuts(
+    native: &NativeWebView,
+    window: &NSWindow,
+    probe: &Probe,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    let field = locate(native, TEXT_FIELD_SCRIPT)
+        .await?
+        .context("no textarea on the page")?;
+    click(native, &field)?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC5 after clicking the page again")?;
+    log::info!(
+        "spike driver: AC5 selected {}",
+        evaluate(native, SELECT_FIRST_WORD_SCRIPT).await?
+    );
+    send_shortcut(window, "c", 8, NSEventModifierFlags::Command, "cmd-c")?;
+    sleep(cx, 1).await;
+    log::info!(
+        "spike driver: AC5 pasteboard after cmd-c: {:?}",
+        pasteboard_string()
+    );
+    evaluate(native, CARET_TO_END_SCRIPT).await?;
+    send_shortcut(window, "v", 9, NSEventModifierFlags::Command, "cmd-v")?;
+    sleep(cx, 1).await;
+    log_state(native, "AC5 page after cmd-v").await?;
+    send_shortcut(window, "a", 0, NSEventModifierFlags::Command, "cmd-a")?;
+    sleep(cx, 1).await;
+    log::info!(
+        "spike driver: AC5 selection after cmd-a: {}",
+        evaluate(native, SELECTION_SCRIPT).await?
+    );
+    probe.log(cx, "AC5 after the edit shortcuts")?;
+    Ok(())
+}
+
+/// Sends a key press the way AppKit routes it for the key window: first as a key equivalent through the view tree (where GPUI matches Zed's keymap), then through the main menu, and only then as keyDown to the first responder.
+/// The app runs in the background so it never takes the user's keyboard, which leaves AppKit without a key window; in that case the same order is followed by hand.
+fn send_shortcut(
+    window: &NSWindow,
+    characters: &str,
+    key_code: u16,
+    modifiers: NSEventModifierFlags,
+    label: &str,
+) -> Result<()> {
+    let mtm = MainThreadMarker::new().context("not on the main thread")?;
+    let app = NSApplication::sharedApplication(mtm);
+    let characters = NSString::from_str(characters);
+    let key_event = |event_type| {
+        NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            event_type,
+            CGPoint::ZERO,
+            modifiers,
+            0.0,
+            window.windowNumber(),
+            None,
+            &characters,
+            &characters,
+            false,
+            key_code,
+        )
+        .context("creating a key event")
+    };
+    let key_down = key_event(NSEventType::KeyDown)?;
+    let route = if window.isKeyWindow() {
+        app.sendEvent(&key_down);
+        "NSApp sendEvent"
+    } else {
+        let content_view = window.contentView().context("no content view")?;
+        if content_view.performKeyEquivalent(&key_down) {
+            "key equivalent, handled by the view tree"
+        } else if app
+            .mainMenu()
+            .is_some_and(|menu| menu.performKeyEquivalent(&key_down))
+        {
+            "key equivalent, handled by the main menu"
+        } else {
+            window.sendEvent(&key_down);
+            "keyDown to the first responder"
+        }
+    };
+    let key_up = key_event(NSEventType::KeyUp)?;
+    window.sendEvent(&key_up);
+    log::info!(
+        "spike driver: sent {label} ({route}); first_responder={:?}",
+        first_responder_name(window)
+    );
+    Ok(())
+}
+
+fn superview_name(view: &NSView) -> Option<String> {
+    // SAFETY: called on the main thread; the superview is only read for its class name.
+    unsafe { view.superview() }
+        .map(|view| view.class().name().to_string_lossy().into_owned())
+}
+
+type SavedPasteboard = Vec<Vec<(Retained<NSString>, Retained<NSData>)>>;
+
+/// The page's copy writes to the system pasteboard, so the driver keeps the user's content and puts it back.
+fn save_pasteboard() -> SavedPasteboard {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|item| {
+            item.types()
+                .iter()
+                .filter_map(|data_type| {
+                    let data = item.dataForType(&data_type)?;
+                    Some((data_type, data))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn restore_pasteboard(saved: &SavedPasteboard) {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    if saved.is_empty() {
+        return;
+    }
+    let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = saved
+        .iter()
+        .map(|entries| {
+            let item = NSPasteboardItem::new();
+            for (data_type, data) in entries {
+                item.setData_forType(data, data_type);
+            }
+            ProtocolObject::from_retained(item)
+        })
+        .collect();
+    pasteboard.writeObjects(&NSArray::from_retained_slice(&items));
+}
+
+fn pasteboard_string() -> Option<String> {
+    // SAFETY: NSPasteboardTypeString is a constant provided by AppKit.
+    let string_type = unsafe { NSPasteboardTypeString };
+    NSPasteboard::generalPasteboard()
+        .stringForType(string_type)
+        .map(|string| string.to_string())
 }

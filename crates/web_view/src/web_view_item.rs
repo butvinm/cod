@@ -10,10 +10,14 @@ use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
     SharedString, Subscription, Task, Window, actions, canvas,
 };
+use objc2::{msg_send, runtime::AnyObject};
 use ui::prelude::*;
 use util::ResultExt as _;
-use workspace::{Workspace, item::Item};
-use wry::dpi::{LogicalPosition, LogicalSize};
+use workspace::{ModalLayer, SplitDirection, Workspace, item::Item};
+use wry::{
+    WebViewExtMacOS as _,
+    dpi::{LogicalPosition, LogicalSize},
+};
 
 use crate::spike_driver;
 
@@ -22,6 +26,14 @@ actions!(
     [
         /// Opens COD_SPIKE_URL, or a public GitLab merge request, in a new web view tab.
         OpenSpikeUrl,
+        /// Cuts the page's selection.
+        Cut,
+        /// Copies the page's selection.
+        Copy,
+        /// Pastes into the page's focused field.
+        Paste,
+        /// Selects all in the page's focused field, or the whole page.
+        SelectAll,
     ]
 );
 
@@ -30,6 +42,10 @@ const DEFAULT_URL: &str = "https://gitlab.com/gitlab-org/gitlab-runner/-/merge_r
 /// WKWebView's default user agent lacks Safari's "Version/... Safari/..." suffix, and sites behind Cloudflare answer it with an interactive "Verify you are human" check.
 /// The engine is Safari's, so the spike sends Safari's user agent; a real version would read it from the system.
 const SAFARI_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15";
+
+/// A click in the page goes straight to the native view and GPUI never sees it.
+/// The page reports every pointer press over IPC, so the item can take GPUI focus and Zed's keymap follows the page.
+const FOCUS_SCRIPT: &str = r#"addEventListener('pointerdown', () => window.ipc.postMessage('cod:pointerdown'), true);"#;
 
 static OPENED_STARTUP_URL: AtomicBool = AtomicBool::new(false);
 
@@ -45,11 +61,16 @@ pub(crate) fn init(cx: &mut App) {
         if let Ok(url) = std::env::var("COD_SPIKE_URL")
             && !OPENED_STARTUP_URL.swap(true, Ordering::SeqCst)
         {
+            let drive = std::env::var("COD_SPIKE_DRIVE").unwrap_or_default();
             cx.defer_in(window, move |workspace, window, cx| {
+                if drive == "keys" {
+                    spike_driver::start_keys(url, window, cx);
+                    return;
+                }
                 let Some(page) = open_url(workspace, url, window, cx).log_err() else {
                     return;
                 };
-                if std::env::var("COD_SPIKE_DRIVE").is_ok_and(|value| value == "1") {
+                if drive == "1" {
                     spike_driver::start(page, window, cx);
                 }
             });
@@ -68,11 +89,33 @@ pub fn open_url(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> anyhow::Result<Entity<WebView>> {
-    let (events_tx, events_rx) = mpsc::unbounded();
-    let native = NativeWebView::new(&url, window, events_tx)?;
-    let page = cx.new(|cx| WebView::new(url, native, events_rx, window, cx));
+    let page = new_page(workspace, url, window, cx)?;
     workspace.add_item_to_active_pane(Box::new(page.clone()), None, true, window, cx);
     Ok(page)
+}
+
+pub fn open_url_in_split(
+    workspace: &mut Workspace,
+    url: String,
+    direction: SplitDirection,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> anyhow::Result<Entity<WebView>> {
+    let page = new_page(workspace, url, window, cx)?;
+    workspace.split_item(direction, Box::new(page.clone()), window, cx);
+    Ok(page)
+}
+
+fn new_page(
+    workspace: &mut Workspace,
+    url: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> anyhow::Result<Entity<WebView>> {
+    let (events_tx, events_rx) = mpsc::unbounded();
+    let native = NativeWebView::new(&url, window, events_tx)?;
+    let modal_layer = workspace.modal_layer();
+    Ok(cx.new(|cx| WebView::new(url, native, events_rx, modal_layer, window, cx)))
 }
 
 pub struct WebView {
@@ -82,13 +125,14 @@ pub struct WebView {
     focus_handle: FocusHandle,
     native: Rc<NativeWebView>,
     _native_events: Task<()>,
-    _focus_subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 enum NativeEvent {
     LoadStarted(String),
     LoadFinished(String),
     TitleChanged(String),
+    PointerDown,
 }
 
 impl WebView {
@@ -96,13 +140,16 @@ impl WebView {
         url: String,
         native: NativeWebView,
         mut events: mpsc::UnboundedReceiver<NativeEvent>,
+        modal_layer: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let native_events = cx.spawn(async move |this, cx| {
+        let native_events = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
                 if this
-                    .update(cx, |this, cx| this.handle_native_event(event, cx))
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_native_event(event, window, cx)
+                    })
                     .is_err()
                 {
                     break;
@@ -112,12 +159,19 @@ impl WebView {
 
         // The native view sits outside GPUI's focus tree, so keyboard focus has to be handed to it (and taken back) explicitly when GPUI focus enters or leaves this item.
         let focus_handle = cx.focus_handle();
-        let focus_subscriptions = [
+        let subscriptions = [
             cx.on_focus(&focus_handle, window, |this, _, _| {
+                log::info!("web_view: GPUI focus in, native view becomes first responder");
                 this.native.webview.focus().log_err();
             }),
             cx.on_blur(&focus_handle, window, |this, _, _| {
+                log::info!("web_view: GPUI focus out, GPUI view becomes first responder");
                 this.native.webview.focus_parent().log_err();
+            }),
+            // The native view draws above everything GPUI paints, so it hides while a modal (palette, file finder) is open.
+            cx.observe(&modal_layer, |this, modal_layer, cx| {
+                let open = modal_layer.read(cx).has_active_modal();
+                this.native.set_covered(open);
             }),
         ];
 
@@ -128,11 +182,11 @@ impl WebView {
             focus_handle,
             native: Rc::new(native),
             _native_events: native_events,
-            _focus_subscriptions: focus_subscriptions,
+            _subscriptions: subscriptions,
         }
     }
 
-    fn handle_native_event(&mut self, event: NativeEvent, cx: &mut Context<Self>) {
+    fn handle_native_event(&mut self, event: NativeEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             NativeEvent::LoadStarted(url) => {
                 log::info!("web_view: load started {url}");
@@ -149,6 +203,13 @@ impl WebView {
                 log::info!("web_view: title {title:?}");
                 self.title = Some(title.into());
             }
+            NativeEvent::PointerDown => {
+                let was_focused = self.focus_handle.is_focused(window);
+                log::info!("web_view: pointer down in the page, GPUI focus was on this item: {was_focused}");
+                if !was_focused {
+                    window.focus(&self.focus_handle, cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -160,6 +221,38 @@ impl WebView {
     pub(crate) fn native(&self) -> Rc<NativeWebView> {
         self.native.clone()
     }
+
+    /// Sends a standard editing command (`copy:`, `paste:`, ...) to the native view, as AppKit's Edit menu would.
+    fn edit_command(&mut self, command: EditCommand) {
+        let webview = self.native.webview.webview();
+        let sender: *const AnyObject = std::ptr::null();
+        log::info!("web_view: {command:?} sent to the native view");
+        // SAFETY: WKWebView implements these NSResponder editing actions, and a nil sender is allowed.
+        unsafe {
+            match command {
+                EditCommand::Cut => {
+                    let _: () = msg_send![&*webview, cut: sender];
+                }
+                EditCommand::Copy => {
+                    let _: () = msg_send![&*webview, copy: sender];
+                }
+                EditCommand::Paste => {
+                    let _: () = msg_send![&*webview, paste: sender];
+                }
+                EditCommand::SelectAll => {
+                    let _: () = msg_send![&*webview, selectAll: sender];
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EditCommand {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
 }
 
 impl EventEmitter<()> for WebView {}
@@ -186,24 +279,35 @@ impl Item for WebView {
     }
 
     fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.native.set_visible(false);
+        self.native.set_shown(false);
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
-        self.native.set_visible(false);
+        log::info!("web_view: item removed from its pane");
+        self.native.set_shown(false);
     }
 }
 
 impl Render for WebView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let native = self.native.clone();
-        div().track_focus(&self.focus_handle).size_full().child(
-            canvas(
-                move |bounds, _window, _cx| native.place(bounds),
-                |_, _, _, _| {},
+        div()
+            .key_context("WebView")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &Cut, _, _| this.edit_command(EditCommand::Cut)))
+            .on_action(cx.listener(|this, _: &Copy, _, _| this.edit_command(EditCommand::Copy)))
+            .on_action(cx.listener(|this, _: &Paste, _, _| this.edit_command(EditCommand::Paste)))
+            .on_action(
+                cx.listener(|this, _: &SelectAll, _, _| this.edit_command(EditCommand::SelectAll)),
             )
-            .size_full(),
-        )
+            .size_full()
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| native.place(bounds),
+                    |_, _, _, _| {},
+                )
+                .size_full(),
+            )
     }
 }
 
@@ -211,6 +315,10 @@ impl Render for WebView {
 pub(crate) struct NativeWebView {
     pub(crate) webview: wry::WebView,
     frame: Cell<Option<Bounds<Pixels>>>,
+    /// The item is the active one in its pane and has been laid out.
+    shown: Cell<bool>,
+    /// A GPUI modal is open over the window.
+    covered: Cell<bool>,
     visible: Cell<bool>,
 }
 
@@ -221,11 +329,22 @@ impl NativeWebView {
         events: mpsc::UnboundedSender<NativeEvent>,
     ) -> anyhow::Result<Self> {
         let load_events = events.clone();
+        let ipc_events = events.clone();
         let builder = wry::WebViewBuilder::new()
             .with_visible(false)
+            // GPUI decides when the page gets keyboard focus.
+            .with_focused(false)
             // Like the rest of Zed, the first click into an inactive window should reach the page.
             .with_accept_first_mouse(true)
             .with_user_agent(SAFARI_USER_AGENT)
+            .with_initialization_script(FOCUS_SCRIPT)
+            .with_ipc_handler(move |request| {
+                if request.body() == "cod:pointerdown" {
+                    ipc_events
+                        .unbounded_send(NativeEvent::PointerDown)
+                        .log_err();
+                }
+            })
             .with_bounds(wry::Rect {
                 position: LogicalPosition::new(0.0, 0.0).into(),
                 size: LogicalSize::new(0.0, 0.0).into(),
@@ -258,6 +377,8 @@ impl NativeWebView {
         Ok(Self {
             webview,
             frame: Cell::new(None),
+            shown: Cell::new(false),
+            covered: Cell::new(false),
             visible: Cell::new(false),
         })
     }
@@ -278,10 +399,29 @@ impl NativeWebView {
                 .log_err();
             self.frame.set(Some(bounds));
         }
-        self.set_visible(true);
+        self.set_shown(true);
     }
 
-    fn set_visible(&self, visible: bool) {
+    fn set_shown(&self, shown: bool) {
+        self.shown.set(shown);
+        self.update_visibility();
+    }
+
+    fn set_covered(&self, covered: bool) {
+        // Spike switch to show the problem the hiding solves.
+        if std::env::var("COD_SPIKE_KEEP_PAGE_OVER_MODALS").is_ok_and(|value| value == "1") {
+            log::info!("web_view: modal open={covered}, page kept visible (COD_SPIKE_KEEP_PAGE_OVER_MODALS)");
+            return;
+        }
+        if self.covered.get() != covered {
+            log::info!("web_view: modal open={covered}");
+            self.covered.set(covered);
+            self.update_visibility();
+        }
+    }
+
+    fn update_visibility(&self) {
+        let visible = self.shown.get() && !self.covered.get();
         if self.visible.get() != visible {
             log::info!("web_view: visible={visible}");
             self.webview.set_visible(visible).log_err();
@@ -291,5 +431,11 @@ impl NativeWebView {
 
     pub(crate) fn frame(&self) -> Option<Bounds<Pixels>> {
         self.frame.get()
+    }
+}
+
+impl Drop for NativeWebView {
+    fn drop(&mut self) {
+        log::info!("web_view: native view dropped, wry removes it from the window");
     }
 }

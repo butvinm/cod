@@ -1351,6 +1351,16 @@
     },
   },
   {
+    "context": "WebView",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-x": "web_view::Cut",
+      "cmd-c": "web_view::Copy",
+      "cmd-v": "web_view::Paste",
+      "cmd-a": "web_view::SelectAll",
+    },
+  },
+  {
     "context": "Terminal",
     "use_key_equivalents": true,
     "bindings": {

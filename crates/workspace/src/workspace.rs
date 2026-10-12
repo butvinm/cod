@@ -8522,6 +8522,11 @@ impl Workspace {
         self.modal_layer.read(cx).has_active_modal()
     }
 
+    /// The layer that holds the active modal; observe it to learn when a modal opens or closes.
+    pub fn modal_layer(&self) -> Entity<ModalLayer> {
+        self.modal_layer.clone()
+    }
+
     pub fn active_modal<V: ManagedView + 'static>(&self, cx: &App) -> Option<Entity<V>> {
         self.modal_layer.read(cx).active_modal()
     }

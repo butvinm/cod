@@ -24,6 +24,10 @@ workspace.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
+# The spike driver checks the editor buffer and which modal opened.
+command_palette.workspace = true
+editor.workspace = true
+file_finder.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
     "NSBitmapImageRep",
@@ -31,6 +35,8 @@ objc2-app-kit = { workspace = true, features = [
     "NSGraphicsContext",
     "NSImage",
     "NSImageRep",
+    "NSMenu",
+    "NSPasteboardItem",
     "objc2-core-graphics",
 ] }
 objc2-core-foundation.workspace = true

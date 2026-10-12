@@ -20959,6 +20959,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
+ "command_palette",
+ "editor",
+ "file_finder",
  "futures 0.3.34",
  "gpui",
  "log",
