@@ -61,3 +61,14 @@ crates/docs_preprocessor/actions.json
 
 .local*
 .cache
+
+# Cod: local-only material (planning docs, agent chat mailbox, Claude Code worktrees and personal settings)
+/cod-docs/
+.agent-chat/
+.claude/worktrees/
+CLAUDE.local.md
+
+# Cod: "Report problem" folders and QA artifacts (may contain private data; scrub before publishing)
+/artifacts/
+/cod-reports/
+/cod-report-*/
