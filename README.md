@@ -10,7 +10,7 @@ Cod is in an early preview. Right now it is stock Zed 1.23.2 plus a web page in 
 
 ## Try it on Linux
 
-The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through XWayland.
+The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through XWayland. It is built on Ubuntu 24.04, so it needs glibc 2.39 or newer (for example Ubuntu 24.04, Debian 13, Fedora 40 or a current Arch).
 
 1. Install WebKitGTK, for example on Ubuntu 24.04 or Debian 13: `sudo apt install libwebkit2gtk-4.1-0`.
 2. Download `cod-linux-x86_64.tar.gz` from the latest prerelease on the [Releases](https://github.com/butvinm/cod/releases) page.
