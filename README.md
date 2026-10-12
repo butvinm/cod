@@ -1,48 +1,26 @@
-# Zed
+# Cod
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+Cod is a desktop workspace for agent-driven development. It is the Zed editor plus a small set of its own: agent chats, web pages in panes, review, a command-line tool and workspaces. It is a personal tool built in the open by one person and a team of agents. It should look and feel like Zed: fast, quiet, keyboard first, very few settings.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Cod is a fork of [Zed](https://github.com/zed-industries/zed) at tag [v1.23.2](https://github.com/zed-industries/zed/tree/v1.23.2). It stays frozen at that version and does not merge from upstream. Zed is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked, and so is this fork (see the `LICENSE-*` files).
 
----
+The earlier Electron prototype lives at [butvinm/cod-electron](https://github.com/butvinm/cod-electron).
 
-### Installation
+Cod is in an early preview. Right now it is stock Zed 1.23.2 plus a web page in a pane (the `web_view` crate).
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+## Try it on Linux
 
-Other platforms are not yet available:
+The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through XWayland.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+1. Install WebKitGTK, for example on Ubuntu 24.04 or Debian 13: `sudo apt install libwebkit2gtk-4.1-0`.
+2. Download `cod-linux-x86_64.tar.gz` from the latest prerelease on the [Releases](https://github.com/butvinm/cod/releases) page.
+3. Unpack it: `tar -xzf cod-linux-x86_64.tar.gz`.
+4. Start it: `./cod/cod-xwayland.sh`. It opens a public GitLab merge request in a pane.
 
-### Developing Zed
+To open another page and a folder: `./cod/cod-xwayland.sh <url> <folder>`.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
 
-### Contributing
+## Building
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
-
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
-
-### Licensing
-
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
-
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Cod builds like Zed: see [Building Zed for Linux](./docs/src/development/linux.md) and [Building Zed for macOS](./docs/src/development/macos.md). On Linux the web view also needs `libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev`. The Linux preview is built by `.github/workflows/linux-release.yml`.
