@@ -1294,6 +1294,15 @@
     },
   },
   {
+    "context": "WebView",
+    "bindings": {
+      "ctrl-x": "web_view::Cut",
+      "ctrl-c": "web_view::Copy",
+      "ctrl-v": "web_view::Paste",
+      "ctrl-a": "web_view::SelectAll",
+    },
+  },
+  {
     "context": "Terminal",
     "bindings": {
       "ctrl-alt-space": "terminal::ShowCharacterPalette",

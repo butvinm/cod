@@ -44,3 +44,10 @@ objc2-core-graphics = { workspace = true, features = ["CGEvent", "CGEventTypes"]
 objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 wry.workspace = true
+
+# WebKitGTK in an X11 child window. The versions match what wry 0.57 uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+gdkx11 = "0.18"
+gtk = "0.18"
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+wry = { workspace = true, features = ["os-webview", "x11"] }

@@ -10,15 +10,18 @@ use gpui::{
     App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
     MouseDownEvent, Pixels, Render, SharedString, Subscription, Task, Window, actions, canvas,
 };
+#[cfg(target_os = "macos")]
 use objc2::{msg_send, runtime::AnyObject};
 use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{ModalLayer, SplitDirection, Workspace, item::Item};
-use wry::{
-    WebViewExtMacOS as _,
-    dpi::{LogicalPosition, LogicalSize},
-};
+#[cfg(target_os = "macos")]
+use wry::WebViewExtMacOS as _;
+use wry::dpi::{LogicalPosition, LogicalSize};
 
+#[cfg(target_os = "linux")]
+use crate::linux;
+#[cfg(target_os = "macos")]
 use crate::spike_driver;
 
 actions!(
@@ -41,6 +44,7 @@ const DEFAULT_URL: &str = "https://gitlab.com/gitlab-org/gitlab-runner/-/merge_r
 
 /// WKWebView's default user agent lacks Safari's "Version/... Safari/..." suffix, and sites behind Cloudflare answer it with an interactive "Verify you are human" check.
 /// The engine is Safari's, so the spike sends Safari's user agent; a real version would read it from the system.
+#[cfg(target_os = "macos")]
 const SAFARI_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15";
 
 /// A click in the page goes straight to the native view and GPUI never sees it.
@@ -61,19 +65,47 @@ pub(crate) fn init(cx: &mut App) {
         if let Ok(url) = std::env::var("COD_SPIKE_URL")
             && !OPENED_STARTUP_URL.swap(true, Ordering::SeqCst)
         {
-            let drive = std::env::var("COD_SPIKE_DRIVE").unwrap_or_default();
-            cx.defer_in(window, move |workspace, window, cx| {
-                if drive == "keys" {
-                    spike_driver::start_keys(url, window, cx);
-                    return;
-                }
-                let Some(page) = open_url(workspace, url, window, cx).log_err() else {
-                    return;
-                };
-                if drive == "1" {
-                    spike_driver::start(page, window, cx);
-                }
-            });
+            #[cfg(target_os = "macos")]
+            {
+                let drive = std::env::var("COD_SPIKE_DRIVE").unwrap_or_default();
+                cx.defer_in(window, move |workspace, window, cx| {
+                    if drive == "keys" {
+                        spike_driver::start_keys(url, window, cx);
+                        return;
+                    }
+                    let Some(page) = open_url(workspace, url, window, cx).log_err() else {
+                        return;
+                    };
+                    if drive == "1" {
+                        spike_driver::start(page, window, cx);
+                    }
+                });
+            }
+            // Linux spike runs: wait for the files from the command line to open, then put the page in a split to the right of the editor.
+            #[cfg(target_os = "linux")]
+            cx.spawn_in(window, async move |workspace, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let page = open_url_in_split(
+                            workspace,
+                            url,
+                            SplitDirection::Right,
+                            window,
+                            cx,
+                        )
+                        .log_err();
+                        if let Some(page) = page
+                            && std::env::var("COD_SPIKE_PROBE").is_ok_and(|value| value == "1")
+                        {
+                            linux::start_probe(Rc::downgrade(&page.read(cx).native), cx);
+                        }
+                    })
+                    .log_err();
+            })
+            .detach();
         }
     })
     .detach();
@@ -162,11 +194,17 @@ impl WebView {
         let subscriptions = [
             cx.on_focus(&focus_handle, window, |this, _, _| {
                 log::info!("web_view: GPUI focus in, native view becomes first responder");
+                #[cfg(target_os = "macos")]
                 this.native.webview.focus().log_err();
+                #[cfg(target_os = "linux")]
+                linux::focus_page(&this.native);
             }),
             cx.on_blur(&focus_handle, window, |this, _, _| {
                 log::info!("web_view: GPUI focus out, GPUI view becomes first responder");
+                #[cfg(target_os = "macos")]
                 this.native.webview.focus_parent().log_err();
+                #[cfg(target_os = "linux")]
+                linux::focus_gpui(this.native.gpui_window);
             }),
             // The native view draws above everything GPUI paints, so it hides while a modal (palette, file finder) is open.
             cx.observe(&modal_layer, |this, modal_layer, cx| {
@@ -178,6 +216,9 @@ impl WebView {
 
         // A modal may already be open when the page is created (for example Zed's project trust prompt).
         native.set_covered(modal_layer.read(cx).has_active_modal());
+
+        #[cfg(target_os = "linux")]
+        linux::route_keys(&native, focus_handle.clone(), window.to_async(cx));
 
         Self {
             url: url.into(),
@@ -222,11 +263,18 @@ impl WebView {
         self.loaded_url.as_deref()
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn native(&self) -> Rc<NativeWebView> {
         self.native.clone()
     }
 
+    #[cfg(target_os = "linux")]
+    fn edit_command(&mut self, command: EditCommand) {
+        linux::edit_command(&self.native, command);
+    }
+
     /// Sends a standard editing command (`copy:`, `paste:`, ...) to the native view, as AppKit's Edit menu would.
+    #[cfg(target_os = "macos")]
     fn edit_command(&mut self, command: EditCommand) {
         let webview = self.native.webview.webview();
         let sender: *const AnyObject = std::ptr::null();
@@ -252,7 +300,7 @@ impl WebView {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum EditCommand {
+pub(crate) enum EditCommand {
     Cut,
     Copy,
     Paste,
@@ -333,6 +381,9 @@ pub(crate) struct NativeWebView {
     /// A GPUI modal is open over the window.
     covered: Cell<bool>,
     visible: Cell<bool>,
+    /// GPUI's X11 window, which gets keyboard focus back when the item loses GPUI focus.
+    #[cfg(target_os = "linux")]
+    gpui_window: std::os::raw::c_ulong,
 }
 
 impl NativeWebView {
@@ -348,8 +399,14 @@ impl NativeWebView {
             // GPUI decides when the page gets keyboard focus.
             .with_focused(false)
             // Like the rest of Zed, the first click into an inactive window should reach the page.
-            .with_accept_first_mouse(true)
-            .with_user_agent(SAFARI_USER_AGENT)
+            .with_accept_first_mouse(true);
+        #[cfg(target_os = "macos")]
+        let builder = builder.with_user_agent(SAFARI_USER_AGENT);
+        #[cfg(target_os = "macos")]
+        const INITIAL_SIZE: f64 = 0.0;
+        #[cfg(target_os = "linux")]
+        const INITIAL_SIZE: f64 = 1.0;
+        let builder = builder
             .with_initialization_script(FOCUS_SCRIPT)
             .with_ipc_handler(move |request| {
                 if request.body() == "cod:pointerdown" {
@@ -360,7 +417,8 @@ impl NativeWebView {
             })
             .with_bounds(wry::Rect {
                 position: LogicalPosition::new(0.0, 0.0).into(),
-                size: LogicalSize::new(0.0, 0.0).into(),
+                // XCreateSimpleWindow fails on a zero size, so Linux starts at 1x1.
+                size: LogicalSize::new(INITIAL_SIZE, INITIAL_SIZE).into(),
             })
             .with_on_page_load_handler(move |event, url| {
                 let event = match event {
@@ -384,8 +442,15 @@ impl NativeWebView {
             builder.with_url(url)
         };
 
+        #[cfg(target_os = "macos")]
         let webview = builder
             .build_as_child(window)
+            .context("creating the OS web view")?;
+        #[cfg(target_os = "linux")]
+        let parent = linux::xlib_parent(window)?;
+        #[cfg(target_os = "linux")]
+        let webview = builder
+            .build_as_child(&parent)
             .context("creating the OS web view")?;
         Ok(Self {
             webview,
@@ -393,6 +458,8 @@ impl NativeWebView {
             shown: Cell::new(false),
             covered: Cell::new(false),
             visible: Cell::new(false),
+            #[cfg(target_os = "linux")]
+            gpui_window: parent.0,
         })
     }
 
@@ -442,6 +509,7 @@ impl NativeWebView {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn frame(&self) -> Option<Bounds<Pixels>> {
         self.frame.get()
     }
