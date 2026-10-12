@@ -174,28 +174,31 @@ pub(crate) fn edit_command(native: &NativeWebView, command: EditCommand) {
 }
 
 /// Key presses in the page go to GTK, not GPUI.
-/// Every key with Ctrl, Alt or Super is offered to GPUI first, so Zed's keymap (Ctrl-W, the palette, and the `WebView` context's Ctrl-C/V) works over the page.
-/// Keys GPUI does not handle, and all plain typing, stay with the page.
+/// While the page has GPUI focus, every key with Ctrl, Alt or Super is offered to GPUI first, so Zed's keymap (Ctrl-W, the palette, and the `WebView` context's Ctrl-C/V) works over the page; keys GPUI does not handle, and all plain typing, stay with the page.
+/// While GPUI focus is elsewhere, X can still deliver keys to the page: the X rule sends keys to the window under the pointer when it is inside the focus window. Those keys belong to GPUI, so all of them are passed on and the page gets none.
 pub(crate) fn route_keys(native: &NativeWebView, focus_handle: FocusHandle, cx: AsyncWindowContext) {
     native
         .webview
         .webview()
         .connect_key_press_event(move |_, event| {
-            let Some(keystroke) = gpui_keystroke(event) else {
-                return glib::Propagation::Proceed;
-            };
             let mut cx = cx.clone();
-            let handled = cx
-                .update(|window, cx| {
-                    if !focus_handle.is_focused(window) {
-                        log::info!("web_view: key in the page while GPUI focus was elsewhere, focusing the item");
-                        window.focus(&focus_handle, cx);
-                    }
-                    window.dispatch_keystroke(keystroke.clone(), cx)
-                })
+            let page_focused = cx
+                .update(|window, _| focus_handle.is_focused(window))
                 .unwrap_or(false);
-            log::info!("web_view: page key {keystroke} offered to GPUI, handled={handled}");
-            if handled {
+            let Some(keystroke) = gpui_keystroke(event, !page_focused) else {
+                return if page_focused {
+                    glib::Propagation::Proceed
+                } else {
+                    glib::Propagation::Stop
+                };
+            };
+            let handled = cx
+                .update(|window, cx| window.dispatch_keystroke(keystroke.clone(), cx))
+                .unwrap_or(false);
+            log::info!(
+                "web_view: page key {keystroke} passed to GPUI (page has GPUI focus: {page_focused}), handled={handled}"
+            );
+            if handled || !page_focused {
                 glib::Propagation::Stop
             } else {
                 glib::Propagation::Proceed
@@ -203,12 +206,13 @@ pub(crate) fn route_keys(native: &NativeWebView, focus_handle: FocusHandle, cx: 
         });
 }
 
-fn gpui_keystroke(event: &gdk::EventKey) -> Option<Keystroke> {
+/// Converts a GDK key press to a GPUI keystroke; plain keys only when `all_keys` is set.
+fn gpui_keystroke(event: &gdk::EventKey, all_keys: bool) -> Option<Keystroke> {
     let state = event.state();
     let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
     let alt = state.contains(gdk::ModifierType::MOD1_MASK);
     let platform = state.contains(gdk::ModifierType::SUPER_MASK);
-    if !(ctrl || alt || platform) {
+    if !(ctrl || alt || platform || all_keys) {
         return None;
     }
     let shift = state.contains(gdk::ModifierType::SHIFT_MASK);

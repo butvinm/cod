@@ -998,6 +998,8 @@ impl X11Client {
                 drop(state);
                 self.enable_ime();
             }
+            // Cod spike (#79): keyboard focus moved into a child X window of ours (an embedded web view), so the window is still active.
+            Event::FocusOut(event) if event.detail == xproto::NotifyDetail::INFERIOR => {}
             Event::FocusOut(event) => {
                 let window = self.get_window(event.event)?;
                 window.set_active(false);

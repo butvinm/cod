@@ -199,12 +199,17 @@ impl WebView {
                 #[cfg(target_os = "linux")]
                 linux::focus_page(&this.native);
             }),
-            cx.on_blur(&focus_handle, window, |this, _, _| {
+            cx.on_blur(&focus_handle, window, |this, window, _| {
                 log::info!("web_view: GPUI focus out, GPUI view becomes first responder");
                 #[cfg(target_os = "macos")]
                 this.native.webview.focus_parent().log_err();
+                // Only when focus moved inside Zed; if the whole window went inactive, X focus is already elsewhere and taking it back would fight the page (or another app).
                 #[cfg(target_os = "linux")]
-                linux::focus_gpui(this.native.host.gpui_window);
+                if window.is_window_active() {
+                    linux::focus_gpui(this.native.host.gpui_window);
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = window;
             }),
             // The native view draws above everything GPUI paints, so it hides while a modal (palette, file finder) is open.
             cx.observe(&modal_layer, |this, modal_layer, cx| {
