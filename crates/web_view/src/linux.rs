@@ -7,15 +7,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use gpui::{App, AsyncWindowContext, FocusHandle, Keystroke, Window};
 use gtk::{gdk, glib, prelude::*};
 use webkit2gtk::WebViewExt as _;
 use wry::{
     WebViewExtUnix as _,
-    raw_window_handle::{
-        HandleError, HasWindowHandle, RawWindowHandle, WindowHandle, XlibWindowHandle,
-    },
+    raw_window_handle::{HasWindowHandle, RawWindowHandle},
 };
 
 use crate::web_view_item::{EditCommand, NativeWebView};
@@ -27,7 +25,7 @@ const GTK_PUMP_INTERVAL: Duration = Duration::from_millis(8);
 /// Starts GTK on the main thread and keeps its event loop running from GPUI's foreground executor.
 /// Returns false when GTK cannot start (no X display), and the web view is then not registered.
 pub(crate) fn init_gtk(cx: &mut App) -> bool {
-    // wry embeds WebKitGTK only into X11 windows, so GDK must use X11 even inside a Wayland session (through XWayland).
+    // The page window is reparented into GPUI's X11 window, so GDK must use X11.
     gdk::set_allowed_backends("x11");
     if let Err(error) = gtk::init() {
         log::error!("web_view: GTK did not start, web views are disabled: {error}");
@@ -47,29 +45,95 @@ pub(crate) fn init_gtk(cx: &mut App) -> bool {
     true
 }
 
-/// GPUI's X11 window gives an XCB handle, and wry only accepts an Xlib one.
-/// The X window id is the same in both, so the spike rewraps it.
-pub(crate) struct XlibParent(pub(crate) c_ulong);
+/// The GTK window that holds one page, reparented into GPUI's X11 window.
+///
+/// wry's own `build_as_child` on X11 wraps a plain X child window as a foreign GDK window.
+/// GTK gives foreign windows no frame clock ("_gdk_frame_clock_freeze: assertion 'GDK_IS_FRAME_CLOCK (clock)' failed"), so the page never gets laid out or painted: the child stays black and WebKit's own window stays 1x1.
+/// Instead the spike makes a normal GTK popup (override-redirect, its own frame clock), lets wry put WebKitGTK in it with `build_gtk`, and moves its X window under GPUI's window with XReparentWindow.
+/// From then on GTK's move and resize calls are relative to GPUI's window.
+pub(crate) struct Host {
+    pub(crate) window: gtk::Window,
+    pub(crate) container: gtk::Box,
+    pub(crate) gpui_window: c_ulong,
+}
 
-impl HasWindowHandle for XlibParent {
-    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-        let handle = XlibWindowHandle::new(self.0);
-        // SAFETY: the X window outlives the web view, which is dropped with its item before the GPUI window closes.
-        Ok(unsafe { WindowHandle::borrow_raw(handle.into()) })
+impl Host {
+    pub(crate) fn new(gpui: &Window) -> anyhow::Result<Self> {
+        let gpui_window = gpui_xid(gpui)?;
+        let window = gtk::Window::new(gtk::WindowType::Popup);
+        window.set_default_size(1, 1);
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        window.add(&container);
+        Ok(Self {
+            window,
+            container,
+            gpui_window,
+        })
+    }
+
+    /// Realizes the GTK window and moves it under GPUI's window. Call after wry has added the web view.
+    pub(crate) fn attach(&self) -> anyhow::Result<()> {
+        self.window.realize();
+        let xid = self
+            .window
+            .window()
+            .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
+            .context("the GTK window has no X11 window")?
+            .xid();
+        let display = gdk::Display::default().context("no GDK display")?;
+        let x11_display = display
+            .downcast_ref::<gdkx11::X11Display>()
+            .context("GDK is not on X11")?;
+        let xlib = x11_dl::xlib::Xlib::open().context("loading libX11")?;
+        // SAFETY: both windows are live on GDK's open X11 display.
+        unsafe {
+            let xdisplay = gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.as_ptr())
+                as *mut x11_dl::xlib::Display;
+            (xlib.XReparentWindow)(xdisplay, xid, self.gpui_window, 0, 0);
+            (xlib.XFlush)(xdisplay);
+        }
+        log::info!(
+            "web_view: GTK window {xid:#x} reparented into GPUI window {:#x}",
+            self.gpui_window
+        );
+        Ok(())
+    }
+
+    pub(crate) fn set_bounds(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.window.move_(x, y);
+        self.window.resize(width.max(1), height.max(1));
+    }
+
+    pub(crate) fn set_visible(&self, visible: bool) {
+        if visible {
+            self.window.show_all();
+        } else {
+            self.window.hide();
+        }
     }
 }
 
-pub(crate) fn xlib_parent(window: &Window) -> anyhow::Result<XlibParent> {
+impl Drop for Host {
+    fn drop(&mut self) {
+        // SAFETY: GTK keeps toplevels alive on its own; the page is gone, so nothing else uses this window.
+        unsafe { self.window.destroy() };
+    }
+}
+
+/// GPUI's X11 window gives an XCB handle; the X window id is all the spike needs.
+fn gpui_xid(window: &Window) -> anyhow::Result<c_ulong> {
     let handle = HasWindowHandle::window_handle(window)?;
     match handle.as_raw() {
-        RawWindowHandle::Xcb(handle) => Ok(XlibParent(c_ulong::from(handle.window.get()))),
-        RawWindowHandle::Xlib(handle) => Ok(XlibParent(handle.window)),
-        other => bail!("the web view needs an X11 window, GPUI gave {other:?} (Wayland is not supported by wry's child web views)"),
+        RawWindowHandle::Xcb(handle) => Ok(c_ulong::from(handle.window.get())),
+        RawWindowHandle::Xlib(handle) => Ok(handle.window),
+        other => bail!(
+            "the web view needs an X11 window, GPUI gave {other:?} (GPUI on Wayland is not supported)"
+        ),
     }
 }
 
 /// Gives the page X keyboard focus, so keys reach it without the pointer over it.
-/// Without a window manager GDK does this with XSetInputFocus on wry's container window.
+/// Without a window manager GDK does this with XSetInputFocus on the host window.
 pub(crate) fn focus_page(native: &NativeWebView) {
     let webview = native.webview.webview();
     webview.grab_focus();
@@ -79,7 +143,7 @@ pub(crate) fn focus_page(native: &NativeWebView) {
 }
 
 /// Hands X keyboard focus back to GPUI's window.
-/// wry's `focus_parent` would focus its own container window instead, which keeps every key in the page.
+/// wry's `focus_parent` would focus the host window instead, which keeps every key in the page.
 pub(crate) fn focus_gpui(gpui_window: c_ulong) {
     let Some(display) = gdk::Display::default() else {
         return;

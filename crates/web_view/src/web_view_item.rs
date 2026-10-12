@@ -204,7 +204,7 @@ impl WebView {
                 #[cfg(target_os = "macos")]
                 this.native.webview.focus_parent().log_err();
                 #[cfg(target_os = "linux")]
-                linux::focus_gpui(this.native.gpui_window);
+                linux::focus_gpui(this.native.host.gpui_window);
             }),
             // The native view draws above everything GPUI paints, so it hides while a modal (palette, file finder) is open.
             cx.observe(&modal_layer, |this, modal_layer, cx| {
@@ -381,9 +381,9 @@ pub(crate) struct NativeWebView {
     /// A GPUI modal is open over the window.
     covered: Cell<bool>,
     visible: Cell<bool>,
-    /// GPUI's X11 window, which gets keyboard focus back when the item loses GPUI focus.
+    /// The GTK window that holds the page inside GPUI's X11 window. Declared after `webview`, so it is destroyed last.
     #[cfg(target_os = "linux")]
-    gpui_window: std::os::raw::c_ulong,
+    pub(crate) host: crate::linux::Host,
 }
 
 impl NativeWebView {
@@ -402,10 +402,6 @@ impl NativeWebView {
             .with_accept_first_mouse(true);
         #[cfg(target_os = "macos")]
         let builder = builder.with_user_agent(SAFARI_USER_AGENT);
-        #[cfg(target_os = "macos")]
-        const INITIAL_SIZE: f64 = 0.0;
-        #[cfg(target_os = "linux")]
-        const INITIAL_SIZE: f64 = 1.0;
         let builder = builder
             .with_initialization_script(FOCUS_SCRIPT)
             .with_ipc_handler(move |request| {
@@ -417,8 +413,7 @@ impl NativeWebView {
             })
             .with_bounds(wry::Rect {
                 position: LogicalPosition::new(0.0, 0.0).into(),
-                // XCreateSimpleWindow fails on a zero size, so Linux starts at 1x1.
-                size: LogicalSize::new(INITIAL_SIZE, INITIAL_SIZE).into(),
+                size: LogicalSize::new(0.0, 0.0).into(),
             })
             .with_on_page_load_handler(move |event, url| {
                 let event = match event {
@@ -446,12 +441,18 @@ impl NativeWebView {
         let webview = builder
             .build_as_child(window)
             .context("creating the OS web view")?;
+        // wry's build_as_child on X11 leaves the page unpainted, see linux::Host.
         #[cfg(target_os = "linux")]
-        let parent = linux::xlib_parent(window)?;
+        let host = linux::Host::new(window)?;
         #[cfg(target_os = "linux")]
-        let webview = builder
-            .build_as_child(&parent)
-            .context("creating the OS web view")?;
+        let webview = {
+            use wry::WebViewBuilderExtUnix as _;
+            builder
+                .build_gtk(&host.container)
+                .context("creating the OS web view")?
+        };
+        #[cfg(target_os = "linux")]
+        host.attach()?;
         Ok(Self {
             webview,
             frame: Cell::new(None),
@@ -459,7 +460,7 @@ impl NativeWebView {
             covered: Cell::new(false),
             visible: Cell::new(false),
             #[cfg(target_os = "linux")]
-            gpui_window: parent.0,
+            host,
         })
     }
 
@@ -471,12 +472,16 @@ impl NativeWebView {
             let width = f64::from(bounds.size.width);
             let height = f64::from(bounds.size.height);
             log::info!("web_view: frame x={x} y={y} width={width} height={height}");
+            #[cfg(target_os = "macos")]
             self.webview
                 .set_bounds(wry::Rect {
                     position: LogicalPosition::new(x, y).into(),
                     size: LogicalSize::new(width, height).into(),
                 })
                 .log_err();
+            #[cfg(target_os = "linux")]
+            self.host
+                .set_bounds(x as i32, y as i32, width as i32, height as i32);
             self.frame.set(Some(bounds));
         }
         self.set_shown(true);
@@ -504,7 +509,10 @@ impl NativeWebView {
         let visible = self.shown.get() && !self.covered.get();
         if self.visible.get() != visible {
             log::info!("web_view: visible={visible}");
+            #[cfg(target_os = "macos")]
             self.webview.set_visible(visible).log_err();
+            #[cfg(target_os = "linux")]
+            self.host.set_visible(visible);
             self.visible.set(visible);
         }
     }
