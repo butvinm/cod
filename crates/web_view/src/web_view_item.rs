@@ -7,8 +7,8 @@ use std::{
 use anyhow::Context as _;
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Render,
-    SharedString, Subscription, Task, Window, actions, canvas,
+    App, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    MouseDownEvent, Pixels, Render, SharedString, Subscription, Task, Window, actions, canvas,
 };
 use objc2::{msg_send, runtime::AnyObject};
 use ui::prelude::*;
@@ -171,9 +171,13 @@ impl WebView {
             // The native view draws above everything GPUI paints, so it hides while a modal (palette, file finder) is open.
             cx.observe(&modal_layer, |this, modal_layer, cx| {
                 let open = modal_layer.read(cx).has_active_modal();
+                log::info!("web_view: modal layer changed, open={open}");
                 this.native.set_covered(open);
             }),
         ];
+
+        // A modal may already be open when the page is created (for example Zed's project trust prompt).
+        native.set_covered(modal_layer.read(cx).has_active_modal());
 
         Self {
             url: url.into(),
@@ -304,7 +308,16 @@ impl Render for WebView {
             .child(
                 canvas(
                     move |bounds, _window, _cx| native.place(bounds),
-                    |_, _, _, _| {},
+                    |_, _, window, _| {
+                        // Spike diagnostics: which clicks GPUI itself receives.
+                        window.on_mouse_event(|event: &MouseDownEvent, phase, window, _| {
+                            log::info!(
+                                "web_view: GPUI got a mouse down at {:?} phase={phase:?} default_prevented={}",
+                                event.position,
+                                window.default_prevented(),
+                            );
+                        });
+                    },
                 )
                 .size_full(),
             )

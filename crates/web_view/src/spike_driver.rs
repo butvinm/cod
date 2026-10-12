@@ -307,7 +307,12 @@ fn click(native: &NativeWebView, target: &Target) -> Result<()> {
 
 /// Clicks a point in the window's base coordinates, through the window like AppKit does for a real click.
 fn click_at(window: &NSWindow, location: CGPoint) -> Result<()> {
-    for event_type in [NSEventType::LeftMouseDown, NSEventType::LeftMouseUp] {
+    // A real click comes after the pointer moved there.
+    for event_type in [
+        NSEventType::MouseMoved,
+        NSEventType::LeftMouseDown,
+        NSEventType::LeftMouseUp,
+    ] {
         let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
             event_type,
             location,
@@ -628,10 +633,16 @@ impl Probe {
             let file_finder = workspace.active_modal::<FileFinder>(cx).is_some();
             let palette = workspace.active_modal::<CommandPalette>(cx).is_some();
             let pages = workspace.items_of_type::<WebView>(cx).count();
+            let prompt = window.has_active_prompt();
+            let any_modal = workspace.has_active_modal(window, cx);
             format!(
-                "gpui_focus page={page:?} editor={editor}; modal file_finder={file_finder} command_palette={palette}; web_view_items={pages}"
+                "gpui_focus page={page:?} editor={editor}; modal any={any_modal} file_finder={file_finder} command_palette={palette} gpui_prompt={prompt}; web_view_items={pages}"
             )
         })?;
+        let sheet = self.window.attachedSheet().is_some();
+        if sheet {
+            log::warn!("spike driver: {label}: the window has an attached sheet");
+        }
         log::info!(
             "spike driver: {label}: {line}; first_responder={:?}",
             first_responder_name(&self.window)
@@ -677,6 +688,20 @@ async fn run_keys(
         window: window.clone(),
     };
     probe.log(cx, "page opened in a split")?;
+    let _keystrokes = cx.update(|_, cx| {
+        cx.observe_keystrokes(|event, _, _| {
+            log::info!(
+                "spike driver: GPUI keystroke {} -> action {:?} contexts={:?}",
+                event.keystroke.unparse(),
+                event.action.as_ref().map(|action| action.name()),
+                event
+                    .context_stack
+                    .iter()
+                    .map(|context| format!("{context:?}"))
+                    .collect::<Vec<_>>(),
+            );
+        })
+    })?;
 
     // AC1: a click in the page moves GPUI focus to the item.
     cx.update(|window, cx| {
@@ -723,6 +748,14 @@ async fn run_keys(
     send_shortcut(&window, ESCAPE, KEY_CODE_ESCAPE, NSEventModifierFlags::empty(), "escape")?;
     sleep(cx, 1).await;
     probe.log(cx, "AC3 after escape")?;
+    send_shortcut(&window, "s", 1, NSEventModifierFlags::Command, "cmd-s")?;
+    sleep(cx, 1).await;
+    probe.log(cx, "AC3 after cmd-s in the editor")?;
+    let saved = std::fs::read_to_string(SAMPLE_FILE)?;
+    log::info!(
+        "spike driver: AC3 file on disk contains the typed text after cmd-s: {}",
+        saved.contains(EDITOR_TEXT.trim())
+    );
 
     // AC5: edit shortcuts reach the page, Zed shortcuts still reach Zed.
     let saved_pasteboard = save_pasteboard();
