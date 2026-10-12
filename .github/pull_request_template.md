@@ -1,20 +1,33 @@
-## Summary
+Closes #<issue>
 
-What problem does this solve, how, and why does this change matter?
-Use "Closes #123" for each issue resolved.
-Include artifacts produced when testing: before/after screenshots, GIFs, videos, benchmarks.
+## What changed
 
-## Testing
+<one or two plain sentences>
 
-Manually test your changes; report results, mention platforms if relevant.
-How can reviewers test this easily? Include setup and steps.
+## Acceptance criteria
 
-## Self-review
+| AC  | Test                                     | Result |
+| --- | ---------------------------------------- | ------ |
+| AC1 | `tests/e2e/<file>.spec.ts` "<test name>" | PASS   |
+| AC2 |                                          |        |
 
-- [ ] I've reviewed my diff for quality, security, reliability, and performance.
-- [ ] UI changes follow the [checklist](https://zed.dev/docs/development/ui-checklist).
-- [ ] Tests cover the new or changed behavior.
+Acceptance tests modified: none (or list each change and why; this blocks the review)
 
-Release Notes:
+## How to try it
 
-- N/A or Added/Fixed/Improved ...
+1.
+2.
+
+## Evidence
+
+- Test run: `<command>` -> <N passed, M failed>
+- Screenshot: <link, or "none"; QA writes the check list after review>
+
+## Checklist
+
+- [ ] One story only, files limited to the handoff
+- [ ] Tests written first; acceptance test assertions untouched
+- [ ] Works fully from the keyboard; no new settings or panels
+- [ ] No work URLs, internal names, internal screenshots or tokens
+- [ ] Text rules: no em or en dashes, ellipsis characters, curly quotes or unicode arrows
+- [ ] Atomic commits, no AI attribution trailers
