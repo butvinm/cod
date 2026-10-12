@@ -232,6 +232,7 @@ members = [
     "crates/vim_mode_setting",
     "crates/watch",
     "crates/web_search",
+    "crates/web_view",
     "crates/web_search_providers",
     "crates/which_key",
     "crates/windows_resources",
@@ -502,6 +503,7 @@ vim_mode_setting = { path = "crates/vim_mode_setting" }
 watch = { path = "crates/watch" }
 web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
+web_view = { path = "crates/web_view" }
 which_key = { path = "crates/which_key" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
@@ -765,6 +767,13 @@ objc2-screen-capture-kit = { version = "=0.3.2", default-features = false, featu
     "std"
 ] }
 objc2-user-notifications = "0.3"
+objc2-web-kit = { version = "=0.3.2", default-features = false, features = [
+    "block2",
+    "objc2-app-kit",
+    "std",
+    "WKSnapshotConfiguration",
+    "WKWebView",
+] }
 open = "5.0.0"
 ordered-float = "5"
 palette = { version = "0.7.5", default-features = false, features = ["std"] }
@@ -937,6 +946,7 @@ webpki-roots = "1.0.8"
 webrtc-sys = "0.3.23"
 wgpu = "29.0.4"
 which = "8"
+wry = { version = "0.57", default-features = false }
 windows-core = "0.62"
 windows-registry = "0.6.0"
 yaml-rust2 = "0.8"
