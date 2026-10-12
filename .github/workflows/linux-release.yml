@@ -1,0 +1,85 @@
+# Builds the Cod preview for x86_64 Linux and uploads it to a GitHub prerelease.
+# A pushed tag v* makes a prerelease named for the tag; a manual run makes a prerelease preview-<run number>.
+name: Linux release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # No debug info: keeps the target folder and the link step small enough for a free runner.
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/lib/jvm
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Linux dependencies
+        run: |
+          ./script/linux
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        run: |
+          # Installs the toolchain named in rust-toolchain.toml (older rustup does it in `rustup show`).
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      - name: Build
+        run: |
+          cargo build --release -p zed
+          df -h /
+
+      - name: Package
+        run: |
+          mkdir cod
+          cp target/release/zed cod/cod
+          strip cod/cod
+          cp script/cod-xwayland.sh cod/cod-xwayland.sh
+          chmod +x cod/cod cod/cod-xwayland.sh
+          cp LICENSE-GPL LICENSE-APACHE README.md cod/
+          tar -czf cod-linux-x86_64.tar.gz cod
+          ls -l cod cod-linux-x86_64.tar.gz
+
+      - name: Upload to a prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="$REF_NAME"
+          else
+            tag="preview-$RUN_NUMBER"
+          fi
+          gh release create "$tag" cod-linux-x86_64.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Cod preview for x86_64 Linux, built from $GITHUB_SHA. See the README for how to try it."
