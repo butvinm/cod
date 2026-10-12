@@ -27,6 +27,10 @@ actions!(
 
 const DEFAULT_URL: &str = "https://gitlab.com/gitlab-org/gitlab-runner/-/merge_requests/6557";
 
+/// WKWebView's default user agent lacks Safari's "Version/... Safari/..." suffix, and sites behind Cloudflare answer it with an interactive "Verify you are human" check.
+/// The engine is Safari's, so the spike sends Safari's user agent; a real version would read it from the system.
+const SAFARI_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15";
+
 static OPENED_STARTUP_URL: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn init(cx: &mut App) {
@@ -219,6 +223,9 @@ impl NativeWebView {
         let load_events = events.clone();
         let builder = wry::WebViewBuilder::new()
             .with_visible(false)
+            // Like the rest of Zed, the first click into an inactive window should reach the page.
+            .with_accept_first_mouse(true)
+            .with_user_agent(SAFARI_USER_AGENT)
             .with_bounds(wry::Rect {
                 position: LogicalPosition::new(0.0, 0.0).into(),
                 size: LogicalSize::new(0.0, 0.0).into(),

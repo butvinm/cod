@@ -29,7 +29,9 @@ const SNAPSHOT_DIRECTORY: &str = "/tmp/cod-spike";
 const STATE_SCRIPT: &str = r#"JSON.stringify({
   url: location.href,
   title: document.title,
+  userAgent: navigator.userAgent,
   viewport: innerWidth + 'x' + innerHeight,
+  scrollHeight: document.scrollingElement ? document.scrollingElement.scrollHeight : null,
   scrollY: Math.round(window.scrollY),
   scrolledElements: [...document.querySelectorAll('*')]
     .filter(element => element.scrollTop > 0)
@@ -43,6 +45,8 @@ const STATE_SCRIPT: &str = r#"JSON.stringify({
     : null,
   activeValue: document.activeElement && 'value' in document.activeElement ? document.activeElement.value : null,
 })"#;
+
+const SCROLL_POSITION_SCRIPT: &str = r#"JSON.stringify([window.scrollY, ...[...document.querySelectorAll('*')].map(element => element.scrollTop)].join(','))"#;
 
 const SURVEY_SCRIPT: &str = r#"JSON.stringify({
   tabs: [...document.querySelectorAll('.merge-request-tabs a, [role=tab]')]
@@ -102,16 +106,22 @@ async fn run(
 ) -> Result<()> {
     let gitlab_native = wait_for_load(&gitlab, cx).await?;
     sleep(cx, 5).await;
+    // gitlab.com sits behind a Cloudflare check. The driver never clicks its checkbox, it only waits for the check to pass on its own.
+    for _ in 0..30 {
+        let title = evaluate(&gitlab_native, "JSON.stringify(document.title)").await?;
+        if title != "Just a moment..." {
+            break;
+        }
+        sleep(cx, 1).await;
+    }
     log::info!(
         "spike driver: survey {}",
         evaluate(&gitlab_native, SURVEY_SCRIPT).await?
     );
     snapshot(&gitlab_native, "gitlab-mr.png").await?;
 
-    log_state(&gitlab_native, "before scroll").await?;
-    scroll(&gitlab_native, -600)?;
-    sleep(cx, 2).await;
-    log_state(&gitlab_native, "after scroll").await?;
+    scroll_and_check(&gitlab_native, "gitlab", cx).await?;
+    snapshot(&gitlab_native, "gitlab-scrolled.png").await?;
 
     match locate(&gitlab_native, COMMITS_TAB_SCRIPT).await? {
         Some(target) => {
@@ -158,6 +168,7 @@ async fn run(
     sleep(cx, 1).await;
     log_state(&local_native, "local page after typing").await?;
     snapshot(&local_native, "textarea.png").await?;
+    scroll_and_check(&local_native, "local page", cx).await?;
 
     resize_window(&local_native, -240.0, -120.0)?;
     sleep(cx, 1).await;
@@ -296,18 +307,53 @@ fn click(native: &NativeWebView, target: &Target) -> Result<()> {
         .context("creating a mouse event")?;
         window.sendEvent(&event);
     }
+    let hit_view = window
+        .contentView()
+        .and_then(|content_view| {
+            let point = content_view.convertPoint_fromView(location, None);
+            content_view.hitTest(point)
+        })
+        .map(|view| view.class().name().to_string_lossy().into_owned());
     log::info!(
-        "spike driver: clicked {:?} at page ({:.0}, {:.0}) = window ({:.0}, {:.0})",
+        "spike driver: clicked {:?} at page ({:.0}, {:.0}) = window ({:.0}, {:.0}); key_window={} hit_view={hit_view:?} first_responder={:?}",
         target.label,
         target.x,
         target.y,
         location.x,
-        location.y
+        location.y,
+        window.isKeyWindow(),
+        first_responder_name(&window),
     );
     Ok(())
 }
 
-fn scroll(native: &NativeWebView, delta_y: i32) -> Result<()> {
+/// Scrolls through the window first, and if the page did not move, through the hit-tested view directly, logging which route worked.
+async fn scroll_and_check(
+    native: &NativeWebView,
+    label: &str,
+    cx: &mut AsyncWindowContext,
+) -> Result<()> {
+    log_state(native, &format!("{label} before scroll")).await?;
+    let before = evaluate(native, SCROLL_POSITION_SCRIPT).await?;
+    for route in [ScrollRoute::Window, ScrollRoute::HitView] {
+        scroll(native, -600, route)?;
+        sleep(cx, 2).await;
+        log_state(native, &format!("{label} after scroll via {route:?}")).await?;
+        if evaluate(native, SCROLL_POSITION_SCRIPT).await? != before {
+            return Ok(());
+        }
+    }
+    log::warn!("spike driver: {label} did not scroll");
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScrollRoute {
+    Window,
+    HitView,
+}
+
+fn scroll(native: &NativeWebView, delta_y: i32, route: ScrollRoute) -> Result<()> {
     let (view, window) = native_window(native)?;
     let size = view.frame().size;
     let location = point_in_window(&view, size.width / 2.0, size.height / 2.0);
@@ -337,7 +383,15 @@ fn scroll(native: &NativeWebView, delta_y: i32) -> Result<()> {
         location.x,
         location.y,
     );
-    window.sendEvent(&event);
+    match route {
+        ScrollRoute::Window => window.sendEvent(&event),
+        ScrollRoute::HitView => {
+            let content_view = window.contentView().context("no content view")?;
+            let point = content_view.convertPoint_fromView(location, None);
+            let hit_view = content_view.hitTest(point).context("nothing under the point")?;
+            hit_view.scrollWheel(&event);
+        }
+    }
     Ok(())
 }
 
@@ -362,11 +416,17 @@ fn type_text(native: &NativeWebView, text: &str) -> Result<()> {
             window.sendEvent(&event);
         }
     }
-    let first_responder = window
-        .firstResponder()
-        .map(|responder| responder.class().name().to_string_lossy().into_owned());
-    log::info!("spike driver: typed {text:?}, first responder {first_responder:?}");
+    log::info!(
+        "spike driver: typed {text:?}, first responder {:?}",
+        first_responder_name(&window)
+    );
     Ok(())
+}
+
+fn first_responder_name(window: &NSWindow) -> Option<String> {
+    window
+        .firstResponder()
+        .map(|responder| responder.class().name().to_string_lossy().into_owned())
 }
 
 /// macOS virtual key codes for the US layout, enough for the driver's lowercase text.
