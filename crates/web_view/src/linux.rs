@@ -459,10 +459,18 @@ impl Host {
             );
             return Ok(());
         }
-        // SAFETY: both windows are live on GDK's open X11 display.
-        unsafe {
+        // SAFETY: both windows are live on GDK's open X11 display; the trap turns an X error (GPUI's window vanished) into an error here instead of an abort.
+        let error = unsafe {
+            gdkx11::ffi::gdk_x11_display_error_trap_push(x11_display.as_ptr());
             (xlib.XReparentWindow)(xdisplay, xid, self.gpui_window, 0, 0);
             (xlib.XFlush)(xdisplay);
+            gdkx11::ffi::gdk_x11_display_error_trap_pop(x11_display.as_ptr())
+        };
+        if error != 0 {
+            bail!(
+                "reparenting the page window into GPUI window {:#x} failed with X error {error}",
+                self.gpui_window
+            );
         }
         log::info!(
             "web_view: GTK window {xid:#x} reparented into GPUI window {:#x}",
