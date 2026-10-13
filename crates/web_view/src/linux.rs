@@ -130,7 +130,7 @@ impl Host {
             .then(|| screen.lookup_visual(visual_id))
             .flatten()
             .map(|visual| visual.upcast::<gdk::Visual>())
-            .or_else(|| screen.rgba_visual());
+            .or_else(|| screen.upcast_ref::<gdk::Screen>().rgba_visual());
         match visual {
             Some(visual) => {
                 log::info!(
