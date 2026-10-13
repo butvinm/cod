@@ -83,7 +83,7 @@ impl Host {
             gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.as_ptr())
                 as *mut x11_dl::xlib::Display
         };
-        self.match_gpui_visual(x11_display, &xlib, xdisplay);
+        self.match_gpui_visual(&xlib, xdisplay);
         self.window.realize();
         let xid = self
             .window
@@ -109,13 +109,11 @@ impl Host {
     /// Falls back to GDK's RGBA visual when the id cannot be looked up.
     fn match_gpui_visual(
         &self,
-        x11_display: &gdkx11::X11Display,
         xlib: &x11_dl::xlib::Xlib,
         xdisplay: *mut x11_dl::xlib::Display,
     ) {
-        let Some(screen) = x11_display.default_screen()
-            .downcast::<gdkx11::X11Screen>()
-            .ok()
+        let Some(screen) = gdk::Screen::default()
+            .and_then(|screen| screen.downcast::<gdkx11::X11Screen>().ok())
         else {
             return;
         };
