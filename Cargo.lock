@@ -23516,7 +23516,6 @@ dependencies = [
  "assets",
  "audio",
  "auto_update",
- "auto_update_ui",
  "breadcrumbs",
  "call",
  "call_hierarchy",

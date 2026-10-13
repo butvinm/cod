@@ -78,7 +78,6 @@ askpass.workspace = true
 assets.workspace = true
 audio.workspace = true
 auto_update.workspace = true
-auto_update_ui.workspace = true
 breadcrumbs.workspace = true
 call.workspace = true
 call_hierarchy.workspace = true

@@ -1,7 +1,5 @@
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use auto_update::{AutoUpdateEvent, AutoUpdateStatus, AutoUpdater, UpdateCheckType};
 use gpui::{Empty, Render, Task};
 use semver::Version;
@@ -72,31 +70,6 @@ impl UpdateVersion {
         self._up_to_date_timer = None;
     }
 
-    pub fn update_simulation(&mut self, cx: &mut Context<Self>) {
-        let next_state = match self.status {
-            AutoUpdateStatus::Idle => AutoUpdateStatus::Checking,
-            AutoUpdateStatus::Checking => AutoUpdateStatus::Downloading {
-                version: Version::new(1, 99, 0),
-                progress: Some(0.5),
-            },
-            AutoUpdateStatus::Downloading { .. } => AutoUpdateStatus::Installing {
-                version: Version::new(1, 99, 0),
-            },
-            AutoUpdateStatus::Installing { .. } => AutoUpdateStatus::Updated {
-                version: Version::new(1, 99, 0),
-            },
-            AutoUpdateStatus::Updated { .. } => AutoUpdateStatus::Errored {
-                error: Arc::new(anyhow!("Network timeout")),
-            },
-            AutoUpdateStatus::Errored { .. } => AutoUpdateStatus::Idle,
-        };
-
-        self.status = next_state;
-        self.update_check_type = UpdateCheckType::Manual;
-        self.dismissed_status = None;
-        self.hide_up_to_date();
-        cx.notify()
-    }
 
     pub fn show_update_in_menu_bar(&self) -> bool {
         self.is_dismissed() && self.status.is_updated()
