@@ -23515,6 +23515,7 @@ dependencies = [
  "askpass",
  "assets",
  "audio",
+ "auto_update",
  "breadcrumbs",
  "call",
  "call_hierarchy",
