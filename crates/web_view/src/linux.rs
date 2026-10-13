@@ -113,7 +113,7 @@ impl Host {
         xlib: &x11_dl::xlib::Xlib,
         xdisplay: *mut x11_dl::xlib::Display,
     ) {
-        let Some(screen) = gdk::prelude::DisplayExt::default_screen(x11_display)
+        let Some(screen) = x11_display.default_screen()
             .downcast::<gdkx11::X11Screen>()
             .ok()
         else {
@@ -132,7 +132,7 @@ impl Host {
             .then(|| screen.lookup_visual(visual_id))
             .flatten()
             .map(|visual| visual.upcast::<gdk::Visual>())
-            .or_else(|| gdk::prelude::ScreenExt::rgba_visual(&screen));
+            .or_else(|| screen.rgba_visual());
         match visual {
             Some(visual) => {
                 log::info!(
