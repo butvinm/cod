@@ -227,6 +227,7 @@ impl Overlay {
     ///
     /// # Safety
     /// The display and windows must be live.
+    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn stacking(
         &self,
         root: c_ulong,
@@ -302,6 +303,15 @@ impl Overlay {
                 && attributes.y < pane.1 + pane.3
                 && attributes.y + attributes.height > pane.1;
             if overlaps {
+                log::info!(
+                    "web_view: overlay covered by window {:#x} at {},{} {}x{} (override-redirect={})",
+                    *window,
+                    attributes.x,
+                    attributes.y,
+                    attributes.width,
+                    attributes.height,
+                    attributes.override_redirect
+                );
                 covered = true;
                 break;
             }
