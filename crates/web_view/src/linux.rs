@@ -160,7 +160,7 @@ impl Overlay {
         let want = self.want_visible.get();
         // Reads GPUI's window state and, now and then, the stacking order. A failed or trapped request counts as "GPUI's window is not viewable", which hides the overlay until the next good read.
         let probe = if want {
-            self.trapped(|| self.probe(query_stack)).flatten()
+            self.trapped(|| self.probe(query_stack))
         } else {
             None
         };
