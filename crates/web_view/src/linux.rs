@@ -149,26 +149,110 @@ struct Overlay {
     frame: Cell<(i32, i32, i32, i32)>,
     want_visible: Cell<bool>,
     shown: Cell<bool>,
-    covered: Cell<bool>,
+    /// The window that covers the pane, so it is logged once per change.
+    covering: Cell<Option<c_ulong>>,
+    gdk_display: *mut gdkx11::ffi::GdkX11Display,
     last_position: Cell<Option<(i32, i32, i32, i32)>>,
 }
 
 impl Overlay {
     fn sync(&self, query_stack: bool) {
+        let want = self.want_visible.get();
+        // Reads GPUI's window state and, now and then, the stacking order. A failed or trapped request counts as "GPUI's window is not viewable", which hides the overlay until the next good read.
+        let probe = if want {
+            self.trapped(|| self.probe(query_stack)).flatten()
+        } else {
+            None
+        };
+        let viewable = probe.is_some();
+        let mut raise_above = None;
+        let mut position = (0, 0, 1, 1);
+        if let Some(probe) = &probe {
+            let (frame_x, frame_y, width, height) = self.frame.get();
+            position = (probe.root_x + frame_x, probe.root_y + frame_y, width, height);
+            if let Some(stacking) = &probe.stacking {
+                if stacking.covering != self.covering.get() {
+                    if let Some(window) = stacking.covering {
+                        log::info!("web_view: overlay covered by window {window:#x}");
+                    } else {
+                        log::info!("web_view: overlay no longer covered");
+                    }
+                    self.covering.set(stacking.covering);
+                }
+                raise_above = stacking.raise_above;
+            }
+        }
+        let show = want && viewable && self.covering.get().is_none();
+        if show != self.shown.get() {
+            log::info!("web_view: overlay shown={show} (gpui viewable={viewable})");
+            if show {
+                self.window.show_all();
+            } else {
+                self.window.hide();
+            }
+            self.shown.set(show);
+            self.last_position.set(None);
+        }
+        if !show {
+            return;
+        }
+        if self.last_position.get() != Some(position) {
+            self.window.move_(position.0, position.1);
+            self.window.resize(position.2, position.3);
+            self.last_position.set(Some(position));
+        }
+        if let Some(sibling) = raise_above {
+            self.trapped(|| {
+                use x11_dl::xlib;
+                // SAFETY: the display is GDK's open X11 display; a window that vanished makes a trapped X error, not an abort.
+                unsafe {
+                    let mut changes: xlib::XWindowChanges = std::mem::zeroed();
+                    changes.sibling = sibling;
+                    changes.stack_mode = xlib::Above;
+                    (self.xlib.XConfigureWindow)(
+                        self.xdisplay,
+                        self.xid,
+                        (xlib::CWSibling | xlib::CWStackMode) as u32,
+                        &mut changes,
+                    );
+                    (self.xlib.XFlush)(self.xdisplay);
+                }
+                Some(())
+            });
+        }
+    }
+
+    /// Runs X requests with GDK's error trap, so a window that disappears between two requests cannot abort the app.
+    /// Returns None when the closure did, or when X reported an error for any request in it.
+    fn trapped<T>(&self, requests: impl FnOnce() -> Option<T>) -> Option<T> {
+        // SAFETY: the GDK display is the live default one; push and pop are paired.
+        unsafe { gdkx11::ffi::gdk_x11_display_error_trap_push(self.gdk_display) };
+        let result = requests();
+        // SAFETY: as above; pop flushes and returns the first trapped error code, or 0.
+        let error = unsafe { gdkx11::ffi::gdk_x11_display_error_trap_pop(self.gdk_display) };
+        if error != 0 {
+            log::debug!("web_view: overlay X request failed with error {error}");
+            return None;
+        }
+        result
+    }
+
+    /// Reads GPUI's window: None when it cannot be read or is not viewable.
+    fn probe(&self, query_stack: bool) -> Option<Probe> {
         use x11_dl::xlib;
         let xlib_api = &*self.xlib;
-        // SAFETY: the display is GDK's open X11 display, both windows are live on it, and every out-parameter is a local.
+        // SAFETY: called inside the error trap on GDK's open X11 display; every out-parameter is a local.
         unsafe {
             let mut attributes: xlib::XWindowAttributes = std::mem::zeroed();
-            let viewable = (xlib_api.XGetWindowAttributes)(
-                self.xdisplay,
-                self.gpui_window,
-                &mut attributes,
-            ) != 0
-                && attributes.map_state == xlib::IsViewable;
+            if (xlib_api.XGetWindowAttributes)(self.xdisplay, self.gpui_window, &mut attributes)
+                == 0
+                || attributes.map_state != xlib::IsViewable
+            {
+                return None;
+            }
             let (mut root_x, mut root_y) = (0, 0);
             let mut child = 0;
-            (xlib_api.XTranslateCoordinates)(
+            if (xlib_api.XTranslateCoordinates)(
                 self.xdisplay,
                 self.gpui_window,
                 attributes.root,
@@ -177,67 +261,41 @@ impl Overlay {
                 &mut root_x,
                 &mut root_y,
                 &mut child,
-            );
+            ) == 0
+            {
+                return None;
+            }
             let (frame_x, frame_y, width, height) = self.frame.get();
-            let position = (root_x + frame_x, root_y + frame_y, width, height);
-            let mut raise_above = None;
-            if query_stack && self.want_visible.get() && viewable {
-                let (covered, above) = self.stacking(attributes.root, position);
-                if covered != self.covered.get() {
-                    log::info!("web_view: overlay covered by another window={covered}");
-                    self.covered.set(covered);
-                }
-                raise_above = above;
-            }
-            let show = self.want_visible.get() && viewable && !self.covered.get();
-            if show != self.shown.get() {
-                log::info!("web_view: overlay shown={show} (gpui viewable={viewable})");
-                if show {
-                    self.window.show_all();
-                } else {
-                    self.window.hide();
-                }
-                self.shown.set(show);
-                self.last_position.set(None);
-            }
-            if !show {
-                return;
-            }
-            if self.last_position.get() != Some(position) {
-                self.window.move_(position.0, position.1);
-                self.window.resize(position.2, position.3);
-                self.last_position.set(Some(position));
-            }
-            if let Some(sibling) = raise_above {
-                let mut changes: xlib::XWindowChanges = std::mem::zeroed();
-                changes.sibling = sibling;
-                changes.stack_mode = xlib::Above;
-                (xlib_api.XConfigureWindow)(
-                    self.xdisplay,
-                    self.xid,
-                    (xlib::CWSibling | xlib::CWStackMode) as u32,
-                    &mut changes,
-                );
-                (xlib_api.XFlush)(self.xdisplay);
-            }
+            let pane = (root_x + frame_x, root_y + frame_y, width, height);
+            let stacking = if query_stack {
+                // A failed stacking read hides the overlay rather than guessing.
+                Some(self.stacking(attributes.root, pane)?)
+            } else {
+                None
+            };
+            Some(Probe {
+                root_x,
+                root_y,
+                stacking,
+            })
         }
     }
 
-    /// Returns whether a window above GPUI's top-level overlaps the pane, and the window to restack above when the overlay is not directly above GPUI's top-level yet.
+    /// Finds the window above GPUI's top-level that overlaps the pane, if any, and the window to restack above when the overlay is not directly above GPUI's top-level yet.
+    /// None when the tree cannot be read.
     ///
     /// # Safety
-    /// The display and windows must be live.
+    /// Call inside the error trap, on the live display.
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn stacking(
-        &self,
-        root: c_ulong,
-        pane: (i32, i32, i32, i32),
-    ) -> (bool, Option<c_ulong>) {
+    unsafe fn stacking(&self, root: c_ulong, pane: (i32, i32, i32, i32)) -> Option<Stacking> {
         use x11_dl::xlib;
+        /// Real window trees are a few levels deep; more means the tree changed under us.
+        const MAX_DEPTH: usize = 16;
         let xlib_api = &*self.xlib;
         // The child of the root that contains GPUI's window (the window manager's frame, or GPUI's window itself).
         let mut top = self.gpui_window;
-        loop {
+        let mut reached_root = false;
+        for _ in 0..MAX_DEPTH {
             let (mut root_return, mut parent) = (0, 0);
             let mut children = std::ptr::null_mut();
             let mut count = 0;
@@ -250,15 +308,22 @@ impl Overlay {
                 &mut count,
             ) == 0
             {
-                return (false, None);
+                return None;
             }
             if !children.is_null() {
                 (xlib_api.XFree)(children.cast());
             }
-            if parent == root || parent == 0 {
+            if parent == root {
+                reached_root = true;
                 break;
             }
+            if parent == 0 {
+                return None;
+            }
             top = parent;
+        }
+        if !reached_root {
+            return None;
         }
         let (mut root_return, mut parent) = (0, 0);
         let mut children = std::ptr::null_mut();
@@ -272,7 +337,7 @@ impl Overlay {
             &mut count,
         ) == 0
         {
-            return (false, None);
+            return None;
         }
         let list: Vec<c_ulong> = if children.is_null() {
             Vec::new()
@@ -282,16 +347,15 @@ impl Overlay {
         if !children.is_null() {
             (xlib_api.XFree)(children.cast());
         }
-        let Some(top_index) = list.iter().position(|window| *window == top) else {
-            return (false, None);
-        };
+        let top_index = list.iter().position(|window| *window == top)?;
         let own_index = list.iter().position(|window| *window == self.xid);
-        let mut covered = false;
+        let mut covering = None;
         for window in &list[top_index + 1..] {
             if *window == self.xid {
                 continue;
             }
             let mut attributes: xlib::XWindowAttributes = std::mem::zeroed();
+            // A window that vanished since the tree was read fails here; it is simply not a cover.
             if (xlib_api.XGetWindowAttributes)(self.xdisplay, *window, &mut attributes) == 0
                 || attributes.map_state != xlib::IsViewable
                 || attributes.class != xlib::InputOutput
@@ -305,25 +369,35 @@ impl Overlay {
                 && attributes.y < pane.1 + pane.3
                 && attributes.y + attributes.height > pane.1;
             if overlaps {
-                log::info!(
-                    "web_view: overlay covered by window {:#x} at {},{} {}x{} (override-redirect={})",
-                    *window,
-                    attributes.x,
-                    attributes.y,
-                    attributes.width,
-                    attributes.height,
-                    attributes.override_redirect
-                );
-                covered = true;
+                covering = Some(*window);
                 break;
             }
         }
-        let above = match own_index {
+        let raise_above = match own_index {
             Some(index) if index == top_index + 1 => None,
             _ => Some(top),
         };
-        (covered, above)
+        Some(Stacking {
+            covering,
+            raise_above,
+        })
     }
+}
+
+/// What one read of GPUI's window found.
+struct Probe {
+    /// GPUI window origin in root coordinates.
+    root_x: i32,
+    root_y: i32,
+    /// Present on the rounds that read the stacking order.
+    stacking: Option<Stacking>,
+}
+
+struct Stacking {
+    /// A normal top-level window above GPUI's that overlaps the pane.
+    covering: Option<c_ulong>,
+    /// Restack the overlay above this window.
+    raise_above: Option<c_ulong>,
 }
 
 impl Host {
@@ -354,7 +428,7 @@ impl Host {
                 as *mut x11_dl::xlib::Display
         };
         if placement() == Placement::Child {
-            self.match_gpui_visual(&xlib, xdisplay);
+            self.match_gpui_visual(x11_display, &xlib, xdisplay);
         }
         self.window.realize();
         let xid = self
@@ -373,7 +447,8 @@ impl Host {
                 frame: Cell::new((0, 0, 1, 1)),
                 want_visible: Cell::new(false),
                 shown: Cell::new(false),
-                covered: Cell::new(false),
+                covering: Cell::new(None),
+                gdk_display: x11_display.as_ptr(),
                 last_position: Cell::new(None),
             });
             OVERLAYS.with(|overlays| overlays.borrow_mut().push(Rc::downgrade(&overlay)));
@@ -402,6 +477,7 @@ impl Host {
     /// Falls back to GDK's RGBA visual when the id cannot be looked up.
     fn match_gpui_visual(
         &self,
+        x11_display: &gdkx11::X11Display,
         xlib: &x11_dl::xlib::Xlib,
         xdisplay: *mut x11_dl::xlib::Display,
     ) {
@@ -412,11 +488,16 @@ impl Host {
         };
         // SAFETY: zeroed attributes are filled in by the call; the window is GPUI's live one.
         let (visual_id, depth) = unsafe {
+            // A trapped X error (the window vanished) must not abort the app.
+            gdkx11::ffi::gdk_x11_display_error_trap_push(x11_display.as_ptr());
             let mut attributes: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
-            if (xlib.XGetWindowAttributes)(xdisplay, self.gpui_window, &mut attributes) == 0 {
-                (0, 0)
-            } else {
+            let found =
+                (xlib.XGetWindowAttributes)(xdisplay, self.gpui_window, &mut attributes) != 0;
+            let error = gdkx11::ffi::gdk_x11_display_error_trap_pop(x11_display.as_ptr());
+            if found && error == 0 {
                 ((xlib.XVisualIDFromVisual)(attributes.visual), attributes.depth)
+            } else {
+                (0, 0)
             }
         };
         let visual = (visual_id != 0)
