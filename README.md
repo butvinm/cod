@@ -19,7 +19,7 @@ The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through 
 
 To open another page and a folder: `./cod/cod-xwayland.sh <url> <folder>`.
 
-The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output (including panics with a backtrace) go to `~/.local/share/cod-preview/logs/`; if Cod quits unexpectedly, attach the end of `cod-stderr.log` there to your report. Crash files (`.dmp` and `.json`) land in the same folder. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
+The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), most distros with systemd keep a core dump: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
 
 ## Building
 

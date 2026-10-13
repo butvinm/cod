@@ -22,9 +22,6 @@ logs="$HOME/.local/share/cod-preview/logs"
 mkdir -p "$logs"
 RUST_BACKTRACE=1
 export RUST_BACKTRACE
-# Install Zed's crash handler so native crashes write .dmp and .json files into the same logs folder.
-ZED_GENERATE_MINIDUMPS=1
-export ZED_GENERATE_MINIDUMPS
 echo "=== cod start $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$logs/cod-stderr.log"
 
 exec "$here/cod" --user-data-dir "$HOME/.local/share/cod-preview" "$@" 2>> "$logs/cod-stderr.log"
