@@ -19,7 +19,7 @@ The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through 
 
 To open another page and a folder: `./cod/cod-xwayland.sh <url> <folder>`.
 
-The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
+The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output (including panics with a backtrace) go to `~/.local/share/cod-preview/logs/`; if Cod quits unexpectedly, attach the end of `cod-stderr.log` there to your report. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
 
 ## Building
 
