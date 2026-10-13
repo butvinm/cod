@@ -17,4 +17,11 @@ else
 fi
 export COD_SPIKE_URL
 
-exec "$here/cod" --user-data-dir "$HOME/.local/share/cod-preview" "$@"
+# Crashes must leave evidence: stderr (GTK, X errors, WebKit, panics) goes to a file next to Zed's own logs, with Rust backtraces on.
+logs="$HOME/.local/share/cod-preview/logs"
+mkdir -p "$logs"
+RUST_BACKTRACE=1
+export RUST_BACKTRACE
+echo "=== cod start $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$logs/cod-stderr.log"
+
+exec "$here/cod" --user-data-dir "$HOME/.local/share/cod-preview" "$@" 2>> "$logs/cod-stderr.log"
