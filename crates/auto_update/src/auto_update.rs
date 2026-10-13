@@ -11,7 +11,7 @@ use paths::remote_servers_dir;
 use release_channel::{AppCommitSha, ReleaseChannel};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use settings::{RegisterSetting, Settings, SettingsStore};
+use settings::{RegisterSetting, Settings};
 use smol::fs::File;
 use smol::{
     fs,
@@ -30,7 +30,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 use util::command::new_command;
-use workspace::Workspace;
 
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
@@ -259,51 +258,21 @@ impl Settings for AutoUpdateSetting {
     }
 }
 
+/// Cod never updates itself from Zed releases. Changing this is not a setting on purpose.
+const DESKTOP_UPDATES_ENABLED: bool = false;
+
 #[derive(Default)]
 struct GlobalAutoUpdate(Option<Entity<AutoUpdater>>);
 
 impl Global for GlobalAutoUpdate {}
 
+/// Cod: this only creates the global that the remote-server downloads
+/// (`download_remote_server_release`, `get_remote_server_release_url`) need.
+/// It registers no "check for updates" actions and starts no polling,
+/// and `AutoUpdater::poll` is disabled, so Cod never fetches or installs a Zed update.
 pub fn init(client: Arc<Client>, cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|_, action, window, cx| check(action, window, cx));
-
-        workspace.register_action(|_, action, _, cx| {
-            view_release_notes(action, cx);
-        });
-    })
-    .detach();
-
     let version = release_channel::AppVersion::global(cx);
-    let auto_updater = cx.new(|cx| {
-        let updater = AutoUpdater::new(version, client, cx);
-
-        let poll_for_updates = ReleaseChannel::try_global(cx)
-            .map(|channel| channel.poll_for_updates())
-            .unwrap_or(false);
-
-        if option_env!("ZED_UPDATE_EXPLANATION").is_none()
-            && env::var("ZED_UPDATE_EXPLANATION").is_err()
-            && poll_for_updates
-        {
-            let mut update_subscription = AutoUpdateSetting::get_global(cx)
-                .0
-                .then(|| updater.start_polling(cx));
-
-            cx.observe_global::<SettingsStore>(move |updater: &mut AutoUpdater, cx| {
-                if AutoUpdateSetting::get_global(cx).0 {
-                    if update_subscription.is_none() {
-                        update_subscription = Some(updater.start_polling(cx))
-                    }
-                } else {
-                    update_subscription.take();
-                }
-            })
-            .detach();
-        }
-
-        updater
-    });
+    let auto_updater = cx.new(|cx| AutoUpdater::new(version, client, cx));
     cx.set_global(GlobalAutoUpdate(Some(auto_updater)));
 }
 
@@ -519,6 +488,10 @@ impl AutoUpdater {
     }
 
     pub fn poll(&mut self, check_type: UpdateCheckType, cx: &mut Context<Self>) {
+        // Cod: every desktop update check, download and install starts here. Disabled for good.
+        if !DESKTOP_UPDATES_ENABLED {
+            return;
+        }
         if check_type.is_manual() {
             self.dismissed_status = None;
         }
@@ -1386,7 +1359,7 @@ mod tests {
     #[gpui::test]
     fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let mut store = SettingsStore::new(cx, &settings::default_settings());
+            let mut store = settings::SettingsStore::new(cx, &settings::default_settings());
             store
                 .set_default_settings(&default_settings(), cx)
                 .expect("Unable to set default settings");
