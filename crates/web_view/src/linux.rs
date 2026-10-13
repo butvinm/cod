@@ -73,6 +73,17 @@ impl Host {
 
     /// Realizes the GTK window and moves it under GPUI's window. Call after wry has added the web view.
     pub(crate) fn attach(&self) -> anyhow::Result<()> {
+        let display = gdk::Display::default().context("no GDK display")?;
+        let x11_display = display
+            .downcast_ref::<gdkx11::X11Display>()
+            .context("GDK is not on X11")?;
+        let xlib = x11_dl::xlib::Xlib::open().context("loading libX11")?;
+        // SAFETY: the display is GDK's open X11 display and GPUI's window is live on it.
+        let xdisplay = unsafe {
+            gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.as_ptr())
+                as *mut x11_dl::xlib::Display
+        };
+        self.match_gpui_visual(x11_display, &xlib, xdisplay);
         self.window.realize();
         let xid = self
             .window
@@ -80,15 +91,8 @@ impl Host {
             .and_then(|window| window.downcast::<gdkx11::X11Window>().ok())
             .context("the GTK window has no X11 window")?
             .xid();
-        let display = gdk::Display::default().context("no GDK display")?;
-        let x11_display = display
-            .downcast_ref::<gdkx11::X11Display>()
-            .context("GDK is not on X11")?;
-        let xlib = x11_dl::xlib::Xlib::open().context("loading libX11")?;
         // SAFETY: both windows are live on GDK's open X11 display.
         unsafe {
-            let xdisplay = gdkx11::ffi::gdk_x11_display_get_xdisplay(x11_display.as_ptr())
-                as *mut x11_dl::xlib::Display;
             (xlib.XReparentWindow)(xdisplay, xid, self.gpui_window, 0, 0);
             (xlib.XFlush)(xdisplay);
         }
@@ -97,6 +101,50 @@ impl Host {
             self.gpui_window
         );
         Ok(())
+    }
+
+    /// Gives the GTK window the visual of GPUI's window (a 32-bit ARGB one) before it is realized.
+    /// GPUI picks a transparent visual, GTK's popup would take the screen default (24 bit).
+    /// A child of another depth inside an ARGB parent can lose its content when the X server hands the parent to a compositor, as XWayland does (issue #5).
+    /// Falls back to GDK's RGBA visual when the id cannot be looked up.
+    fn match_gpui_visual(
+        &self,
+        x11_display: &gdkx11::X11Display,
+        xlib: &x11_dl::xlib::Xlib,
+        xdisplay: *mut x11_dl::xlib::Display,
+    ) {
+        let Some(screen) = gdk::prelude::DisplayExt::default_screen(x11_display)
+            .downcast::<gdkx11::X11Screen>()
+            .ok()
+        else {
+            return;
+        };
+        // SAFETY: zeroed attributes are filled in by the call; the window is GPUI's live one.
+        let (visual_id, depth) = unsafe {
+            let mut attributes: x11_dl::xlib::XWindowAttributes = std::mem::zeroed();
+            if (xlib.XGetWindowAttributes)(xdisplay, self.gpui_window, &mut attributes) == 0 {
+                (0, 0)
+            } else {
+                ((xlib.XVisualIDFromVisual)(attributes.visual), attributes.depth)
+            }
+        };
+        let visual = (visual_id != 0)
+            .then(|| screen.lookup_visual(visual_id))
+            .flatten()
+            .map(|visual| visual.upcast::<gdk::Visual>())
+            .or_else(|| gdk::prelude::ScreenExt::rgba_visual(&screen));
+        match visual {
+            Some(visual) => {
+                log::info!(
+                    "web_view: GPUI window visual {visual_id:#x} depth {depth}; GTK window gets a visual of depth {}",
+                    visual.depth()
+                );
+                self.window.set_visual(Some(&visual));
+            }
+            None => log::warn!(
+                "web_view: GPUI window visual {visual_id:#x} depth {depth}; no matching GTK visual, the page window keeps the default"
+            ),
+        }
     }
 
     pub(crate) fn set_bounds(&self, x: i32, y: i32, width: i32, height: i32) {
