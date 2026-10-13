@@ -408,8 +408,10 @@ impl AutoUpdater {
         // the app after an update, we use `set_restart_path` to run the auto
         // update helper instead of the app, so that it can overwrite the app
         // and then spawn the new binary.
+        // Cod: this quit hook installs a staged update, so it is off with desktop updates.
         #[cfg(target_os = "windows")]
-        let quit_subscription = Some(cx.on_app_quit(|_, _| finalize_auto_update_on_quit()));
+        let quit_subscription = DESKTOP_UPDATES_ENABLED
+            .then(|| cx.on_app_quit(|_, _| finalize_auto_update_on_quit()));
         #[cfg(not(target_os = "windows"))]
         let quit_subscription = None;
 
@@ -1306,6 +1308,9 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
 }
 
 pub async fn finalize_auto_update_on_quit() {
+    if !DESKTOP_UPDATES_ENABLED {
+        return;
+    }
     let Some(installer_path) = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.join("updates")))
@@ -1333,15 +1338,14 @@ pub async fn finalize_auto_update_on_quit() {
 mod tests {
     use client::Client;
     use clock::FakeSystemClock;
-    use futures::channel::oneshot;
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use http_client::{FakeHttpClient, Response};
     use settings::default_settings;
     use std::{
         rc::Rc,
         sync::{
             Arc,
-            atomic::{self, AtomicBool},
+            atomic::{self, AtomicUsize},
         },
     };
     use tempfile::tempdir;
@@ -1372,12 +1376,10 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_auto_update_downloads(cx: &mut TestAppContext) {
+    async fn test_desktop_updates_never_run(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
         zlog::init_test();
-        let release_available = Arc::new(AtomicBool::new(false));
-
-        let (dmg_tx, dmg_rx) = oneshot::channel::<String>();
+        let requests = Arc::new(AtomicUsize::new(0));
 
         cx.update(|cx| {
             settings::init(cx);
@@ -1386,29 +1388,17 @@ mod tests {
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);
 
             let clock = Arc::new(FakeSystemClock::new());
-            let release_available = Arc::clone(&release_available);
-            let dmg_rx = Arc::new(parking_lot::Mutex::new(Some(dmg_rx)));
-            let fake_client_http = FakeHttpClient::create(move |req| {
-                let release_available = release_available.load(atomic::Ordering::Relaxed);
-                let dmg_rx = dmg_rx.clone();
+            let requests = Arc::clone(&requests);
+            let fake_client_http = FakeHttpClient::create(move |_req| {
+                requests.fetch_add(1, atomic::Ordering::SeqCst);
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
-                    if release_available {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
-                        ).unwrap());
-                    } else {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
-                        ).unwrap());
-                    }
-                } else if req.uri().path() == "/new-download" {
-                    return Ok(Response::builder().status(200).body({
-                        let dmg_rx = dmg_rx.lock().take().unwrap();
-                        dmg_rx.await.unwrap().into()
-                    }).unwrap());
-                }
-                Ok(Response::builder().status(404).body("".into()).unwrap())
+                    Ok(Response::builder()
+                        .status(200)
+                        .body(
+                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#
+                                .into(),
+                        )
+                        .unwrap())
                 }
             });
             let client = Client::new(clock, fake_client_http, cx);
@@ -1416,71 +1406,33 @@ mod tests {
         });
 
         let auto_updater = cx.update(|cx| AutoUpdater::get(cx).expect("auto updater should exist"));
+        let assert_idle_and_silent = |cx: &mut TestAppContext, step: &str| {
+            cx.background_executor.run_until_parked();
+            auto_updater.read_with(cx, |updater, _| {
+                assert_eq!(updater.status(), AutoUpdateStatus::Idle, "{step}");
+            });
+            assert_eq!(requests.load(atomic::Ordering::SeqCst), 0, "{step}");
+        };
 
-        cx.background_executor.run_until_parked();
+        assert_idle_and_silent(cx, "after startup");
 
-        auto_updater.read_with(cx, |updater, _| {
-            assert_eq!(updater.status(), AutoUpdateStatus::Idle);
-            assert_eq!(updater.current_version(), semver::Version::new(0, 100, 0));
-        });
-
-        release_available.store(true, atomic::Ordering::SeqCst);
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.background_executor.run_until_parked();
-
-        loop {
-            cx.background_executor.timer(Duration::from_millis(0)).await;
-            cx.run_until_parked();
-            let status = auto_updater.read_with(cx, |updater, _| updater.status());
-            if !matches!(status, AutoUpdateStatus::Idle) {
-                break;
-            }
-        }
-        let status = auto_updater.read_with(cx, |updater, _| updater.status());
-        assert_eq!(
-            status,
-            AutoUpdateStatus::Downloading {
-                version: semver::Version::new(0, 100, 1),
-                progress: None,
-            }
-        );
-
-        dmg_tx.send("<fake-zed-update>".to_owned()).unwrap();
-
-        let tmp_dir = Arc::new(tempdir().unwrap());
+        cx.background_executor.advance_clock(POLL_INTERVAL * 3);
+        assert_idle_and_silent(cx, "after advancing the clock");
 
         cx.update(|cx| {
-            let tmp_dir = tmp_dir.clone();
-            cx.set_global(InstallOverride(Rc::new(move |target_path, _cx| {
-                let tmp_dir = tmp_dir.clone();
-                let dest_path = tmp_dir.path().join("zed");
-                std::fs::copy(&target_path, &dest_path)?;
-                Ok(Some(dest_path))
-            })));
+            cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(r#"{ "auto_update": true }"#, cx)
+                    .expect("Unable to set user settings");
+            });
         });
+        cx.background_executor.advance_clock(POLL_INTERVAL);
+        assert_idle_and_silent(cx, "after enabling the auto_update setting");
 
-        loop {
-            cx.background_executor.timer(Duration::from_millis(0)).await;
-            cx.run_until_parked();
-            let status = auto_updater.read_with(cx, |updater, _| updater.status());
-            if !matches!(status, AutoUpdateStatus::Downloading { .. }) {
-                break;
-            }
-        }
-        let status = auto_updater.read_with(cx, |updater, _| updater.status());
-        assert_eq!(
-            status,
-            AutoUpdateStatus::Updated {
-                version: semver::Version::new(0, 100, 1)
-            }
-        );
-        let will_restart = cx.expect_restart();
-        cx.update(|cx| cx.restart());
-        let (path, arguments) = will_restart.await.unwrap();
-        assert!(arguments.is_empty());
-        let path = path.unwrap();
-        assert_eq!(path, tmp_dir.path().join("zed"));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-zed-update>");
+        auto_updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Manual, cx);
+        });
+        assert_idle_and_silent(cx, "after a manual check");
     }
 
     #[gpui::test]
