@@ -295,6 +295,8 @@ impl Overlay {
             if (xlib_api.XGetWindowAttributes)(self.xdisplay, *window, &mut attributes) == 0
                 || attributes.map_state != xlib::IsViewable
                 || attributes.class != xlib::InputOutput
+                // Override-redirect windows are menus and tooltips; the page's own tooltips are among them and must not hide the page.
+                || attributes.override_redirect != 0
             {
                 continue;
             }
