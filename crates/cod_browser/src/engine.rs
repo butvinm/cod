@@ -1,7 +1,11 @@
 use std::{
     collections::HashMap,
     io::{BufReader, BufWriter, Write},
-    os::{fd::FromRawFd as _, unix::net::UnixStream},
+    mem::ManuallyDrop,
+    os::{
+        fd::{AsRawFd as _, FromRawFd as _},
+        unix::net::UnixStream,
+    },
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -347,11 +351,27 @@ pub fn main() {
         std::process::exit(2);
     };
     // Cod starts the helper with one end of a socket pair as its standard input, so there is no socket path another process could connect to.
-    // SAFETY: file descriptor 0 is owned by this process and nothing else in it uses standard input.
-    let stream = unsafe { UnixStream::from_raw_fd(0) };
-    if stream.local_addr().is_err() {
+    // SAFETY: file descriptor 0 is owned by this process and nothing else in it uses standard input. It is never dropped here: it is replaced below.
+    let original = ManuallyDrop::new(unsafe { UnixStream::from_raw_fd(0) });
+    if original.local_addr().is_err() {
         eprintln!("cod-browser: standard input is not a socket, it is meant to be started by Cod");
         std::process::exit(2);
+    }
+    // Keep the connection on a close-on-exec duplicate and point standard input at /dev/null, so no process CEF starts can inherit the control socket.
+    let stream = match original.try_clone() {
+        Ok(stream) => stream,
+        Err(error) => {
+            eprintln!("cod-browser: cannot duplicate the connection: {error}");
+            std::process::exit(2);
+        }
+    };
+    match std::fs::File::open("/dev/null") {
+        // SAFETY: both descriptors are valid; dup2 atomically makes descriptor 0 refer to /dev/null.
+        Ok(null) if unsafe { libc::dup2(null.as_raw_fd(), 0) } == 0 => {}
+        other => {
+            eprintln!("cod-browser: cannot redirect standard input: {other:?}");
+            std::process::exit(2);
+        }
     }
     let (out, outgoing) = mpsc::channel::<Outgoing>();
     let pages: Pages = Arc::new(Mutex::new(HashMap::new()));

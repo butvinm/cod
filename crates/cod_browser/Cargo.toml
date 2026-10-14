@@ -17,3 +17,4 @@ doctest = false
 # The binary does nothing on other platforms, so the CEF crates are only fetched and built on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
 cef.workspace = true
+libc.workspace = true
