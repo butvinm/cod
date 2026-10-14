@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{BufReader, BufWriter, Write},
-    os::unix::net::UnixStream,
+    os::{fd::FromRawFd as _, unix::net::UnixStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -316,20 +316,17 @@ pub fn main() {
         std::process::exit(code.max(0));
     }
 
-    let (Some(socket_path), Some(cache)) = (
-        switch_value("--cod-socket="),
-        switch_value("--cod-cache="),
-    ) else {
-        eprintln!("cod-browser: started without --cod-socket and --cod-cache, it is meant to be started by Cod");
+    let Some(cache) = switch_value("--cod-cache=") else {
+        eprintln!("cod-browser: started without --cod-cache, it is meant to be started by Cod");
         std::process::exit(2);
     };
-    let stream = match UnixStream::connect(&socket_path) {
-        Ok(stream) => stream,
-        Err(error) => {
-            eprintln!("cod-browser: cannot connect to {socket_path}: {error}");
-            std::process::exit(2);
-        }
-    };
+    // Cod starts the helper with one end of a socket pair as its standard input, so there is no socket path another process could connect to.
+    // SAFETY: file descriptor 0 is owned by this process and nothing else in it uses standard input.
+    let stream = unsafe { UnixStream::from_raw_fd(0) };
+    if stream.local_addr().is_err() {
+        eprintln!("cod-browser: standard input is not a socket, it is meant to be started by Cod");
+        std::process::exit(2);
+    }
     let (out, outgoing) = mpsc::channel::<Outgoing>();
     let pages: Pages = Arc::new(Mutex::new(HashMap::new()));
 

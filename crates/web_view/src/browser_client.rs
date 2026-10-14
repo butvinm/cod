@@ -5,19 +5,18 @@
 use std::{
     collections::HashMap,
     io::BufReader,
-    os::unix::net::{UnixListener, UnixStream},
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context as _, Result, bail};
 use futures::channel::mpsc::UnboundedSender;
-use util::ResultExt as _;
 
 #[path = "../../cod_browser/src/protocol.rs"]
 #[allow(dead_code)]
@@ -90,20 +89,15 @@ fn client(data_dir: &Path) -> Result<Arc<Client>> {
 
 fn start(data_dir: &Path) -> Result<Arc<Client>> {
     let helper = helper_path()?;
-    let socket_path =
-        std::env::temp_dir().join(format!("cod-browser-{}.sock", std::process::id()));
-    std::fs::remove_file(&socket_path).ok();
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("listening on {}", socket_path.display()))?;
-    listener.set_nonblocking(true)?;
     let cache = data_dir.join("cef");
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
 
+    // The helper gets one end of a socket pair as its standard input: there is no path in the file system that another process could connect to.
+    let (stream, helper_end) = UnixStream::pair().context("creating the helper connection")?;
     let mut command = Command::new(&helper);
     command
-        .arg(format!("--cod-socket={}", socket_path.display()))
         .arg(format!("--cod-cache={}", cache.display()))
-        .stdin(Stdio::null());
+        .stdin(Stdio::from(OwnedFd::from(helper_end)));
     if let Ok(dir) = std::env::var("COD_CEF_DIR") {
         let library_path = match std::env::var("LD_LIBRARY_PATH") {
             Ok(existing) if !existing.is_empty() => format!("{dir}:{existing}"),
@@ -111,31 +105,12 @@ fn start(data_dir: &Path) -> Result<Arc<Client>> {
         };
         command.env("LD_LIBRARY_PATH", library_path);
     }
-    let mut child = command
+    let started = Instant::now();
+    let child = command
         .spawn()
         .with_context(|| format!("starting {}", helper.display()))?;
-
-    let started = Instant::now();
-    let stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if let Some(status) = child.try_wait()? {
-                    bail!("the cod-browser helper exited at start-up: {status}");
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    child.kill().ok();
-                    bail!("the cod-browser helper did not connect within 30 seconds");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error).context("accepting the cod-browser helper"),
-        }
-    };
-    std::fs::remove_file(&socket_path).log_err();
-    stream.set_nonblocking(false)?;
     log::info!(
-        "web_view: cod-browser helper {} connected after {:?}",
+        "web_view: cod-browser helper {} started in {:?}",
         helper.display(),
         started.elapsed()
     );
