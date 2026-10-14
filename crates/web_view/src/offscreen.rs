@@ -386,11 +386,13 @@ fn windows_key_code(keystroke: &Keystroke) -> Option<i32> {
         "right" => 0x27,
         "down" => 0x28,
         "delete" => 0x2E,
+        "insert" => 0x2D,
+        key if function_key_number(key).is_some() => 0x70 + function_key_number(key)? - 1,
         key => {
             let mut chars = key.chars();
             let first = chars.next()?;
             if chars.next().is_some() {
-                // Function keys and the like are not forwarded in the proof.
+                // Other named keys have no forwarding yet.
                 return None;
             }
             match first {
@@ -402,6 +404,12 @@ fn windows_key_code(keystroke: &Keystroke) -> Option<i32> {
         }
     };
     Some(code)
+}
+
+/// 1 to 12 for "f1" to "f12".
+fn function_key_number(key: &str) -> Option<i32> {
+    let number: i32 = key.strip_prefix('f')?.parse().ok()?;
+    (1..=12).contains(&number).then_some(number)
 }
 
 fn page_point(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (i32, i32) {
@@ -667,8 +675,16 @@ mod tests {
 
     #[test]
     fn keys_without_a_mapping_are_not_forwarded() {
-        assert_eq!(windows_key_code(&keystroke("f5")), None);
+        assert_eq!(windows_key_code(&keystroke("f13")), None);
+        assert_eq!(windows_key_code(&keystroke("f0")), None);
         assert_eq!(windows_key_code(&keystroke("")), None);
+    }
+
+    #[test]
+    fn function_keys_f1_to_f12_are_forwarded() {
+        assert_eq!(windows_key_code(&keystroke("f1")), Some(0x70));
+        assert_eq!(windows_key_code(&keystroke("f5")), Some(0x74));
+        assert_eq!(windows_key_code(&keystroke("f12")), Some(0x7B));
     }
 
     #[test]
