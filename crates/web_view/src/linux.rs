@@ -100,6 +100,11 @@ pub(crate) struct Host {
     overlay: RefCell<Option<Rc<Overlay>>>,
 }
 
+/// True when COD_GPUI_X11_INNER_WINDOW=1, the same switch GPUI reads to render into an inner child window.
+fn gpui_inner_window_enabled() -> bool {
+    std::env::var("COD_GPUI_X11_INNER_WINDOW").is_ok_and(|value| value == "1")
+}
+
 /// Where the page window lives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Placement {
@@ -463,6 +468,11 @@ impl Host {
         let error = unsafe {
             gdkx11::ffi::gdk_x11_display_error_trap_push(x11_display.as_ptr());
             (xlib.XReparentWindow)(xdisplay, xid, self.gpui_window, 0, 0);
+            if gpui_inner_window_enabled() {
+                // GPUI renders into an inner child of its toplevel (COD_GPUI_X11_INNER_WINDOW);
+                // the page is its sibling and must stay above it. The toplevel id is the handle GPUI exposes.
+                (xlib.XRaiseWindow)(xdisplay, xid);
+            }
             (xlib.XFlush)(xdisplay);
             gdkx11::ffi::gdk_x11_display_error_trap_pop(x11_display.as_ptr())
         };
@@ -473,8 +483,9 @@ impl Host {
             );
         }
         log::info!(
-            "web_view: GTK window {xid:#x} reparented into GPUI window {:#x}",
-            self.gpui_window
+            "web_view: GTK window {xid:#x} reparented into GPUI window {:#x} (above GPUI's inner render window: {})",
+            self.gpui_window,
+            gpui_inner_window_enabled()
         );
         Ok(())
     }

@@ -87,6 +87,16 @@ x11rb::atom_manager! {
     }
 }
 
+/// Cod (issue #5): when COD_GPUI_X11_INNER_WINDOW=1, GPUI renders into an InputOutput child of its
+/// toplevel instead of the toplevel itself. Under XWayland the toplevel's own Vulkan frames are
+/// presented directly, so child windows of other clients (the web view's page) are never composited.
+pub(crate) fn inner_window_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("COD_GPUI_X11_INNER_WINDOW").is_ok_and(|value| value == "1")
+    })
+}
+
 fn query_render_extent(
     xcb: &Rc<XCBConnection>,
     x_window: xproto::Window,
@@ -263,6 +273,8 @@ pub struct X11WindowState {
     client: X11ClientStatePtr,
     executor: ForegroundExecutor,
     atoms: XcbAtoms,
+    /// The window the renderer draws into: the inner child, or the toplevel when the switch is off.
+    pub(crate) render_window: xproto::Window,
     x_root_window: xproto::Window,
     x_screen_index: usize,
     visual_id: u32,
@@ -746,6 +758,39 @@ impl X11WindowState {
                 ),
             )?;
 
+            let render_window = if inner_window_enabled() {
+                // The child selects only Expose (which is never propagated to the parent). Key,
+                // pointer and XInput events are not selected on it, so the X server delivers them
+                // to the toplevel, which keeps all of GPUI's event selection.
+                let inner = xcb.generate_id()?;
+                let inner_aux = xproto::CreateWindowAux::new()
+                    .border_pixel(visual_set.black_pixel)
+                    .colormap(colormap)
+                    .event_mask(xproto::EventMask::EXPOSURE);
+                check_reply(
+                    || "X11 CreateWindow for the inner render window failed.",
+                    xcb.create_window(
+                        visual.depth,
+                        inner,
+                        x_window,
+                        0,
+                        0,
+                        bounds.size.width.0 as u16,
+                        bounds.size.height.0 as u16,
+                        0,
+                        xproto::WindowClass::INPUT_OUTPUT,
+                        visual.id,
+                        &inner_aux,
+                    ),
+                )?;
+                check_reply(
+                    || "X11 MapWindow for the inner render window failed.",
+                    xcb.map_window(inner),
+                )?;
+                inner
+            } else {
+                x_window
+            };
             xcb_flush(xcb);
 
             let mut renderer = {
@@ -754,13 +799,13 @@ impl X11WindowState {
                         xcb,
                     ) as *mut _,
                     screen_id: x_screen_index,
-                    window_id: x_window,
+                    window_id: render_window,
                     visual_id: visual.id,
                 };
                 let config = WgpuSurfaceConfig {
                     // Note: this has to be done after the GPU init, or otherwise
                     // the sizes are immediately invalidated.
-                    size: query_render_extent(xcb, x_window)?,
+                    size: query_render_extent(xcb, render_window)?,
                     // We set it to transparent by default, even if we have client-side
                     // decorations, since those seem to work on X11 even without `true` here.
                     // If the window appearance changes, then the renderer will get updated
@@ -830,6 +875,7 @@ impl X11WindowState {
                 scale_factor,
                 renderer,
                 atoms: *atoms,
+                render_window,
                 input_handler: None,
                 active: false,
                 // The window is not mapped until the client sees `MapNotify`.
@@ -1291,6 +1337,7 @@ impl X11WindowStatePtr {
     }
 
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
+        let device_size = bounds.size;
         let (is_resize, content_size, scale_factor) = {
             let mut state = self.state.borrow_mut();
             let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
@@ -1306,7 +1353,19 @@ impl X11WindowStatePtr {
                 state.bounds = bounds;
             }
 
-            let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
+            if state.render_window != self.x_window {
+                // The inner window always covers the toplevel's whole client area.
+                check_reply(
+                    || "X11 ConfigureWindow for the inner render window failed.",
+                    self.xcb.configure_window(
+                        state.render_window,
+                        &xproto::ConfigureWindowAux::new()
+                            .width(device_size.width.max(1) as u32)
+                            .height(device_size.height.max(1) as u32),
+                    ),
+                )?;
+            }
+            let gpu_size = query_render_extent(&self.xcb, state.render_window)?;
             state.renderer.update_drawable_size(gpu_size);
             let result = (is_resize, state.content_size(), state.scale_factor);
             if let Some(value) = state.last_sync_counter.take() {
@@ -1753,7 +1812,7 @@ impl PlatformWindow for X11Window {
                     &*self.0.xcb,
                 ) as *mut _,
                 screen_id: inner.x_screen_index,
-                window_id: self.0.x_window,
+                window_id: inner.render_window,
                 visual_id: inner.visual_id,
             };
             match inner.renderer.recover(&raw_window) {
