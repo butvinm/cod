@@ -34,20 +34,45 @@ pub(crate) struct PageFrame {
 pub(crate) enum PageEvent {
     /// A newer frame is waiting in `Page::take_frame`.
     Frame,
-    Title(String),
-    Address(String),
-    Loading(bool),
-    Console(String),
+    /// Title, address, loading state or console output changed: see `Page::take_diagnostics`.
+    Diagnostics,
     Created,
     Closed,
     /// The helper died or was cut off: the page is gone and will not paint again.
     Failed(String),
 }
 
+/// Console messages kept per page between two looks by the UI; later ones are counted and dropped.
+const MAX_PENDING_CONSOLE: usize = 64;
+
+/// What the page reported since the UI last looked. Title, address and loading state keep only the latest value, console output is capped, so a busy UI never accumulates an unbounded backlog.
+#[derive(Default)]
+pub(crate) struct Diagnostics {
+    pub title: Option<String>,
+    pub address: Option<String>,
+    pub loading: Option<bool>,
+    pub console: Vec<String>,
+    pub dropped_console: usize,
+}
+
 struct Slot {
     events: UnboundedSender<PageEvent>,
     latest: Mutex<Option<PageFrame>>,
     frame_signalled: AtomicBool,
+    diagnostics: Mutex<Diagnostics>,
+    diagnostics_signalled: AtomicBool,
+}
+
+impl Slot {
+    /// Records a diagnostic change and wakes the UI once, however many more arrive before it looks.
+    fn record(&self, update: impl FnOnce(&mut Diagnostics)) {
+        if let Ok(mut diagnostics) = self.diagnostics.lock() {
+            update(&mut diagnostics);
+        }
+        if !self.diagnostics_signalled.swap(true, Ordering::AcqRel) {
+            self.events.unbounded_send(PageEvent::Diagnostics).ok();
+        }
+    }
 }
 
 /// Commands waiting for the writer thread. When it is full the helper is not keeping up.
@@ -313,22 +338,28 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
             }
             FromBrowser::Title { page, title } => {
                 if let Some(slot) = slot(page) {
-                    slot.events.unbounded_send(PageEvent::Title(title)).ok();
+                    slot.record(|diagnostics| diagnostics.title = Some(title));
                 }
             }
             FromBrowser::Address { page, url } => {
                 if let Some(slot) = slot(page) {
-                    slot.events.unbounded_send(PageEvent::Address(url)).ok();
+                    slot.record(|diagnostics| diagnostics.address = Some(url));
                 }
             }
             FromBrowser::Loading { page, loading } => {
                 if let Some(slot) = slot(page) {
-                    slot.events.unbounded_send(PageEvent::Loading(loading)).ok();
+                    slot.record(|diagnostics| diagnostics.loading = Some(loading));
                 }
             }
             FromBrowser::Console { page, message } => {
                 if let Some(slot) = slot(page) {
-                    slot.events.unbounded_send(PageEvent::Console(message)).ok();
+                    slot.record(|diagnostics| {
+                        if diagnostics.console.len() < MAX_PENDING_CONSOLE {
+                            diagnostics.console.push(message);
+                        } else {
+                            diagnostics.dropped_console += 1;
+                        }
+                    });
                 }
             }
             FromBrowser::Closed { page } => {
@@ -463,6 +494,8 @@ impl Page {
             events,
             latest: Mutex::new(None),
             frame_signalled: AtomicBool::new(false),
+            diagnostics: Mutex::new(Diagnostics::default()),
+            diagnostics_signalled: AtomicBool::new(false),
         });
         client
             .slots
@@ -492,6 +525,16 @@ impl Page {
     pub fn take_frame(&self) -> Option<PageFrame> {
         self.slot.frame_signalled.store(false, Ordering::Release);
         self.slot.latest.lock().ok()?.take()
+    }
+
+    /// What the page reported since the last call. Clears the signal so the next change sends a new event.
+    pub fn take_diagnostics(&self) -> Diagnostics {
+        self.slot.diagnostics_signalled.store(false, Ordering::Release);
+        self.slot
+            .diagnostics
+            .lock()
+            .map(|mut diagnostics| std::mem::take(&mut *diagnostics))
+            .unwrap_or_default()
     }
 
     pub fn resize(&self, width: i32, height: i32, scale: f32) {

@@ -38,6 +38,8 @@ enum Outgoing {
     Message(FromBrowser),
     /// A newer frame of this page is waiting in its slot.
     FrameReady(u32),
+    /// Title, address or loading state of this page changed; only the latest values are sent.
+    MetaReady(u32),
 }
 
 struct PageView {
@@ -58,13 +60,33 @@ struct PageState {
     frame_pending: AtomicBool,
     browser: Mutex<Option<BrowserHandle>>,
     close_requested: AtomicBool,
+    meta: Mutex<PageMeta>,
+    meta_pending: AtomicBool,
     out: mpsc::Sender<Outgoing>,
     pages: Pages,
+}
+
+/// The latest title, address and loading state not yet sent.
+#[derive(Default)]
+struct PageMeta {
+    title: Option<String>,
+    address: Option<String>,
+    loading: Option<bool>,
 }
 
 type Pages = Arc<Mutex<HashMap<u32, Arc<PageState>>>>;
 
 impl PageState {
+    /// Keeps only the latest value of each and queues at most one notification, however fast the page changes them.
+    fn update_meta(&self, update: impl FnOnce(&mut PageMeta)) {
+        if let Ok(mut meta) = self.meta.lock() {
+            update(&mut meta);
+        }
+        if !self.meta_pending.swap(true, Ordering::AcqRel) {
+            self.out.send(Outgoing::MetaReady(self.id)).ok();
+        }
+    }
+
     fn send(&self, message: FromBrowser) {
         self.out.send(Outgoing::Message(message)).ok();
     }
@@ -182,7 +204,7 @@ wrap_load_handler! {
             _can_go_forward: ::std::os::raw::c_int,
         ) {
             let state = &self.handler.state;
-            state.send(FromBrowser::Loading { page: state.id, loading: is_loading != 0 });
+            state.update_meta(|meta| meta.loading = Some(is_loading != 0));
         }
     }
 }
@@ -197,7 +219,7 @@ wrap_display_handler! {
             let state = &self.handler.state;
             if let Some(title) = title {
                 let title = limited(&title.to_string(), MAX_TITLE_BYTES);
-                state.send(FromBrowser::Title { page: state.id, title });
+                state.update_meta(|meta| meta.title = Some(title));
             }
         }
 
@@ -210,7 +232,7 @@ wrap_display_handler! {
             let state = &self.handler.state;
             if let Some(url) = url {
                 let url = limited(&url.to_string(), MAX_URL_BYTES);
-                state.send(FromBrowser::Address { page: state.id, url });
+                state.update_meta(|meta| meta.address = Some(url));
             }
         }
 
@@ -397,6 +419,27 @@ fn write_loop(stream: UnixStream, outgoing: mpsc::Receiver<Outgoing>, pages: Pag
                 }
                 message.write_to(&mut writer)
             }
+            Outgoing::MetaReady(page) => {
+                let state = pages.lock().ok().and_then(|pages| pages.get(&page).cloned());
+                let Some(state) = state else { continue };
+                state.meta_pending.store(false, Ordering::Release);
+                let meta = state
+                    .meta
+                    .lock()
+                    .map(|mut meta| std::mem::take(&mut *meta))
+                    .unwrap_or_default();
+                let mut result = Ok(());
+                if let Some(title) = meta.title {
+                    result = FromBrowser::Title { page, title }.write_to(&mut writer);
+                }
+                if let (Ok(()), Some(url)) = (&result, meta.address) {
+                    result = FromBrowser::Address { page, url }.write_to(&mut writer);
+                }
+                if let (Ok(()), Some(loading)) = (&result, meta.loading) {
+                    result = FromBrowser::Loading { page, loading }.write_to(&mut writer);
+                }
+                result
+            }
             Outgoing::FrameReady(page) => {
                 let state = pages.lock().ok().and_then(|pages| pages.get(&page).cloned());
                 let Some(state) = state else { continue };
@@ -436,6 +479,8 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
             frame_pending: AtomicBool::new(false),
             browser: Mutex::new(None),
             close_requested: AtomicBool::new(false),
+            meta: Mutex::new(PageMeta::default()),
+            meta_pending: AtomicBool::new(false),
             out: out.clone(),
             pages: pages.clone(),
         });

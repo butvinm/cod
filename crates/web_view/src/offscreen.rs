@@ -212,26 +212,39 @@ impl OffscreenView {
                 };
                 self.show_frame(frame, window, cx);
             }
-            PageEvent::Title(title) => {
-                log::info!("web_view: title {title:?}");
-                self.title = Some(title.into());
-            }
-            PageEvent::Address(url) => {
-                log::info!("web_view: address {url}");
-                self.url = url.into();
-            }
-            PageEvent::Loading(loading) => {
-                log::info!(
-                    "web_view: loading={loading} title={:?}",
-                    self.title.as_deref().unwrap_or_default()
-                );
-                self.loading = loading;
-            }
-            PageEvent::Console(message) => {
-                log::info!("web_view: page console: {message}");
-                self.console.push(message);
+            PageEvent::Diagnostics => {
+                let Some(diagnostics) = self.page.as_ref().map(|page| page.take_diagnostics())
+                else {
+                    return;
+                };
+                if let Some(title) = diagnostics.title {
+                    log::info!("web_view: title {title:?}");
+                    self.title = Some(title.into());
+                }
+                if let Some(url) = diagnostics.address {
+                    log::info!("web_view: address {url}");
+                    self.url = url.into();
+                }
+                if let Some(loading) = diagnostics.loading {
+                    log::info!(
+                        "web_view: loading={loading} title={:?}",
+                        self.title.as_deref().unwrap_or_default()
+                    );
+                    self.loading = loading;
+                }
+                if diagnostics.dropped_console > 0 {
+                    log::warn!(
+                        "web_view: {} console messages dropped (the page logs faster than the UI reads)",
+                        diagnostics.dropped_console
+                    );
+                }
+                for message in diagnostics.console {
+                    log::info!("web_view: page console: {message}");
+                    self.console.push(message);
+                }
                 if self.console.len() > 200 {
-                    self.console.remove(0);
+                    let excess = self.console.len() - 200;
+                    self.console.drain(..excess);
                 }
             }
             PageEvent::Created => {
