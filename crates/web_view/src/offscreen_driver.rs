@@ -453,6 +453,18 @@ async fn run(
             (cpu_seconds() - idle_zed) / 4.0 * 100.0,
             (helper_cpu_seconds() - idle_helper) / 4.0 * 100.0,
         );
+        // Baseline: ask GPUI for a repaint every 16 ms with an unchanged page, so the page costs nothing and only GPUI's own (software rendered) window repaint is measured.
+        let (refresh_zed, refresh_helper) = (cpu_seconds(), helper_cpu_seconds());
+        let refresh_started = Instant::now();
+        while refresh_started.elapsed() < Duration::from_secs(4) {
+            cx.update(|window, _| window.refresh()).log_err();
+            pause(cx, 16).await;
+        }
+        log::info!(
+            "driver: BASELINE repaint requests every 16 ms, page unchanged: CPU in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}",
+            (cpu_seconds() - refresh_zed) / 4.0 * 100.0,
+            (helper_cpu_seconds() - refresh_helper) / 4.0 * 100.0,
+        );
         let (frames_a, micros_a) = read(cx, &second, |view| (view.frames_painted, view.image_micros)).unwrap_or_default();
         let cpu_a = cpu_seconds();
         let helper_a = helper_cpu_seconds();

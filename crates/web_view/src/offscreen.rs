@@ -616,3 +616,61 @@ fn mouse_button_type(button: MouseButton) -> u8 {
         MouseButton::Right => BUTTON_RIGHT,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keystroke(key: &str) -> Keystroke {
+        Keystroke {
+            modifiers: Modifiers::default(),
+            key: key.into(),
+            key_char: None,
+        }
+    }
+
+    #[test]
+    fn editing_keys_map_to_windows_key_codes() {
+        assert_eq!(windows_key_code(&keystroke("backspace")), Some(0x08));
+        assert_eq!(windows_key_code(&keystroke("enter")), Some(0x0D));
+        assert_eq!(windows_key_code(&keystroke("left")), Some(0x25));
+        assert_eq!(windows_key_code(&keystroke("right")), Some(0x27));
+        assert_eq!(windows_key_code(&keystroke("delete")), Some(0x2E));
+    }
+
+    #[test]
+    fn letters_and_digits_map_to_their_upper_case_codes() {
+        assert_eq!(windows_key_code(&keystroke("h")), Some('H' as i32));
+        assert_eq!(windows_key_code(&keystroke("H")), Some('H' as i32));
+        assert_eq!(windows_key_code(&keystroke("7")), Some('7' as i32));
+    }
+
+    #[test]
+    fn keys_without_a_mapping_are_not_forwarded() {
+        assert_eq!(windows_key_code(&keystroke("f5")), None);
+        assert_eq!(windows_key_code(&keystroke("")), None);
+    }
+
+    #[test]
+    fn modifier_flags_carry_modifiers_and_the_pressed_button() {
+        let modifiers = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            modifier_flags(&modifiers, Some(MouseButton::Left)),
+            EVENT_CONTROL | EVENT_SHIFT | EVENT_LEFT_BUTTON
+        );
+        assert_eq!(modifier_flags(&Modifiers::default(), None), 0);
+    }
+
+    #[test]
+    fn page_points_are_relative_to_the_pane() {
+        let bounds = Bounds {
+            origin: gpui::point(px(100.0), px(40.0)),
+            size: gpui::size(px(300.0), px(200.0)),
+        };
+        assert_eq!(page_point(gpui::point(px(150.0), px(90.0)), bounds), (50, 50));
+    }
+}
