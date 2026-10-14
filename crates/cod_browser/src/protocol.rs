@@ -415,9 +415,14 @@ impl FromBrowser {
             input.read_exact(&mut header)?;
             let mut fields = Fields(&header);
             let (page, width, height) = (fields.u32()?, fields.u32()?, fields.u32()?);
-            let bytes = width as usize * height as usize * 4;
-            if bytes > MAX_FRAME_BYTES || length != 1 + 12 + bytes {
-                return Err(bad("bad frame size"));
+            // The sizes come from the other process, so every step is checked before anything is allocated.
+            let bytes = (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|bytes| *bytes > 0 && *bytes <= MAX_FRAME_BYTES)
+                .ok_or_else(|| bad("bad frame size"))?;
+            if bytes.checked_add(13) != Some(length) {
+                return Err(bad("bad frame length"));
             }
             let mut bgra = vec![0; bytes];
             input.read_exact(&mut bgra)?;
@@ -538,6 +543,79 @@ mod tests {
         let mut input = bytes.as_slice();
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), frame);
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), title);
+    }
+
+    fn frame_header(length: u32, page: u32, width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes.push(9);
+        bytes.extend_from_slice(&page.to_le_bytes());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_frame_header_with_overflowing_dimensions_is_rejected() {
+        for (width, height) in [(u32::MAX, u32::MAX), (1 << 31, 4), (0, 10), (10, 0)] {
+            let bytes = frame_header(13, 1, width, height);
+            let error = FromBrowser::read_from(&mut bytes.as_slice()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn a_frame_above_the_size_limit_is_rejected_before_allocating() {
+        let bytes = frame_header(13 + (MAX_FRAME_BYTES as u32 + 4), 1, 1 << 14, (1 << 12) + 1);
+        assert!(FromBrowser::read_from(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_truncated_frame_payload_is_an_error() {
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, 1, 4, 4, &[7; 64]).unwrap();
+        bytes.truncate(bytes.len() - 10);
+        let error = FromBrowser::read_from(&mut bytes.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    struct OneByteAtATime<'a>(&'a [u8]);
+
+    impl Read for OneByteAtATime<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() || buffer.is_empty() {
+                return Ok(0);
+            }
+            buffer[0] = self.0[0];
+            self.0 = &self.0[1..];
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn messages_survive_fragmented_reads() {
+        let frame = FromBrowser::Frame {
+            page: 5,
+            width: 2,
+            height: 2,
+            bgra: (0..16).collect(),
+        };
+        let command = ToBrowser::Load {
+            page: 5,
+            url: "https://example.org/".into(),
+        };
+        let mut frame_bytes = Vec::new();
+        frame.write_to(&mut frame_bytes).unwrap();
+        let mut command_bytes = Vec::new();
+        command.write_to(&mut command_bytes).unwrap();
+        assert_eq!(
+            FromBrowser::read_from(&mut OneByteAtATime(&frame_bytes)).unwrap(),
+            frame
+        );
+        assert_eq!(
+            ToBrowser::read_from(&mut OneByteAtATime(&command_bytes)).unwrap(),
+            command
+        );
     }
 
     #[test]
