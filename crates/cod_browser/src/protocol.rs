@@ -416,11 +416,7 @@ impl FromBrowser {
             let mut fields = Fields(&header);
             let (page, width, height) = (fields.u32()?, fields.u32()?, fields.u32()?);
             // The sizes come from the other process, so every step is checked before anything is allocated.
-            let bytes = (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
-                .filter(|bytes| *bytes > 0 && *bytes <= MAX_FRAME_BYTES)
-                .ok_or_else(|| bad("bad frame size"))?;
+            let bytes = frame_byte_len(width, height)?;
             if bytes.checked_add(13) != Some(length) {
                 return Err(bad("bad frame length"));
             }
@@ -467,7 +463,25 @@ impl FromBrowser {
     }
 }
 
-/// Writes a frame without first copying the pixels into a message buffer.
+/// The one place that turns frame dimensions into a byte count: BGRA, no overflow, not empty, within `MAX_FRAME_BYTES`.
+/// The helper uses it before it copies pixels, the writer before it sends them and the reader before it allocates.
+pub fn frame_byte_len(width: u32, height: u32) -> io::Result<usize> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes > 0 && *bytes <= MAX_FRAME_BYTES)
+        .ok_or_else(|| bad("bad frame size"))
+}
+
+/// The length field of a frame message (tag, 12 header bytes and the pixels), if it fits in a `u32`.
+fn frame_message_len(bytes: usize) -> io::Result<u32> {
+    bytes
+        .checked_add(13)
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| bad("frame too large"))
+}
+
+/// Writes a frame without first copying the pixels into a message buffer. Refuses pixels that do not match the dimensions.
 pub fn write_frame(
     out: &mut impl Write,
     page: u32,
@@ -475,7 +489,10 @@ pub fn write_frame(
     height: u32,
     bgra: &[u8],
 ) -> io::Result<()> {
-    let length = (1 + 12 + bgra.len()) as u32;
+    if frame_byte_len(width, height)? != bgra.len() {
+        return Err(bad("frame pixels do not match its size"));
+    }
+    let length = frame_message_len(bgra.len())?;
     let mut header = Vec::with_capacity(17);
     header.extend_from_slice(&length.to_le_bytes());
     header.push(9);
@@ -568,6 +585,31 @@ mod tests {
     fn a_frame_above_the_size_limit_is_rejected_before_allocating() {
         let bytes = frame_header(13 + (MAX_FRAME_BYTES as u32 + 4), 1, 1 << 14, (1 << 12) + 1);
         assert!(FromBrowser::read_from(&mut bytes.as_slice()).is_err());
+    }
+
+    #[test]
+    fn frame_byte_len_is_checked_and_limited() {
+        assert_eq!(frame_byte_len(3, 2).unwrap(), 24);
+        assert!(frame_byte_len(0, 5).is_err());
+        assert!(frame_byte_len(u32::MAX, u32::MAX).is_err());
+        assert!(frame_byte_len(1 << 14, (1 << 12) + 1).is_err());
+        assert_eq!(frame_byte_len(1 << 14, 1 << 12).unwrap(), MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn the_writer_refuses_frames_the_reader_would_reject() {
+        let mut out = Vec::new();
+        assert!(write_frame(&mut out, 1, 2, 2, &[0; 15]).is_err());
+        assert!(write_frame(&mut out, 1, 0, 2, &[]).is_err());
+        assert!(write_frame(&mut out, 1, u32::MAX, 2, &[0; 16]).is_err());
+        assert!(out.is_empty(), "nothing is written for a refused frame");
+    }
+
+    #[test]
+    fn frame_message_lengths_that_do_not_fit_are_refused() {
+        assert_eq!(frame_message_len(16).unwrap(), 29);
+        assert!(frame_message_len(usize::MAX).is_err());
+        assert!(frame_message_len(u32::MAX as usize).is_err());
     }
 
     #[test]

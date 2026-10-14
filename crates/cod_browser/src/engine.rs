@@ -175,13 +175,17 @@ wrap_render_handler! {
             if type_ != PaintElementType::VIEW || buffer.is_null() || width <= 0 || height <= 0 {
                 return;
             }
-            // SAFETY: CEF guarantees `buffer` holds `width * height` BGRA pixels for the duration of this call.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(buffer, width as usize * height as usize * 4)
+            // The same checked size the writer and the reader use, so a bogus size from the engine is dropped before any slice or copy is made.
+            let (width, height) = (width as u32, height as u32);
+            let Ok(length) = protocol::frame_byte_len(width, height) else {
+                eprintln!("cod-browser: dropped a frame of {width}x{height}");
+                return;
             };
+            // SAFETY: CEF guarantees `buffer` holds `width * height` BGRA pixels for the duration of this call, and `length` is exactly that, checked.
+            let bytes = unsafe { std::slice::from_raw_parts(buffer, length) };
             let state = &self.handler.state;
             if let Ok(mut latest) = state.latest.lock() {
-                *latest = Some((width as u32, height as u32, bytes.to_vec()));
+                *latest = Some((width, height, bytes.to_vec()));
             }
             if !state.frame_pending.swap(true, Ordering::AcqRel) {
                 state.out.send(Outgoing::FrameReady(state.id)).ok();
