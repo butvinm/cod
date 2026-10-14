@@ -582,6 +582,8 @@ block2 = "0.6"
 brush-parser = "0.3"
 bytes = "1.0"
 cargo_metadata = "0.19"
+# Chromium Embedded Framework bindings for the off-screen web view (#16). The "+" part is the CEF release the crate links against.
+cef = { version = "=154.5.0+154.0.34", default-features = false }
 cargo_toml = "0.21"
 cbindgen = { version = "0.28.0", default-features = false }
 chardetng = "0.1"

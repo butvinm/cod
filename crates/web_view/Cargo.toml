@@ -12,6 +12,10 @@ workspace = true
 path = "src/web_view.rs"
 doctest = false
 
+[features]
+# Off-screen web view through CEF (#16). Off by default: it links libcef.so, which then has to be found at start-up.
+offscreen = ["dep:cef"]
+
 [dependencies]
 anyhow.workspace = true
 futures.workspace = true
@@ -47,8 +51,12 @@ wry.workspace = true
 
 # WebKitGTK in an X11 child window. The versions match what wry 0.57 uses.
 [target.'cfg(target_os = "linux")'.dependencies]
+cef = { workspace = true, optional = true }
 gdkx11 = "0.18"
 gtk = "0.18"
+image.workspace = true
+paths.workspace = true
+smallvec.workspace = true
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { workspace = true, features = ["os-webview"] }
 x11-dl = "2.21"

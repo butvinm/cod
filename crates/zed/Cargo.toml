@@ -12,6 +12,8 @@ default-run = "zed"
 workspace = true
 
 [features]
+# Draw web pages from an off-screen browser (CEF), for native Wayland (#16).
+offscreen-web-view = ["web_view/offscreen"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]

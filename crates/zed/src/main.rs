@@ -201,6 +201,10 @@ static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
+    // The off-screen browser starts its helper processes from this same binary; they must not run the editor.
+    #[cfg(all(target_os = "linux", feature = "offscreen-web-view"))]
+    web_view::run_subprocess_if_requested();
+
     // If this process was re-executed as a Linux sandbox helper, run that mode
     // without returning. Must run before argument parsing: the wrapped command's
     // args are appended verbatim and would otherwise be misinterpreted as Zed's
