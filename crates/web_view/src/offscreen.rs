@@ -281,6 +281,10 @@ impl OffscreenView {
         Some((size, newest))
     }
 
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+
     pub(crate) fn is_hidden(&self) -> bool {
         self.hidden.get()
     }

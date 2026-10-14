@@ -41,6 +41,57 @@ const REQUIRED: [&str; 8] = [
 
 static RESULTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
 
+/// COD_SPIKE_KILL_HELPER=1 runs the dead-helper check instead of the acceptance sequence.
+fn recovery_mode() -> bool {
+    std::env::var("COD_SPIKE_KILL_HELPER").is_ok_and(|value| value == "1")
+}
+
+/// Kills the helper, expects the open page to say so, then opens a page again and expects a new helper to draw it.
+async fn recover(
+    workspace: &WeakEntity<Workspace>,
+    page: &Entity<OffscreenView>,
+    cx: &mut AsyncWindowContext,
+) {
+    let killed = Command::new("pkill")
+        .args(["-9", "-f", "cod-browser --cod-cache"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let failed_after = wait_until(cx, 10_000, |cx| {
+        read(cx, page, |view| view.failure().is_some()).unwrap_or(false)
+    })
+    .await;
+    let message = read(cx, page, |view| view.failure().map(str::to_owned)).flatten();
+    let live_after_death = browser_client::live_browsers();
+    pause(cx, 500).await;
+    screenshot("RECOVERY-failed");
+    let fixture = read(cx, page, |view| view.current_url().to_owned()).unwrap_or_default();
+    let reopened = workspace
+        .update_in(cx, |workspace, window, cx| {
+            open_url_in_active_pane(workspace, fixture, window, cx).log_err()
+        })
+        .ok()
+        .flatten();
+    let mut drew = false;
+    if let Some(reopened) = &reopened {
+        drew = wait_until(cx, 30_000, |cx| {
+            read(cx, reopened, |view| {
+                view.painted_frame().is_some_and(|(_, newest)| newest)
+            })
+            .unwrap_or(false)
+        })
+        .await
+        .is_some();
+    }
+    let live_after_restart = browser_client::live_browsers();
+    verdict(
+        "RECOVERY",
+        killed && failed_after.is_some() && live_after_death == 0 && drew && live_after_restart == 1,
+        format!(
+            "helper killed={killed}; the open page showed {message:?} after {failed_after:?}; live views after death {live_after_death}; a new page then drew its first frame={drew} with {live_after_restart} live view"
+        ),
+    );
+}
+
 pub(crate) fn start(page: Entity<OffscreenView>, window: &mut Window, cx: &mut Context<Workspace>) {
     cx.spawn_in(window, async move |workspace, cx| {
         run(workspace, page, cx).await;
@@ -52,7 +103,12 @@ pub(crate) fn start(page: Entity<OffscreenView>, window: &mut Window, cx: &mut C
 /// Ends the process with status 0 only when every required check reported and passed.
 async fn finish(cx: &mut AsyncWindowContext) {
     let results = RESULTS.lock().map(|results| results.clone()).unwrap_or_default();
-    let problems: Vec<String> = REQUIRED
+    let required: &[&str] = if recovery_mode() {
+        &["AC1", "RECOVERY"]
+    } else {
+        &REQUIRED
+    };
+    let problems: Vec<String> = required
         .iter()
         .filter_map(|name| match results.iter().find(|(reported, _)| reported == name) {
             None => Some(format!("{name} missing")),
@@ -61,7 +117,7 @@ async fn finish(cx: &mut AsyncWindowContext) {
         })
         .collect();
     let code = if problems.is_empty() {
-        log::info!("driver: RESULT all {} checks passed", REQUIRED.len());
+        log::info!("driver: RESULT all {} checks passed", required.len());
         0
     } else {
         log::error!("driver: RESULT FAIL {}", problems.join(", "));
@@ -337,6 +393,11 @@ async fn run(
             frame_size.0, frame_size.1, expected.0, expected.1
         ),
     );
+
+    if recovery_mode() {
+        recover(&workspace, &page, cx).await;
+        return;
+    }
 
     // AC2: the wheel scrolls the page.
     let state = read_state(cx, &page).await;
