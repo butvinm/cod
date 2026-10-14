@@ -172,8 +172,19 @@ fn write_loop(client: Arc<Client>, mut command: Command, helper: PathBuf, mut st
                 helper.display(),
                 started.elapsed()
             );
-            if let Ok(mut slot) = client.helper.lock() {
+            // fail() sets `alive` to false and only then takes the child under this lock, so checking `alive` while holding it decides who owns the child: either fail() finds it and ends it, or the shutdown already happened and it is ended here.
+            let mut slot = match client.helper.lock() {
+                Ok(slot) => slot,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if client.alive.load(Ordering::Acquire) {
                 *slot = Some(child);
+            } else {
+                drop(slot);
+                let mut child = child;
+                child.kill().ok();
+                child.wait().ok();
+                return;
             }
         }
         Err(error) => {
