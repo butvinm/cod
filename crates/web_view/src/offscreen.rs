@@ -7,7 +7,7 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
-    App, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable,
+    App, Bounds, Context, DispatchPhase, Entity, ImageId, EventEmitter, FocusHandle, Focusable,
     HitboxBehavior, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage,
     ScrollDelta, ScrollWheelEvent, SharedString, Styled as _,
@@ -119,6 +119,8 @@ pub struct OffscreenView {
     focus_handle: FocusHandle,
     pane_bounds: Rc<Cell<Bounds<Pixels>>>,
     hidden: Rc<Cell<bool>>,
+    /// The image and its pixel size that the last paint of the pane drew.
+    painted: Rc<Cell<Option<(ImageId, (u32, u32))>>>,
     console: Vec<String>,
     pub(crate) frames_painted: u64,
     /// Total time spent turning frames into images, for the frame cost report.
@@ -192,6 +194,7 @@ impl OffscreenView {
             focus_handle,
             pane_bounds: Rc::new(Cell::new(Bounds::default())),
             hidden: Rc::new(Cell::new(false)),
+            painted: Rc::new(Cell::new(None)),
             console: Vec::new(),
             frames_painted: 0,
             image_micros: 0,
@@ -269,6 +272,13 @@ impl OffscreenView {
         }
         self.last_frame_size = size;
         cx.notify();
+    }
+
+    /// The size in pixels of the image the last paint drew, and whether it is the newest one.
+    pub(crate) fn painted_frame(&self) -> Option<((u32, u32), bool)> {
+        let (id, size) = self.painted.get()?;
+        let newest = self.image.as_ref().is_some_and(|image| image.id == id);
+        Some((size, newest))
     }
 
     pub(crate) fn is_hidden(&self) -> bool {
@@ -484,6 +494,9 @@ impl Render for OffscreenView {
         let focus_handle = self.focus_handle.clone();
         let image = self.image.clone();
         let shown_size = self.last_frame_size;
+        // Recorded when GPUI paints the pane, so the driver can tell a frame that was built from one that was drawn.
+        let painted = self.painted.clone();
+        let painted_marker = image.as_ref().map(|image| (image.id, shown_size));
 
         div()
             .key_context("WebView")
@@ -524,6 +537,7 @@ impl Render for OffscreenView {
                         }
                     },
                     move |bounds, hitbox, window, _cx| {
+                        painted.set(painted_marker);
                         let Some(page) = page else { return };
                         window.on_mouse_event({
                             let page = page.clone();

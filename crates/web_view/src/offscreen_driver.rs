@@ -5,6 +5,7 @@
 
 use std::{
     process::Command,
+    sync::Mutex,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -26,15 +27,55 @@ use crate::{
 const SECOND_TITLE: &str = "Cod off-screen second page";
 const FIRST_TITLE: &str = "Cod off-screen test page";
 
+/// Every check that has to report, in the order they run. A missing one fails the run like a failed one.
+const REQUIRED: [&str; 8] = [
+    "AC1",
+    "AC2 wheel",
+    "AC2 link",
+    "AC3",
+    "AC4",
+    "AC5 hide/show",
+    "AC5 browser side",
+    "AC5 close",
+];
+
+static RESULTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
 pub(crate) fn start(page: Entity<OffscreenView>, window: &mut Window, cx: &mut Context<Workspace>) {
     cx.spawn_in(window, async move |workspace, cx| {
         run(workspace, page, cx).await;
+        finish(cx).await;
     })
     .detach();
 }
 
+/// Ends the process with status 0 only when every required check reported and passed.
+async fn finish(cx: &mut AsyncWindowContext) {
+    let results = RESULTS.lock().map(|results| results.clone()).unwrap_or_default();
+    let problems: Vec<String> = REQUIRED
+        .iter()
+        .filter_map(|name| match results.iter().find(|(reported, _)| reported == name) {
+            None => Some(format!("{name} missing")),
+            Some((_, false)) => Some(format!("{name} failed")),
+            Some((_, true)) => None,
+        })
+        .collect();
+    let code = if problems.is_empty() {
+        log::info!("driver: RESULT all {} checks passed", REQUIRED.len());
+        0
+    } else {
+        log::error!("driver: RESULT FAIL {}", problems.join(", "));
+        1
+    };
+    pause(cx, 1000).await;
+    std::process::exit(code);
+}
+
 fn verdict(name: &str, passed: bool, detail: String) {
     let word = if passed { "PASS" } else { "FAIL" };
+    if let Ok(mut results) = RESULTS.lock() {
+        results.push((name.to_owned(), passed));
+    }
     log::info!("driver: {name} {word} {detail}");
     screenshot(&name.replace(' ', "-"));
 }
@@ -110,6 +151,15 @@ fn number(state: &Option<Value>, key: &str) -> f64 {
         .and_then(|state| state.get(key))
         .and_then(Value::as_f64)
         .unwrap_or(f64::NAN)
+}
+
+fn visibility(state: &Option<Value>) -> String {
+    state
+        .as_ref()
+        .and_then(|state| state.get("visibility"))
+        .and_then(Value::as_str)
+        .unwrap_or("no answer")
+        .to_owned()
 }
 
 fn target(state: &Option<Value>, key: &str) -> (f32, f32) {
@@ -264,19 +314,26 @@ async fn run(
     };
     pause(cx, 500).await;
     let scale = cx.update(|window, _| window.scale_factor()).unwrap_or(1.0);
-    let (frames, frame_size, bounds) = read(cx, &page, |view| {
-        (view.frames_painted, view.last_frame_size, view.pane_bounds())
+    let (frames, frame_size, bounds, painted) = read(cx, &page, |view| {
+        (
+            view.frames_painted,
+            view.last_frame_size,
+            view.pane_bounds(),
+            view.painted_frame(),
+        )
     })
     .unwrap_or_default();
     let expected = (
         (f32::from(bounds.size.width) * scale) as u32,
         (f32::from(bounds.size.height) * scale) as u32,
     );
+    // "Painted" is recorded by GPUI's own paint pass over the pane, so the image was drawn and not only built.
+    let drawn = painted.is_some_and(|(size, newest)| size == frame_size && newest);
     verdict(
         "AC1",
-        frames > 0 && frame_size == expected,
+        frames > 0 && frame_size == expected && drawn,
         format!(
-            "page loaded in {loaded:?}, {frames} frames drawn as GPUI images, frame {}x{} px, pane {}x{} px, scale {scale}",
+            "page loaded in {loaded:?}, {frames} frames built as GPUI images, last paint drew the newest frame: {drawn} ({painted:?}), frame {}x{} px, pane {}x{} px, scale {scale}",
             frame_size.0, frame_size.1, expected.0, expected.1
         ),
     );
@@ -405,6 +462,8 @@ async fn run(
     pause(cx, 1500).await;
     let hidden = read(cx, &page, |view| view.is_hidden()).unwrap_or(false);
     let live_two = browser_client::live_browsers();
+    // The browser's own view of it: the page reports document.visibilityState, which CEF sets from was_hidden.
+    let visibility_hidden = visibility(&read_state(cx, &page).await);
     let pane = workspace
         .read_with(cx, |workspace, _| workspace.active_pane().clone())
         .ok();
@@ -421,6 +480,12 @@ async fn run(
         "AC5 hide/show",
         hidden && shown && second.is_some(),
         format!("after opening another tab hidden={hidden}, after switching back shown={shown}, live browser views {live_before} -> {live_two}, frames so far {frames_before_close}"),
+    );
+    let visibility_shown = visibility(&read_state(cx, &page).await);
+    verdict(
+        "AC5 browser side",
+        visibility_hidden == "hidden" && visibility_shown == "visible",
+        format!("page document.visibilityState: {visibility_hidden:?} while another tab was active, {visibility_shown:?} after switching back"),
     );
     press(
         cx,
