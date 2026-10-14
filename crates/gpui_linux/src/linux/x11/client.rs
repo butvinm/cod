@@ -202,6 +202,8 @@ pub struct X11ClientState {
     pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
+    /// Inner render window id -> its toplevel (COD_GPUI_X11_INNER_WINDOW). Only Expose is selected on them.
+    pub(crate) inner_windows: HashMap<xproto::Window, xproto::Window>,
     pub(crate) mouse_focused_window: Option<xproto::Window>,
     pub(crate) keyboard_focused_window: Option<xproto::Window>,
     pub(crate) xkb: xkbc::State,
@@ -266,6 +268,7 @@ impl X11ClientStatePtr {
             state.cursor_hidden_window = None;
         }
         state.cursor_styles.remove(&x_window);
+        state.inner_windows.retain(|_, toplevel| *toplevel != x_window);
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -383,6 +386,14 @@ impl X11Client {
         );
         let supports_xinput_gestures = xinput_version.major_version > 2
             || (xinput_version.major_version == 2 && xinput_version.minor_version >= 4);
+        log::info!(
+            "GPUI X11 inner render window: {} (COD_GPUI_X11_INNER_WINDOW=1 turns it on)",
+            if super::window::inner_window_enabled() {
+                "used"
+            } else {
+                "not used"
+            }
+        );
         log::info!(
             "XInput version: {}.{}, gesture support: {}",
             xinput_version.major_version,
@@ -552,6 +563,7 @@ impl X11Client {
             resource_database,
             atoms,
             windows: HashMap::default(),
+            inner_windows: HashMap::default(),
             mouse_focused_window: None,
             keyboard_focused_window: None,
             xkb: xkb_state,
@@ -599,7 +611,14 @@ impl X11Client {
                     Ok(Some(event)) => {
                         match event {
                             Event::Expose(expose_event) => {
-                                windows_to_refresh.insert(expose_event.window);
+                                let toplevel = self
+                                    .0
+                                    .borrow()
+                                    .inner_windows
+                                    .get(&expose_event.window)
+                                    .copied()
+                                    .unwrap_or(expose_event.window);
+                                windows_to_refresh.insert(toplevel);
                             }
                             Event::KeyRelease(_) => {
                                 if let Some(last_keymap_change_event) =
@@ -1323,6 +1342,11 @@ impl X11Client {
                     }
                 }
             }
+            // The inner render window covers the toplevel, so the pointer moving into it is a Leave
+            // with detail Inferior on the toplevel, and moving back out an Enter with that detail.
+            Event::XinputEnter(event) | Event::XinputLeave(event)
+                if event.detail == xinput::NotifyDetail::INFERIOR
+                    && !self.0.borrow().inner_windows.is_empty() => {}
             Event::XinputEnter(event) if event.mode == xinput::NotifyMode::NORMAL => {
                 let window = self.get_window(event.event)?;
                 window.set_hovered(true);
@@ -1684,6 +1708,10 @@ impl LinuxClient for X11Client {
             is_mapped: false,
         };
 
+        let render_window = window.0.state.borrow().render_window;
+        if render_window != x_window {
+            state.inner_windows.insert(render_window, x_window);
+        }
         state.windows.insert(x_window, window_ref);
         Ok(Box::new(window))
     }
