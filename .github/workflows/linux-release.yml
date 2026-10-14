@@ -23,6 +23,8 @@ jobs:
       # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the first two pairs repeat them.
       # The last pair links with mold.
       RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
+      CEF_VERSION: 154.0.34
+      CEF_PATH: /home/runner/cef
       CC: clang
       CXX: clang++
     steps:
@@ -69,6 +71,16 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
+      # The cef crate downloads CEF from the Spotify CDN into CEF_PATH at build time.
+      # The folder is cached by CEF version (keep CEF_VERSION in step with the cef crate in Cargo.toml).
+      # Only master saves it, like the other caches.
+      - name: Restore the CEF download
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
       - name: Build (cargo release-fast, no LTO, mold, sccache)
         env:
           SCCACHE_GHA_ENABLED: "true"
@@ -76,20 +88,41 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: |
           sccache --zero-stats
-          cargo build --profile release-fast -p zed
+          cargo build --profile release-fast -p zed -p cod_browser
           sccache --show-stats
           df -h /
+          du -sh "$CEF_PATH"
 
+      - name: Save the CEF download
+        if: github.ref == 'refs/heads/master' && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # The CEF runtime goes into cod/cef/, which cod-wayland.sh uses as COD_CEF_DIR.
+      # Not shipped: headers, the wrapper library, chrome-sandbox (the helper runs with --no-sandbox), other locales.
       - name: Package (strip, tar)
         run: |
-          mkdir cod
+          mkdir -p cod/cef/locales
           cp target/release-fast/zed cod/cod
-          strip cod/cod
-          cp script/cod-xwayland.sh cod/cod-xwayland.sh
-          chmod +x cod/cod cod/cod-xwayland.sh
+          cp target/release-fast/cod-browser cod/cod-browser
+          strip cod/cod cod/cod-browser
+          cef_dir="$CEF_PATH/$CEF_VERSION/cef_linux_x86_64"
+          ls -l "$cef_dir"
+          cp "$cef_dir"/*.so "$cef_dir"/*.so.* "$cef_dir"/*.pak "$cef_dir"/*.bin "$cef_dir"/*.dat "$cef_dir"/*.json cod/cef/ 2>/dev/null || true
+          cp "$cef_dir"/locales/en-US.pak cod/cef/locales/
+          rm -f cod/cef/archive.json
+          strip --strip-unneeded cod/cef/*.so
+          test -f cod/cef/libcef.so
+          test -f cod/cef/icudtl.dat
+          cp script/cod-xwayland.sh script/cod-wayland.sh cod/
+          chmod +x cod/cod cod/cod-browser cod/cod-xwayland.sh cod/cod-wayland.sh
           cp LICENSE-GPL LICENSE-APACHE README.md cod/
           tar -czf cod-linux-x86_64.tar.gz cod
-          ls -l cod cod-linux-x86_64.tar.gz
+          ls -l cod cod/cef cod-linux-x86_64.tar.gz
+          tar -tzf cod-linux-x86_64.tar.gz | head -50
+          df -h /
 
       - name: Upload to a prerelease
         env:
