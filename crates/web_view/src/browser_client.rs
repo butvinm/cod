@@ -145,21 +145,33 @@ fn start(data_dir: &Path) -> Result<Arc<Client>> {
     });
     let reader_stream = stream.try_clone()?;
     let reader_client = client.clone();
-    std::thread::Builder::new()
+    // If any thread cannot start, `fail` stops the ones already running (they exit when the client is dead and the socket is cut) and ends the helper if the writer already started it.
+    let started = std::thread::Builder::new()
         .name("cod-browser-reader".into())
         .spawn(move || read_loop(reader_client, reader_stream))
-        .context("starting the reader thread")?;
-    // Starting the process and every write to it happen on this thread, never on the GPUI thread.
-    let writer_client = client.clone();
-    std::thread::Builder::new()
-        .name("cod-browser-writer".into())
-        .spawn(move || write_loop(writer_client, command, helper, stream))
-        .context("starting the writer thread")?;
-    let watchdog_client = client.clone();
-    std::thread::Builder::new()
-        .name("cod-browser-watchdog".into())
-        .spawn(move || watch(watchdog_client))
-        .context("starting the watchdog thread")?;
+        .map(drop)
+        .context("starting the reader thread")
+        .and_then(|()| {
+            // Starting the process and every write to it happen on this thread, never on the GPUI thread.
+            let writer_client = client.clone();
+            std::thread::Builder::new()
+                .name("cod-browser-writer".into())
+                .spawn(move || write_loop(writer_client, command, helper, stream))
+                .map(drop)
+                .context("starting the writer thread")
+        })
+        .and_then(|()| {
+            let watchdog_client = client.clone();
+            std::thread::Builder::new()
+                .name("cod-browser-watchdog".into())
+                .spawn(move || watch(watchdog_client))
+                .map(drop)
+                .context("starting the watchdog thread")
+        });
+    if let Err(error) = started {
+        client.fail(&format!("{error:#}"));
+        return Err(error);
+    }
     Ok(client)
 }
 
