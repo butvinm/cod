@@ -3,16 +3,16 @@
 //! The helper renders with CEF and sends BGRA frames; only the latest frame of each page is kept, and a `PageEvent::Frame` tells the GPUI side that a newer one is waiting.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::BufReader,
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
@@ -48,12 +48,23 @@ struct Slot {
     frame_signalled: AtomicBool,
 }
 
+/// Commands waiting for the writer thread. When it is full the helper is not keeping up.
+const MAX_QUEUED_COMMANDS: usize = 512;
+/// A write that blocks longer than this means the helper has stopped reading.
+const WRITE_STALL: Duration = Duration::from_secs(5);
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Client {
-    writer: Mutex<UnixStream>,
+    outbox: Mutex<VecDeque<ToBrowser>>,
+    wake: Condvar,
+    /// A second handle on the socket, to cut the connection when the helper is declared dead.
+    control: UnixStream,
     slots: Mutex<HashMap<u32, Arc<Slot>>>,
     next_page: AtomicU32,
-    helper: Mutex<Child>,
+    helper: Mutex<Option<Child>>,
     alive: AtomicBool,
+    ready: AtomicBool,
+    write_started: Mutex<Option<Instant>>,
 }
 
 static CLIENT: OnceLock<std::result::Result<Arc<Client>, String>> = OnceLock::new();
@@ -105,29 +116,113 @@ fn start(data_dir: &Path) -> Result<Arc<Client>> {
         };
         command.env("LD_LIBRARY_PATH", library_path);
     }
-    let started = Instant::now();
-    let child = command
-        .spawn()
-        .with_context(|| format!("starting {}", helper.display()))?;
-    log::info!(
-        "web_view: cod-browser helper {} started in {:?}",
-        helper.display(),
-        started.elapsed()
-    );
-
     let client = Arc::new(Client {
-        writer: Mutex::new(stream.try_clone()?),
+        outbox: Mutex::new(VecDeque::new()),
+        wake: Condvar::new(),
+        control: stream.try_clone()?,
         slots: Mutex::new(HashMap::new()),
         next_page: AtomicU32::new(1),
-        helper: Mutex::new(child),
+        helper: Mutex::new(None),
         alive: AtomicBool::new(true),
+        ready: AtomicBool::new(false),
+        write_started: Mutex::new(None),
     });
+    let reader_stream = stream.try_clone()?;
     let reader_client = client.clone();
     std::thread::Builder::new()
         .name("cod-browser-reader".into())
-        .spawn(move || read_loop(reader_client, stream))
+        .spawn(move || read_loop(reader_client, reader_stream))
         .context("starting the reader thread")?;
+    // Starting the process and every write to it happen on this thread, never on the GPUI thread.
+    let writer_client = client.clone();
+    std::thread::Builder::new()
+        .name("cod-browser-writer".into())
+        .spawn(move || write_loop(writer_client, command, helper, stream))
+        .context("starting the writer thread")?;
+    let watchdog_client = client.clone();
+    std::thread::Builder::new()
+        .name("cod-browser-watchdog".into())
+        .spawn(move || watch(watchdog_client))
+        .context("starting the watchdog thread")?;
     Ok(client)
+}
+
+fn write_loop(client: Arc<Client>, mut command: Command, helper: PathBuf, mut stream: UnixStream) {
+    let started = Instant::now();
+    match command.spawn() {
+        Ok(child) => {
+            log::info!(
+                "web_view: cod-browser helper {} started in {:?}",
+                helper.display(),
+                started.elapsed()
+            );
+            if let Ok(mut slot) = client.helper.lock() {
+                *slot = Some(child);
+            }
+        }
+        Err(error) => {
+            client.fail(&format!("cannot start {}: {error}", helper.display()));
+            return;
+        }
+    }
+    // The command holds the helper's end of the socket until it is dropped.
+    drop(command);
+    loop {
+        let message = {
+            let Ok(mut outbox) = client.outbox.lock() else {
+                return;
+            };
+            loop {
+                if !client.alive.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(message) = outbox.pop_front() {
+                    break message;
+                }
+                outbox = match client.wake.wait(outbox) {
+                    Ok(outbox) => outbox,
+                    Err(_) => return,
+                };
+            }
+        };
+        if let Ok(mut write_started) = client.write_started.lock() {
+            *write_started = Some(Instant::now());
+        }
+        let result = message.write_to(&mut stream);
+        if let Ok(mut write_started) = client.write_started.lock() {
+            *write_started = None;
+        }
+        if let Err(error) = result {
+            client.fail(&format!("cannot write to cod-browser: {error}"));
+            return;
+        }
+    }
+}
+
+/// Notices a helper that exited, never became ready, or stopped reading its commands, and ends it.
+fn watch(client: Arc<Client>) {
+    let started = Instant::now();
+    while client.alive.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(250));
+        let exited = client
+            .helper
+            .lock()
+            .ok()
+            .and_then(|mut helper| helper.as_mut().and_then(|child| child.try_wait().ok().flatten()));
+        if let Some(status) = exited {
+            client.fail(&format!("the cod-browser helper exited: {status}"));
+        } else if !client.ready.load(Ordering::Acquire) && started.elapsed() > START_TIMEOUT {
+            client.fail("the cod-browser helper did not become ready in time");
+        } else if client
+            .write_started
+            .lock()
+            .ok()
+            .and_then(|write_started| *write_started)
+            .is_some_and(|since| since.elapsed() > WRITE_STALL)
+        {
+            client.fail("the cod-browser helper stopped reading commands");
+        }
+    }
 }
 
 fn read_loop(client: Arc<Client>, stream: UnixStream) {
@@ -148,7 +243,10 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
                 .and_then(|slots| slots.get(&page).cloned())
         };
         match message {
-            FromBrowser::Ready => log::info!("web_view: cod-browser is ready"),
+            FromBrowser::Ready => {
+                client.ready.store(true, Ordering::Release);
+                log::info!("web_view: cod-browser is ready");
+            }
             FromBrowser::Failed { message } => log::error!("web_view: cod-browser failed: {message}"),
             FromBrowser::Frame {
                 page,
@@ -213,29 +311,67 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
             }
         }
     }
-    client.alive.store(false, Ordering::Release);
-    if let Ok(mut slots) = client.slots.lock() {
-        for (_, slot) in slots.drain() {
-            slot.events.unbounded_send(PageEvent::Closed).ok();
-        }
-    }
-    if let Ok(mut helper) = client.helper.lock() {
-        helper.kill().ok();
-        helper.wait().ok();
-    }
+    client.fail("the connection to cod-browser was lost");
 }
 
 impl Client {
+    /// Queues a command for the writer thread; never blocks.
+    /// Pointer moves and resizes replace an identical kind of command at the end of the queue, and when the queue is full pointer moves and wheel events are dropped.
     fn send(&self, message: &ToBrowser) {
         if !self.alive.load(Ordering::Acquire) {
             return;
         }
-        let Ok(mut writer) = self.writer.lock() else {
-            return;
+        let overflow = {
+            let Ok(mut outbox) = self.outbox.lock() else {
+                return;
+            };
+            let replaces_last = match (outbox.back(), message) {
+                (
+                    Some(ToBrowser::MouseMove { page: queued, .. }),
+                    ToBrowser::MouseMove { page, .. },
+                ) => queued == page,
+                (
+                    Some(ToBrowser::Resize { page: queued, .. }),
+                    ToBrowser::Resize { page, .. },
+                ) => queued == page,
+                _ => false,
+            };
+            if replaces_last {
+                if let Some(last) = outbox.back_mut() {
+                    *last = message.clone();
+                }
+                false
+            } else if outbox.len() >= MAX_QUEUED_COMMANDS {
+                !matches!(message, ToBrowser::MouseMove { .. } | ToBrowser::Wheel { .. })
+            } else {
+                outbox.push_back(message.clone());
+                self.wake.notify_one();
+                false
+            }
         };
-        if let Err(error) = message.write_to(&mut *writer) {
-            log::error!("web_view: cannot reach cod-browser: {error}");
-            self.alive.store(false, Ordering::Release);
+        if overflow {
+            self.fail("the cod-browser command queue is full");
+        }
+    }
+
+    /// Declares the helper dead: stops the writer, cuts the connection and ends the process.
+    fn fail(&self, reason: &str) {
+        if !self.alive.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        log::error!("web_view: {reason}");
+        self.control.shutdown(std::net::Shutdown::Both).ok();
+        if let Ok(mut helper) = self.helper.lock()
+            && let Some(mut child) = helper.take()
+        {
+            child.kill().ok();
+            child.wait().ok();
+        }
+        self.wake.notify_all();
+        if let Ok(mut slots) = self.slots.lock() {
+            for (_, slot) in slots.drain() {
+                slot.events.unbounded_send(PageEvent::Closed).ok();
+            }
         }
     }
 }
