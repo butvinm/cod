@@ -2,7 +2,7 @@
 # Starts Cod as a native Wayland client with the off-screen web view (issue #16).
 # Usage: cod-wayland.sh [url] [folder]
 # Unlike cod-xwayland.sh this keeps WAYLAND_DISPLAY: the browser draws into memory and GPUI paints its frames as images, so no X11 window is involved.
-# Needs a build with `--features offscreen-web-view` and the CEF runtime folder in COD_CEF_DIR (libcef.so, the .pak files, icudtl.dat, locales/).
+# Needs the cod-browser helper next to the cod executable (or COD_BROWSER_BIN) and the CEF runtime folder in COD_CEF_DIR (libcef.so, the .pak files, icudtl.dat, locales/).
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -18,8 +18,6 @@ fi
 
 COD_WEBVIEW_BACKEND=offscreen
 export COD_WEBVIEW_BACKEND
-LD_LIBRARY_PATH="$COD_CEF_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export LD_LIBRARY_PATH
 
 if [ "$#" -gt 0 ]; then
     COD_SPIKE_URL=$1

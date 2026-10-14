@@ -10,7 +10,7 @@ use gpui::{
     App, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle, Focusable,
     HitboxBehavior, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
+    ScrollDelta, ScrollWheelEvent, SharedString, Styled as _,
     Subscription, Task, Window, canvas, div, img, px,
 };
 use smallvec::SmallVec;

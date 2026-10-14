@@ -48,7 +48,7 @@ fn read<R>(
     page: &Entity<OffscreenView>,
     read: impl FnOnce(&OffscreenView) -> R,
 ) -> Option<R> {
-    page.read_with(cx, |view, _| read(view)).ok()
+    Some(page.read_with(cx, |view, _| read(view)))
 }
 
 fn send(cx: &mut AsyncWindowContext, event: PlatformInput) {
