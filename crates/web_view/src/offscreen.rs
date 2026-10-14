@@ -113,6 +113,8 @@ pub struct OffscreenView {
     loading: bool,
     page: Option<Rc<Page>>,
     start_error: Option<String>,
+    /// Set when the helper died: the pane shows this instead of a frozen page.
+    failure: Option<String>,
     image: Option<Arc<RenderImage>>,
     focus_handle: FocusHandle,
     pane_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -185,6 +187,7 @@ impl OffscreenView {
             loading: true,
             page,
             start_error,
+            failure: None,
             image: None,
             focus_handle,
             pane_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -235,6 +238,14 @@ impl OffscreenView {
                 }
             }
             PageEvent::Closed => {}
+            PageEvent::Failed(reason) => {
+                log::error!("web_view: the page failed: {reason}");
+                if let Some(image) = self.image.take() {
+                    window.drop_image(image).log_err();
+                }
+                self.page = None;
+                self.failure = Some(reason);
+            }
         }
         cx.notify();
     }
@@ -447,6 +458,15 @@ impl Render for OffscreenView {
                 .size_full()
                 .p_4()
                 .child(format!("The off-screen browser did not start: {error}"))
+                .into_any_element();
+        }
+        if let Some(reason) = &self.failure {
+            return div()
+                .size_full()
+                .p_4()
+                .child(format!(
+                    "The off-screen browser stopped: {reason}. Open the page again to start a new one."
+                ))
                 .into_any_element();
         }
         let scale = window.scale_factor();

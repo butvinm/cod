@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -40,6 +40,8 @@ pub(crate) enum PageEvent {
     Console(String),
     Created,
     Closed,
+    /// The helper died or was cut off: the page is gone and will not paint again.
+    Failed(String),
 }
 
 struct Slot {
@@ -63,17 +65,22 @@ struct Client {
     next_page: AtomicU32,
     helper: Mutex<Option<Child>>,
     alive: AtomicBool,
+    live: AtomicUsize,
     ready: AtomicBool,
     write_started: Mutex<Option<Instant>>,
 }
 
-static CLIENT: OnceLock<std::result::Result<Arc<Client>, String>> = OnceLock::new();
+/// The running helper connection. A dead one is replaced by the next page that opens.
+static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 
-/// Browser views opened and not yet closed, for the driver and the log.
-static LIVE_BROWSERS: AtomicUsize = AtomicUsize::new(0);
-
+/// Browser views of the running helper that were opened and not yet closed, for the driver and the log.
 pub(crate) fn live_browsers() -> usize {
-    LIVE_BROWSERS.load(Ordering::Acquire)
+    CLIENT
+        .lock()
+        .ok()
+        .and_then(|client| client.clone())
+        .filter(|client| client.alive.load(Ordering::Acquire))
+        .map_or(0, |client| client.live.load(Ordering::Acquire))
 }
 
 fn helper_path() -> Result<PathBuf> {
@@ -91,11 +98,19 @@ fn helper_path() -> Result<PathBuf> {
     )
 }
 
+/// The live helper connection, starting a new helper when there is none or the last one died.
 fn client(data_dir: &Path) -> Result<Arc<Client>> {
-    CLIENT
-        .get_or_init(|| start(data_dir).map_err(|error| format!("{error:#}")))
-        .clone()
-        .map_err(anyhow::Error::msg)
+    let mut current = CLIENT
+        .lock()
+        .map_err(|_| anyhow::anyhow!("browser client state poisoned"))?;
+    if let Some(client) = current.as_ref()
+        && client.alive.load(Ordering::Acquire)
+    {
+        return Ok(client.clone());
+    }
+    let client = start(data_dir)?;
+    *current = Some(client.clone());
+    Ok(client)
 }
 
 fn start(data_dir: &Path) -> Result<Arc<Client>> {
@@ -124,6 +139,7 @@ fn start(data_dir: &Path) -> Result<Arc<Client>> {
         next_page: AtomicU32::new(1),
         helper: Mutex::new(None),
         alive: AtomicBool::new(true),
+        live: AtomicUsize::new(0),
         ready: AtomicBool::new(false),
         write_started: Mutex::new(None),
     });
@@ -267,7 +283,7 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
                 }
             }
             FromBrowser::Created { page } => {
-                LIVE_BROWSERS.fetch_add(1, Ordering::AcqRel);
+                client.live.fetch_add(1, Ordering::AcqRel);
                 if let Some(slot) = slot(page) {
                     slot.events.unbounded_send(PageEvent::Created).ok();
                 }
@@ -293,7 +309,8 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
                 }
             }
             FromBrowser::Closed { page } => {
-                let live = LIVE_BROWSERS
+                let live = client
+                    .live
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                         Some(live.saturating_sub(1))
                     })
@@ -368,9 +385,16 @@ impl Client {
             child.wait().ok();
         }
         self.wake.notify_all();
+        self.live.store(0, Ordering::Release);
+        if let Ok(mut outbox) = self.outbox.lock() {
+            outbox.clear();
+        }
+        // Every open page is told, so its pane can say what happened instead of freezing.
         if let Ok(mut slots) = self.slots.lock() {
             for (_, slot) in slots.drain() {
-                slot.events.unbounded_send(PageEvent::Closed).ok();
+                slot.events
+                    .unbounded_send(PageEvent::Failed(reason.to_owned()))
+                    .ok();
             }
         }
     }
@@ -411,6 +435,15 @@ impl Page {
             scale,
             url: url.to_owned(),
         });
+        // The helper may have died between getting the client and registering the page.
+        if !client.alive.load(Ordering::Acquire)
+            && let Ok(mut slots) = client.slots.lock()
+            && let Some(slot) = slots.remove(&id)
+        {
+            slot.events
+                .unbounded_send(PageEvent::Failed("the cod-browser helper is not running".into()))
+                .ok();
+        }
         Ok(Self { client, id, slot })
     }
 
