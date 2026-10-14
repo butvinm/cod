@@ -19,7 +19,10 @@ jobs:
       CARGO_TERM_COLOR: always
       CARGO_INCREMENTAL: "0"
       # No debug info: keeps the target folder and the link step small enough for a free runner.
-      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the first two pairs repeat them.
+      # The last pair links with mold.
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
       CC: clang
       CXX: clang++
     steps:
@@ -40,7 +43,7 @@ jobs:
       - name: Install Linux dependencies
         run: |
           ./script/linux
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev mold
 
       - name: Install Rust toolchain
         run: |
@@ -49,15 +52,21 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Build
+      - name: Restore the Rust dependency cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-on-failure: true
+
+      - name: Build (cargo release-fast, no LTO, mold)
         run: |
-          cargo build --release -p zed
+          cargo build --profile release-fast -p zed
           df -h /
 
-      - name: Package
+      - name: Package (strip, tar)
         run: |
           mkdir cod
-          cp target/release/zed cod/cod
+          cp target/release-fast/zed cod/cod
           strip cod/cod
           cp script/cod-xwayland.sh cod/cod-xwayland.sh
           chmod +x cod/cod cod/cod-xwayland.sh
