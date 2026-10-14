@@ -443,6 +443,17 @@ async fn run(
 
     // Frame cost: scroll the remaining page continuously and report frames, copy cost and CPU.
     if let Some(second) = second {
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.resize_pane(Axis::Horizontal, px(250.0), window, cx);
+            })
+            .log_err();
+        // COD_SPIKE_COST_URL measures a real page (a long Wikipedia article) instead of the animated fixture.
+        let cost_url = std::env::var("COD_SPIKE_COST_URL").ok();
+        if let (Some(url), Some(Some(engine))) = (&cost_url, read(cx, &second, |view| view.page())) {
+            engine.load_url(url);
+            pause(cx, 8000).await;
+        }
         let origin = pane_origin(cx, &second);
         let center = origin + point(px(200.0), px(300.0));
         pause(cx, 1500).await;
@@ -469,11 +480,13 @@ async fn run(
         let cpu_a = cpu_seconds();
         let helper_a = helper_cpu_seconds();
         let started = Instant::now();
-        run_script(
-            cx,
-            &second,
-            "document.body.style.height='20000px'; (function tick(){ document.body.style.background = 'hsl(' + (performance.now() / 10 % 360) + ',60%,85%)'; requestAnimationFrame(tick); })();",
-        );
+        if cost_url.is_none() {
+            run_script(
+                cx,
+                &second,
+                "document.body.style.height='20000px'; (function tick(){ document.body.style.background = 'hsl(' + (performance.now() / 10 % 360) + ',60%,85%)'; requestAnimationFrame(tick); })();",
+            );
+        }
         while started.elapsed() < Duration::from_secs(6) {
             wheel(cx, center, -40.0);
             pause(cx, 16).await;
