@@ -52,15 +52,32 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Restore the Rust dependency cache
+      # sccache keeps every compiled crate (third-party and workspace) in the GitHub Actions cache.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      # Only the cargo registry and git checkouts are kept here. The target folder is left to sccache,
+      # so the compiled output is not stored twice against the 10 GB cache limit.
+      # Only master writes caches, so tags and other branches cannot fill or poison them.
+      - name: Restore the cargo registry cache
         uses: Swatinem/rust-cache@v2.8.0
         with:
           key: release-fast
+          cache-targets: false
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      - name: Build (cargo release-fast, no LTO, mold)
+      - name: Build (cargo release-fast, no LTO, mold, sccache)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
         run: |
+          sccache --zero-stats
           cargo build --profile release-fast -p zed
+          sccache --show-stats
           df -h /
 
       - name: Package (strip, tar)
