@@ -1,0 +1,19 @@
+[package]
+name = "cod_browser"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "Helper process that renders web pages off-screen with CEF and sends the frames to Cod (issue #16)."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cod-browser"
+path = "src/cod_browser.rs"
+doctest = false
+
+# The binary does nothing on other platforms, so the CEF crates are only fetched and built on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+cef.workspace = true

@@ -1,6 +1,6 @@
 //! A workspace item that shows a web page drawn by an off-screen browser (issue #16).
 //!
-//! The browser (CEF, see `cef_engine`) renders into memory. Every frame becomes a fresh `RenderImage` that GPUI paints inside the pane like any other image, so the page is part of Cod's own window and works on native Wayland.
+//! The browser (CEF, in the `cod-browser` helper process, see `browser_client`) renders into memory. Every frame becomes a fresh `RenderImage` that GPUI paints inside the pane like any other image, so the page is part of Cod's own window and works on native Wayland.
 //! Mouse and keyboard events that GPUI delivers to the pane are forwarded to the browser.
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
@@ -18,9 +18,12 @@ use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{SplitDirection, Workspace, item::Item};
 
-use crate::cef_engine::{
-    EVENT_ALT, EVENT_COMMAND, EVENT_CONTROL, EVENT_LEFT_BUTTON, EVENT_MIDDLE_BUTTON,
-    EVENT_RIGHT_BUTTON, EVENT_SHIFT, Page, PageEvent, PageFrame,
+use crate::browser_client::{
+    Page, PageEvent, PageFrame,
+    protocol::{
+        self, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, EVENT_ALT, EVENT_COMMAND, EVENT_CONTROL,
+        EVENT_LEFT_BUTTON, EVENT_MIDDLE_BUTTON, EVENT_RIGHT_BUTTON, EVENT_SHIFT,
+    },
 };
 
 /// Pixels one wheel "line" scrolls, for devices that report lines.
@@ -90,6 +93,20 @@ pub fn open_url_in_split(
     Ok(page)
 }
 
+pub(crate) fn open_url_in_active_pane(
+    workspace: &mut Workspace,
+    url: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> anyhow::Result<Entity<OffscreenView>> {
+    let page = cx.new(|cx| OffscreenView::new(url, window, cx));
+    if let Some(error) = page.read(cx).start_error.clone() {
+        anyhow::bail!("{error}");
+    }
+    workspace.add_item_to_active_pane(Box::new(page.clone()), None, true, window, cx);
+    Ok(page)
+}
+
 pub struct OffscreenView {
     url: SharedString,
     title: Option<SharedString>,
@@ -102,6 +119,8 @@ pub struct OffscreenView {
     hidden: Rc<Cell<bool>>,
     console: Vec<String>,
     pub(crate) frames_painted: u64,
+    /// Total time spent turning frames into images, for the frame cost report.
+    pub(crate) image_micros: u64,
     pub(crate) last_frame_size: (u32, u32),
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
@@ -172,6 +191,7 @@ impl OffscreenView {
             hidden: Rc::new(Cell::new(false)),
             console: Vec::new(),
             frames_painted: 0,
+            image_micros: 0,
             last_frame_size: (0, 0),
             _events: events,
             _subscriptions: subscriptions,
@@ -220,6 +240,7 @@ impl OffscreenView {
     }
 
     fn show_frame(&mut self, frame: PageFrame, window: &mut Window, cx: &mut Context<Self>) {
+        let started = std::time::Instant::now();
         let size = (frame.width, frame.height);
         let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra) else {
             return;
@@ -231,11 +252,16 @@ impl OffscreenView {
             window.drop_image(previous).log_err();
         }
         self.frames_painted += 1;
+        self.image_micros += started.elapsed().as_micros() as u64;
         if self.last_frame_size != size {
             log::info!("web_view: frame size {}x{}", size.0, size.1);
         }
         self.last_frame_size = size;
         cx.notify();
+    }
+
+    pub(crate) fn is_hidden(&self) -> bool {
+        self.hidden.get()
     }
 
     pub(crate) fn page(&self) -> Option<Rc<Page>> {
@@ -271,7 +297,7 @@ impl OffscreenView {
         let Some(code) = windows_key_code(keystroke) else {
             return;
         };
-        page.key(cef::KeyEventType::RAWKEYDOWN, code, 0, flags);
+        page.key(protocol::KEY_RAW_DOWN, code, 0, flags);
         let typed = if keystroke.modifiers.control
             || keystroke.modifiers.alt
             || keystroke.modifiers.platform
@@ -287,7 +313,7 @@ impl OffscreenView {
             }
         };
         if let Some(character) = typed {
-            page.key(cef::KeyEventType::CHAR, i32::from(character), character, flags);
+            page.key(protocol::KEY_CHAR, i32::from(character), character, flags);
         }
         cx.stop_propagation();
     }
@@ -300,7 +326,7 @@ impl OffscreenView {
             return;
         };
         page.key(
-            cef::KeyEventType::KEYUP,
+            protocol::KEY_UP,
             code,
             0,
             modifier_flags(&event.keystroke.modifiers, None),
@@ -583,10 +609,10 @@ impl Render for OffscreenView {
     }
 }
 
-fn mouse_button_type(button: MouseButton) -> cef::MouseButtonType {
+fn mouse_button_type(button: MouseButton) -> u8 {
     match button {
-        MouseButton::Left | MouseButton::Navigate(_) => cef::MouseButtonType::LEFT,
-        MouseButton::Middle => cef::MouseButtonType::MIDDLE,
-        MouseButton::Right => cef::MouseButtonType::RIGHT,
+        MouseButton::Left | MouseButton::Navigate(_) => BUTTON_LEFT,
+        MouseButton::Middle => BUTTON_MIDDLE,
+        MouseButton::Right => BUTTON_RIGHT,
     }
 }

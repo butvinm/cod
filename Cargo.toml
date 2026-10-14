@@ -33,6 +33,7 @@ members = [
     "crates/cloud_api_client",
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
+    "crates/cod_browser",
     "crates/codestral",
     "crates/collab",
     "crates/collab_ui",
