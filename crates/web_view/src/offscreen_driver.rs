@@ -4,6 +4,7 @@
 //! Every acceptance criterion logs one `driver: ACn PASS|FAIL ...` line.
 
 use std::{
+    process::Command,
     sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
@@ -35,6 +36,7 @@ pub(crate) fn start(page: Entity<OffscreenView>, window: &mut Window, cx: &mut C
 fn verdict(name: &str, passed: bool, detail: String) {
     let word = if passed { "PASS" } else { "FAIL" };
     log::info!("driver: {name} {word} {detail}");
+    screenshot(&name.replace(' ', "-"));
 }
 
 async fn pause(cx: &AsyncWindowContext, millis: u64) {
@@ -203,7 +205,38 @@ async fn wait_for_title(
 }
 
 fn cpu_seconds() -> f64 {
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+    cpu_seconds_of("/proc/self/stat")
+}
+
+/// CPU time of the `cod-browser` helper and every process CEF started from it.
+fn helper_cpu_seconds() -> f64 {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0.0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("cmdline"))
+                .is_ok_and(|command| command.contains("cod-browser"))
+        })
+        .map(|entry| cpu_seconds_of(&entry.path().join("stat").to_string_lossy()))
+        .sum()
+}
+
+/// Saves a screenshot of the compositor output when COD_SPIKE_SHOTS names a folder; needs `grim` and a wlroots compositor.
+fn screenshot(name: &str) {
+    let Ok(folder) = std::env::var("COD_SPIKE_SHOTS") else {
+        return;
+    };
+    let path = format!("{folder}/{name}.png");
+    match Command::new("grim").arg(&path).status() {
+        Ok(status) if status.success() => log::info!("driver: screenshot {path}"),
+        other => log::warn!("driver: screenshot {path} failed: {other:?}"),
+    }
+}
+
+fn cpu_seconds_of(stat_path: &str) -> f64 {
+    let Ok(stat) = std::fs::read_to_string(stat_path) else {
         return 0.0;
     };
     let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
@@ -412,8 +445,17 @@ async fn run(
     if let Some(second) = second {
         let origin = pane_origin(cx, &second);
         let center = origin + point(px(200.0), px(300.0));
+        pause(cx, 1500).await;
+        let (idle_zed, idle_helper) = (cpu_seconds(), helper_cpu_seconds());
+        pause(cx, 4000).await;
+        log::info!(
+            "driver: IDLE static page: CPU in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}",
+            (cpu_seconds() - idle_zed) / 4.0 * 100.0,
+            (helper_cpu_seconds() - idle_helper) / 4.0 * 100.0,
+        );
         let (frames_a, micros_a) = read(cx, &second, |view| (view.frames_painted, view.image_micros)).unwrap_or_default();
         let cpu_a = cpu_seconds();
+        let helper_a = helper_cpu_seconds();
         let started = Instant::now();
         run_script(
             cx,
@@ -427,15 +469,19 @@ async fn run(
         let elapsed = started.elapsed().as_secs_f64();
         let (frames_b, micros_b) = read(cx, &second, |view| (view.frames_painted, view.image_micros)).unwrap_or_default();
         let cpu_b = cpu_seconds();
+        let helper_b = helper_cpu_seconds();
         let frames = frames_b - frames_a;
         let size = read(cx, &second, |view| view.last_frame_size).unwrap_or_default();
         log::info!(
-            "driver: COST pane frame {}x{} px: {frames} frames in {elapsed:.1}s = {:.1} fps; image build {} us/frame; Zed process CPU {:.0}% of one core over the run (the cod-browser processes are measured separately)",
+            "driver: COST pane frame {}x{} px: {frames} frames in {elapsed:.1}s = {:.1} fps; image build {} us/frame; CPU over the run in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}; CPU per frame: Zed {:.1} ms, helper {:.1} ms",
             size.0,
             size.1,
             frames as f64 / elapsed,
             if frames > 0 { (micros_b - micros_a) / frames } else { 0 },
             (cpu_b - cpu_a) / elapsed * 100.0,
+            (helper_b - helper_a) / elapsed * 100.0,
+            (cpu_b - cpu_a) * 1000.0 / frames.max(1) as f64,
+            (helper_b - helper_a) * 1000.0 / frames.max(1) as f64,
         );
     }
     log::info!("driver: done");
