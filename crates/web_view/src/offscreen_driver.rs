@@ -28,8 +28,9 @@ const SECOND_TITLE: &str = "Cod off-screen second page";
 const FIRST_TITLE: &str = "Cod off-screen test page";
 
 /// Every check that has to report, in the order they run. A missing one fails the run like a failed one.
-const REQUIRED: [&str; 8] = [
+const REQUIRED: [&str; 9] = [
     "AC1",
+    "AC6",
     "AC2 wheel",
     "AC2 link",
     "AC3",
@@ -310,6 +311,38 @@ async fn wait_for_title(
     .await
 }
 
+/// The fixture's banner colour, #2b6cb0.
+const BANNER: [u8; 3] = [0x2b, 0x6c, 0xb0];
+
+/// Captures the whole compositor output with `grim` (a wlroots tool) and decodes it.
+fn capture() -> Option<image::RgbaImage> {
+    let path = std::env::temp_dir().join(format!("cod-driver-{}.png", std::process::id()));
+    let status = Command::new("grim").arg(&path).status().log_err()?;
+    let decoded = status.success().then(|| image::open(&path).log_err()).flatten();
+    std::fs::remove_file(&path).ok();
+    decoded.map(|image| image.to_rgba8())
+}
+
+/// Counts pixels of the banner colour inside and outside a pane rectangle (x, y, width, height in pixels).
+fn count_banner_pixels(image: &image::RgbaImage, pane: (u32, u32, u32, u32)) -> (u64, u64) {
+    let (mut inside, mut outside) = (0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let matches = pixel.0[..3]
+            .iter()
+            .zip(BANNER)
+            .all(|(channel, expected)| channel.abs_diff(expected) <= 3);
+        if !matches {
+            continue;
+        }
+        if x >= pane.0 && x < pane.0 + pane.2 && y >= pane.1 && y < pane.1 + pane.3 {
+            inside += 1;
+        } else {
+            outside += 1;
+        }
+    }
+    (inside, outside)
+}
+
 fn cpu_seconds() -> f64 {
     cpu_seconds_of("/proc/self/stat")
 }
@@ -385,12 +418,35 @@ async fn run(
     );
     // "Painted" is recorded by GPUI's own paint pass over the pane, so the image was drawn and not only built.
     let drawn = painted.is_some_and(|(size, newest)| size == frame_size && newest);
+    // What the compositor really shows: known fixture pixels (the blue banner) must be inside the pane and nowhere else.
+    pause(cx, 300).await;
+    let captured = capture();
+    let pane = (
+        (f32::from(bounds.origin.x) * scale) as u32,
+        (f32::from(bounds.origin.y) * scale) as u32,
+        expected.0,
+        expected.1,
+    );
+    let (inside, outside) = captured
+        .as_ref()
+        .map(|image| count_banner_pixels(image, pane))
+        .unwrap_or((0, u64::MAX));
+    // The banner is 60 CSS pixels high and the page width less its margins and scrollbar.
+    let banner_pixels = u64::from(expected.0.saturating_sub(24 + 15)) * u64::from((60.0 * scale) as u32);
     verdict(
         "AC1",
-        frames > 0 && frame_size == expected && drawn,
+        frames > 0 && frame_size == expected && drawn && inside * 2 >= banner_pixels,
         format!(
-            "page loaded in {loaded:?}, {frames} frames built as GPUI images, last paint drew the newest frame: {drawn} ({painted:?}), frame {}x{} px, pane {}x{} px, scale {scale}",
-            frame_size.0, frame_size.1, expected.0, expected.1
+            "page loaded in {loaded:?}, {frames} frames built, last paint drew the newest frame: {drawn} ({painted:?}); in the captured screen {inside} fixture banner pixels are inside the pane (page expects about {banner_pixels}); frame {}x{} px, pane {}x{} px at {},{} scale {scale}",
+            frame_size.0, frame_size.1, expected.0, expected.1, pane.0, pane.1
+        ),
+    );
+    verdict(
+        "AC6",
+        captured.is_some() && inside > 0 && outside == 0,
+        format!(
+            "captured screen: {outside} page banner pixels outside the pane rectangle, {inside} inside; screen captured: {}",
+            captured.is_some()
         ),
     );
 

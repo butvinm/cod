@@ -2,7 +2,7 @@
 # Runs the off-screen web view driver (issue #16) under a headless Wayland compositor and exits with its status.
 # Status 0 means every acceptance check reported and passed; 1 means a check failed or did not report; 124 means the run timed out.
 # Usage: run_driver.sh <zed binary> <folder to open>
-# Needs: sway (wlroots headless backend; Weston headless has no wl_seat, which GPUI requires), dbus-run-session, lavapipe (mesa-vulkan-drivers), the cod-browser helper next to the zed binary, COD_CEF_DIR (folder with libcef.so), optionally grim for screenshots (COD_SPIKE_SHOTS=<folder>).
+# Needs: sway (wlroots headless backend; Weston headless has no wl_seat, which GPUI requires), dbus-run-session, lavapipe (mesa-vulkan-drivers), the cod-browser helper next to the zed binary, COD_CEF_DIR (folder with libcef.so), grim, which the AC1 and AC6 checks use to capture the screen and look for the fixture's banner pixels (COD_SPIKE_SHOTS=<folder> also saves a screenshot per check).
 set -uo pipefail
 
 zed=${1:?usage: run_driver.sh <zed binary> <folder>}
@@ -19,7 +19,7 @@ echo '{ "session": { "trust_all_worktrees": true } }' > "$data/config/settings.j
 
 export XDG_RUNTIME_DIR="$runtime"
 WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman \
-    sway -c /dev/null > "$work/sway.log" 2>&1 &
+    sway -c "$here/sway.conf" > "$work/sway.log" 2>&1 &
 sway_pid=$!
 cleanup() {
     kill "$sway_pid" 2>/dev/null
