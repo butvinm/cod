@@ -395,10 +395,17 @@ impl Client {
         if let Some(child) = child {
             reap(child);
         }
-        self.wake.notify_all();
         self.live.store(0, Ordering::Release);
-        if let Ok(mut outbox) = self.outbox.lock() {
-            outbox.clear();
+        // `alive` is already false. The writer checks it while holding the queue lock before it sleeps, so clearing the queue and waking it under that same lock means it cannot miss this wakeup and sleep forever.
+        match self.outbox.lock() {
+            Ok(mut outbox) => {
+                outbox.clear();
+                self.wake.notify_all();
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                self.wake.notify_all();
+            }
         }
         // Every open page is told, so its pane can say what happened instead of freezing.
         if let Ok(mut slots) = self.slots.lock() {
