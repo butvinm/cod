@@ -331,6 +331,19 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
     client.fail("the connection to cod-browser was lost");
 }
 
+/// Ends a helper process and collects its exit status on a thread of its own, so the caller (possibly the GPUI thread) never waits for it.
+fn reap(mut child: Child) {
+    child.kill().ok();
+    let spawned = std::thread::Builder::new()
+        .name("cod-browser-reaper".into())
+        .spawn(move || {
+            child.wait().ok();
+        });
+    if let Err(error) = spawned {
+        log::error!("web_view: cannot start the reaper thread: {error}");
+    }
+}
+
 impl Client {
     /// Queues a command for the writer thread; never blocks.
     /// Pointer moves and resizes replace an identical kind of command at the end of the queue, and when the queue is full pointer moves and wheel events are dropped.
@@ -378,11 +391,9 @@ impl Client {
         }
         log::error!("web_view: {reason}");
         self.control.shutdown(std::net::Shutdown::Both).ok();
-        if let Ok(mut helper) = self.helper.lock()
-            && let Some(mut child) = helper.take()
-        {
-            child.kill().ok();
-            child.wait().ok();
+        let child = self.helper.lock().ok().and_then(|mut helper| helper.take());
+        if let Some(child) = child {
+            reap(child);
         }
         self.wake.notify_all();
         self.live.store(0, Ordering::Release);
