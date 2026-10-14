@@ -4,7 +4,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::Instant,
@@ -13,6 +13,26 @@ use std::{
 use cef::*;
 
 use crate::protocol::{self, FromBrowser, ToBrowser};
+
+const MAX_CONSOLE_BYTES: usize = 4096;
+const MAX_TITLE_BYTES: usize = 1024;
+const MAX_URL_BYTES: usize = 8192;
+const MAX_PENDING_CONSOLE: usize = 64;
+
+/// Console messages queued for sending and not yet written.
+static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
+
+/// Cuts text from the page to at most `limit` bytes on a character boundary, so no message can exceed what Cod accepts.
+fn limited(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
 
 enum Outgoing {
     Message(FromBrowser),
@@ -176,7 +196,8 @@ wrap_display_handler! {
         fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
             let state = &self.handler.state;
             if let Some(title) = title {
-                state.send(FromBrowser::Title { page: state.id, title: title.to_string() });
+                let title = limited(&title.to_string(), MAX_TITLE_BYTES);
+                state.send(FromBrowser::Title { page: state.id, title });
             }
         }
 
@@ -188,7 +209,8 @@ wrap_display_handler! {
         ) {
             let state = &self.handler.state;
             if let Some(url) = url {
-                state.send(FromBrowser::Address { page: state.id, url: url.to_string() });
+                let url = limited(&url.to_string(), MAX_URL_BYTES);
+                state.send(FromBrowser::Address { page: state.id, url });
             }
         }
 
@@ -201,8 +223,13 @@ wrap_display_handler! {
             _line: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             let state = &self.handler.state;
-            if let Some(message) = message {
-                state.send(FromBrowser::Console { page: state.id, message: message.to_string() });
+            // Diagnostics are best effort: a page that logs in a loop must not grow the queue or crowd out frames.
+            let Some(message) = message else { return 0 };
+            if PENDING_CONSOLE.fetch_add(1, Ordering::AcqRel) < MAX_PENDING_CONSOLE {
+                let message = limited(&message.to_string(), MAX_CONSOLE_BYTES);
+                state.send(FromBrowser::Console { page: state.id, message });
+            } else {
+                PENDING_CONSOLE.fetch_sub(1, Ordering::AcqRel);
             }
             0
         }
@@ -367,7 +394,12 @@ fn write_loop(stream: UnixStream, outgoing: mpsc::Receiver<Outgoing>, pages: Pag
     let mut writer = BufWriter::with_capacity(1 << 16, stream);
     while let Ok(item) = outgoing.recv() {
         let result = match item {
-            Outgoing::Message(message) => message.write_to(&mut writer),
+            Outgoing::Message(message) => {
+                if matches!(message, FromBrowser::Console { .. }) {
+                    PENDING_CONSOLE.fetch_sub(1, Ordering::AcqRel);
+                }
+                message.write_to(&mut writer)
+            }
             Outgoing::FrameReady(page) => {
                 let state = pages.lock().ok().and_then(|pages| pages.get(&page).cloned());
                 let Some(state) = state else { continue };
