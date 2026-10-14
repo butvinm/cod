@@ -10,16 +10,20 @@ Cod is in an early preview. Right now it is stock Zed 1.23.2 plus a web page in 
 
 ## Try it on Linux
 
-The preview runs on x86_64 Linux with X11. On a Wayland desktop it runs through XWayland. It is built on Ubuntu 24.04, so it needs glibc 2.39 or newer (for example Ubuntu 24.04, Debian 13, Fedora 40 or a current Arch).
+The preview runs on x86_64 Linux. It is built on Ubuntu 24.04, so it needs glibc 2.39 or newer (for example Ubuntu 24.04, Debian 13, Fedora 40 or a current Arch).
 
-1. Install WebKitGTK, for example on Ubuntu 24.04 or Debian 13: `sudo apt install libwebkit2gtk-4.1-0`.
+On a Wayland desktop, use `cod-wayland.sh` (recommended). Cod runs as a native Wayland client and web pages are drawn by a bundled off-screen browser (Chromium Embedded Framework, in the `cod/cef` folder and the `cod-browser` helper). The tarball is large because of it.
+
+1. Install the libraries the browser needs. On Arch: `sudo pacman -S nss nspr alsa-lib at-spi2-core cups libdrm mesa libxkbcommon pango libxcomposite libxdamage libxrandr`. The `cod` binary is still linked against WebKitGTK, so it also needs `webkit2gtk-4.1` on Arch (`libwebkit2gtk-4.1-0` on Ubuntu 24.04 or Debian 13).
 2. Download `cod-linux-x86_64.tar.gz` from the latest prerelease on the [Releases](https://github.com/butvinm/cod/releases) page.
 3. Unpack it: `tar -xzf cod-linux-x86_64.tar.gz`.
-4. Start it: `./cod/cod-xwayland.sh`. It opens a public GitLab merge request in a pane.
+4. Start it: `./cod/cod-wayland.sh`. It opens a Wikipedia page in a pane.
 
-To open another page and a folder: `./cod/cod-xwayland.sh <url> <folder>`.
+To open another page and a folder: `./cod/cod-wayland.sh <url> <folder>`.
 
-The start script makes Cod use X11 (the web page needs X11 for now) and keeps its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), a core dump is available if systemd-coredump is installed and enabled: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
+Without a Wayland session (X11), or if the off-screen browser does not work for you, use `./cod/cod-xwayland.sh [url] [folder]` instead. It makes Cod use X11 (through XWayland on a Wayland desktop) with the older WebKitGTK web view.
+
+Both start scripts keep its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), a core dump is available if systemd-coredump is installed and enabled: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
 
 ## Building
 

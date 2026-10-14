@@ -49,6 +49,9 @@ wry.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 gdkx11 = "0.18"
 gtk = "0.18"
+image.workspace = true
+paths.workspace = true
+smallvec.workspace = true
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { workspace = true, features = ["os-webview"] }
 x11-dl = "2.21"

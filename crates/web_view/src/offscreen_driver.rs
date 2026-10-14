@@ -1,0 +1,695 @@
+//! Spike-only driver for the off-screen web view, enabled with COD_SPIKE_DRIVE=offscreen together with COD_SPIKE_URL (a file URL of `test_fixtures/offscreen.html`).
+//!
+//! Headless Weston has no input seat, so the driver feeds synthetic GPUI events into the window with `Window::dispatch_event`, exactly where the platform layer would, and reads the page's state back with JavaScript (`console.log` lines that the engine reports).
+//! Every acceptance criterion logs one `driver: ACn PASS|FAIL ...` line.
+
+use std::{
+    process::Command,
+    sync::Mutex,
+    sync::atomic::{AtomicU32, Ordering},
+    time::{Duration, Instant},
+};
+
+use gpui::{
+    Axis, AsyncWindowContext, Context, Entity, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta,
+    ScrollWheelEvent, TouchPhase, WeakEntity, Window, point, px,
+};
+use serde_json::Value;
+use util::ResultExt as _;
+use workspace::Workspace;
+
+use crate::{
+    browser_client,
+    offscreen::{OffscreenView, open_url_in_active_pane},
+};
+
+const SECOND_TITLE: &str = "Cod off-screen second page";
+const FIRST_TITLE: &str = "Cod off-screen test page";
+
+/// Every check that has to report, in the order they run. A missing one fails the run like a failed one.
+const REQUIRED: [&str; 9] = [
+    "AC1",
+    "AC6",
+    "AC2 wheel",
+    "AC2 link",
+    "AC3",
+    "AC4",
+    "AC5 hide/show",
+    "AC5 browser side",
+    "AC5 close",
+];
+
+static RESULTS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+/// COD_SPIKE_KILL_HELPER=1 runs the dead-helper check instead of the acceptance sequence.
+fn recovery_mode() -> bool {
+    std::env::var("COD_SPIKE_KILL_HELPER").is_ok_and(|value| value == "1")
+}
+
+/// Kills the helper, expects the open page to say so, then opens a page again and expects a new helper to draw it.
+async fn recover(
+    workspace: &WeakEntity<Workspace>,
+    page: &Entity<OffscreenView>,
+    cx: &mut AsyncWindowContext,
+) {
+    let killed = Command::new("pkill")
+        .args(["-9", "-f", "cod-browser --cod-cache"])
+        .status()
+        .is_ok_and(|status| status.success());
+    let failed_after = wait_until(cx, 10_000, |cx| {
+        read(cx, page, |view| view.failure().is_some()).unwrap_or(false)
+    })
+    .await;
+    let message = read(cx, page, |view| view.failure().map(str::to_owned)).flatten();
+    let live_after_death = browser_client::live_browsers();
+    pause(cx, 500).await;
+    screenshot("RECOVERY-failed");
+    let fixture = read(cx, page, |view| view.current_url().to_owned()).unwrap_or_default();
+    let reopened = workspace
+        .update_in(cx, |workspace, window, cx| {
+            open_url_in_active_pane(workspace, fixture, window, cx).log_err()
+        })
+        .ok()
+        .flatten();
+    let mut drew = false;
+    if let Some(reopened) = &reopened {
+        drew = wait_until(cx, 30_000, |cx| {
+            read(cx, reopened, |view| {
+                view.painted_frame().is_some_and(|(_, newest)| newest)
+            })
+            .unwrap_or(false)
+        })
+        .await
+        .is_some();
+    }
+    let live_after_restart = browser_client::live_browsers();
+    verdict(
+        "RECOVERY",
+        killed && failed_after.is_some() && live_after_death == 0 && drew && live_after_restart == 1,
+        format!(
+            "helper killed={killed}; the open page showed {message:?} after {failed_after:?}; live views after death {live_after_death}; a new page then drew its first frame={drew} with {live_after_restart} live view"
+        ),
+    );
+}
+
+pub(crate) fn start(page: Entity<OffscreenView>, window: &mut Window, cx: &mut Context<Workspace>) {
+    cx.spawn_in(window, async move |workspace, cx| {
+        run(workspace, page, cx).await;
+        finish(cx).await;
+    })
+    .detach();
+}
+
+/// Ends the process with status 0 only when every required check reported and passed.
+async fn finish(cx: &mut AsyncWindowContext) {
+    let results = RESULTS.lock().map(|results| results.clone()).unwrap_or_default();
+    let required: &[&str] = if recovery_mode() {
+        &["AC1", "RECOVERY"]
+    } else {
+        &REQUIRED
+    };
+    let problems: Vec<String> = required
+        .iter()
+        .filter_map(|name| match results.iter().find(|(reported, _)| reported == name) {
+            None => Some(format!("{name} missing")),
+            Some((_, false)) => Some(format!("{name} failed")),
+            Some((_, true)) => None,
+        })
+        .collect();
+    let code = if problems.is_empty() {
+        log::info!("driver: RESULT all {} checks passed", required.len());
+        0
+    } else {
+        log::error!("driver: RESULT FAIL {}", problems.join(", "));
+        1
+    };
+    pause(cx, 1000).await;
+    std::process::exit(code);
+}
+
+fn verdict(name: &str, passed: bool, detail: String) {
+    let word = if passed { "PASS" } else { "FAIL" };
+    if let Ok(mut results) = RESULTS.lock() {
+        results.push((name.to_owned(), passed));
+    }
+    log::info!("driver: {name} {word} {detail}");
+    screenshot(&name.replace(' ', "-"));
+}
+
+async fn pause(cx: &AsyncWindowContext, millis: u64) {
+    cx.background_executor()
+        .timer(Duration::from_millis(millis))
+        .await;
+}
+
+fn read<R>(
+    cx: &mut AsyncWindowContext,
+    page: &Entity<OffscreenView>,
+    read: impl FnOnce(&OffscreenView) -> R,
+) -> Option<R> {
+    Some(page.read_with(cx, |view, _| read(view)))
+}
+
+fn send(cx: &mut AsyncWindowContext, event: PlatformInput) {
+    cx.update(|window, cx| {
+        window.dispatch_event(event, cx);
+    })
+    .log_err();
+}
+
+async fn wait_until(
+    cx: &mut AsyncWindowContext,
+    timeout_millis: u64,
+    mut condition: impl FnMut(&mut AsyncWindowContext) -> bool,
+) -> Option<Duration> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(timeout_millis) {
+        if condition(cx) {
+            return Some(started.elapsed());
+        }
+        pause(cx, 25).await;
+    }
+    None
+}
+
+fn run_script(cx: &mut AsyncWindowContext, page: &Entity<OffscreenView>, script: &str) {
+    if let Some(Some(engine)) = read(cx, page, |view| view.page()) {
+        engine.execute_javascript(script);
+    }
+}
+
+async fn read_state(cx: &mut AsyncWindowContext, page: &Entity<OffscreenView>) -> Option<Value> {
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let prefix = format!("COD_STATE#{id} ");
+    run_script(
+        cx,
+        page,
+        &format!("console.log('COD_STATE#{id} ' + window.codState())"),
+    );
+    let mut json = None;
+    wait_until(cx, 3000, |cx| {
+        json = read(cx, page, |view| {
+            view.console()
+                .iter()
+                .find_map(|line| line.strip_prefix(prefix.as_str()).map(str::to_owned))
+        })
+        .flatten();
+        json.is_some()
+    })
+    .await?;
+    serde_json::from_str(&json?).ok()
+}
+
+fn number(state: &Option<Value>, key: &str) -> f64 {
+    state
+        .as_ref()
+        .and_then(|state| state.get(key))
+        .and_then(Value::as_f64)
+        .unwrap_or(f64::NAN)
+}
+
+fn visibility(state: &Option<Value>) -> String {
+    state
+        .as_ref()
+        .and_then(|state| state.get("visibility"))
+        .and_then(Value::as_str)
+        .unwrap_or("no answer")
+        .to_owned()
+}
+
+fn target(state: &Option<Value>, key: &str) -> (f32, f32) {
+    let spot = state.as_ref().and_then(|state| state.get(key));
+    let coordinate = |axis: &str| {
+        spot.and_then(|spot| spot.get(axis))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32
+    };
+    (coordinate("x"), coordinate("y"))
+}
+
+fn pane_origin(cx: &mut AsyncWindowContext, page: &Entity<OffscreenView>) -> gpui::Point<gpui::Pixels> {
+    read(cx, page, |view| view.pane_bounds().origin).unwrap_or_default()
+}
+
+fn move_to(cx: &mut AsyncWindowContext, position: gpui::Point<gpui::Pixels>) {
+    send(
+        cx,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }),
+    );
+}
+
+fn click_at(cx: &mut AsyncWindowContext, position: gpui::Point<gpui::Pixels>) {
+    move_to(cx, position);
+    send(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+    );
+    send(
+        cx,
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }),
+    );
+}
+
+fn wheel(cx: &mut AsyncWindowContext, position: gpui::Point<gpui::Pixels>, delta_y: f32) {
+    send(
+        cx,
+        PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.0), px(delta_y))),
+            modifiers: Modifiers::default(),
+            touch_phase: TouchPhase::Moved,
+        }),
+    );
+}
+
+fn press(cx: &mut AsyncWindowContext, key: &str, text: Option<&str>, modifiers: Modifiers) {
+    let keystroke = Keystroke {
+        modifiers,
+        key: key.into(),
+        key_char: text.map(str::to_owned),
+    };
+    send(
+        cx,
+        PlatformInput::KeyDown(KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        }),
+    );
+    send(cx, PlatformInput::KeyUp(KeyUpEvent { keystroke }));
+}
+
+async fn wait_for_title(
+    cx: &mut AsyncWindowContext,
+    page: &Entity<OffscreenView>,
+    title: &str,
+    timeout_millis: u64,
+) -> Option<Duration> {
+    wait_until(cx, timeout_millis, |cx| {
+        read(cx, page, |view| {
+            view.title() == Some(title) && !view.is_loading()
+        })
+        .unwrap_or(false)
+    })
+    .await
+}
+
+/// The fixture's banner colour, #2b6cb0.
+const BANNER: [u8; 3] = [0x2b, 0x6c, 0xb0];
+
+/// Captures the whole compositor output with `grim` (a wlroots tool) and decodes it.
+fn capture() -> Option<image::RgbaImage> {
+    let path = std::env::temp_dir().join(format!("cod-driver-{}.png", std::process::id()));
+    let status = Command::new("grim").arg(&path).status().log_err()?;
+    let decoded = status.success().then(|| image::open(&path).log_err()).flatten();
+    std::fs::remove_file(&path).ok();
+    decoded.map(|image| image.to_rgba8())
+}
+
+/// Counts pixels of the banner colour inside and outside a pane rectangle (x, y, width, height in pixels).
+fn count_banner_pixels(image: &image::RgbaImage, pane: (u32, u32, u32, u32)) -> (u64, u64) {
+    let (mut inside, mut outside) = (0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        let matches = pixel.0[..3]
+            .iter()
+            .zip(BANNER)
+            .all(|(channel, expected)| channel.abs_diff(expected) <= 3);
+        if !matches {
+            continue;
+        }
+        if x >= pane.0 && x < pane.0 + pane.2 && y >= pane.1 && y < pane.1 + pane.3 {
+            inside += 1;
+        } else {
+            outside += 1;
+        }
+    }
+    (inside, outside)
+}
+
+fn cpu_seconds() -> f64 {
+    cpu_seconds_of("/proc/self/stat")
+}
+
+/// CPU time of the `cod-browser` helper and every process CEF started from it.
+fn helper_cpu_seconds() -> f64 {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0.0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("cmdline"))
+                .is_ok_and(|command| command.contains("cod-browser"))
+        })
+        .map(|entry| cpu_seconds_of(&entry.path().join("stat").to_string_lossy()))
+        .sum()
+}
+
+/// Saves a screenshot of the compositor output when COD_SPIKE_SHOTS names a folder; needs `grim` and a wlroots compositor.
+fn screenshot(name: &str) {
+    let Ok(folder) = std::env::var("COD_SPIKE_SHOTS") else {
+        return;
+    };
+    let path = format!("{folder}/{name}.png");
+    match Command::new("grim").arg(&path).status() {
+        Ok(status) if status.success() => log::info!("driver: screenshot {path}"),
+        other => log::warn!("driver: screenshot {path} failed: {other:?}"),
+    }
+}
+
+fn cpu_seconds_of(stat_path: &str) -> f64 {
+    let Ok(stat) = std::fs::read_to_string(stat_path) else {
+        return 0.0;
+    };
+    let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+        return 0.0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // utime and stime are fields 14 and 15 of the file, 12 and 13 after the command name.
+    let ticks = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|field| field.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    (ticks(11) + ticks(12)) / 100.0
+}
+
+async fn run(
+    workspace: WeakEntity<Workspace>,
+    page: Entity<OffscreenView>,
+    cx: &mut AsyncWindowContext,
+) {
+    let Some(loaded) = wait_for_title(cx, &page, FIRST_TITLE, 30_000).await else {
+        verdict("AC1", false, "the fixture page did not load".into());
+        return;
+    };
+    pause(cx, 500).await;
+    let scale = cx.update(|window, _| window.scale_factor()).unwrap_or(1.0);
+    let (frames, frame_size, bounds, painted) = read(cx, &page, |view| {
+        (
+            view.frames_painted,
+            view.last_frame_size,
+            view.pane_bounds(),
+            view.painted_frame(),
+        )
+    })
+    .unwrap_or_default();
+    let expected = (
+        (f32::from(bounds.size.width) * scale) as u32,
+        (f32::from(bounds.size.height) * scale) as u32,
+    );
+    // "Painted" is recorded by GPUI's own paint pass over the pane, so the image was drawn and not only built.
+    let drawn = painted.is_some_and(|(size, newest)| size == frame_size && newest);
+    // What the compositor really shows: known fixture pixels (the blue banner) must be inside the pane and nowhere else.
+    pause(cx, 300).await;
+    let captured = capture();
+    let pane = (
+        (f32::from(bounds.origin.x) * scale) as u32,
+        (f32::from(bounds.origin.y) * scale) as u32,
+        expected.0,
+        expected.1,
+    );
+    let (inside, outside) = captured
+        .as_ref()
+        .map(|image| count_banner_pixels(image, pane))
+        .unwrap_or((0, u64::MAX));
+    // The banner is 60 CSS pixels high and the page width less its margins and scrollbar.
+    let banner_pixels = u64::from(expected.0.saturating_sub(24 + 15)) * u64::from((60.0 * scale) as u32);
+    verdict(
+        "AC1",
+        frames > 0 && frame_size == expected && drawn && inside * 2 >= banner_pixels,
+        format!(
+            "page loaded in {loaded:?}, {frames} frames built, last paint drew the newest frame: {drawn} ({painted:?}); in the captured screen {inside} fixture banner pixels are inside the pane (page expects about {banner_pixels}); frame {}x{} px, pane {}x{} px at {},{} scale {scale}",
+            frame_size.0, frame_size.1, expected.0, expected.1, pane.0, pane.1
+        ),
+    );
+    verdict(
+        "AC6",
+        captured.is_some() && inside > 0 && outside == 0,
+        format!(
+            "captured screen: {outside} page banner pixels outside the pane rectangle, {inside} inside; screen captured: {}",
+            captured.is_some()
+        ),
+    );
+
+    if recovery_mode() {
+        recover(&workspace, &page, cx).await;
+        return;
+    }
+
+    // AC2: the wheel scrolls the page.
+    let state = read_state(cx, &page).await;
+    let origin = pane_origin(cx, &page);
+    let center = origin + point(px(200.0), px(300.0));
+    let before = number(&state, "scrollY");
+    move_to(cx, center);
+    for _ in 0..3 {
+        wheel(cx, center, -100.0);
+        pause(cx, 30).await;
+    }
+    pause(cx, 700).await;
+    let state = read_state(cx, &page).await;
+    let after = number(&state, "scrollY");
+    verdict(
+        "AC2 wheel",
+        after > before,
+        format!("scrollY {before} -> {after}"),
+    );
+    for _ in 0..3 {
+        wheel(cx, center, 200.0);
+        pause(cx, 30).await;
+    }
+    pause(cx, 700).await;
+
+    // AC2: a click on a link navigates and the tab title changes.
+    let state = read_state(cx, &page).await;
+    let (link_x, link_y) = target(&state, "link");
+    click_at(cx, origin + point(px(link_x), px(link_y)));
+    let navigated = wait_for_title(cx, &page, SECOND_TITLE, 5000).await;
+    let title = read(cx, &page, |view| view.title().map(str::to_owned)).flatten();
+    verdict(
+        "AC2 link",
+        navigated.is_some(),
+        format!("tab title {title:?} after {navigated:?}"),
+    );
+
+    // Back to the test page for the typing check.
+    let fixture = read(cx, &page, |view| view.current_url().replace("offscreen_next.html", "offscreen.html"))
+        .unwrap_or_default();
+    if let Some(Some(engine)) = read(cx, &page, |view| view.page()) {
+        engine.load_url(&fixture);
+    }
+    wait_for_title(cx, &page, FIRST_TITLE, 10_000).await;
+    pause(cx, 500).await;
+
+    // AC3: click the text field, type, Backspace, arrow, type again.
+    let state = read_state(cx, &page).await;
+    let (field_x, field_y) = target(&state, "field");
+    click_at(cx, origin + point(px(field_x), px(field_y)));
+    pause(cx, 300).await;
+    for letter in ["h", "e", "l", "l", "o"] {
+        press(cx, letter, Some(letter), Modifiers::default());
+        pause(cx, 20).await;
+    }
+    press(cx, "backspace", None, Modifiers::default());
+    press(cx, "left", None, Modifiers::default());
+    press(cx, "x", Some("X"), Modifiers::shift());
+    pause(cx, 400).await;
+    let state = read_state(cx, &page).await;
+    let value = state
+        .as_ref()
+        .and_then(|state| state.get("value"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    verdict(
+        "AC3",
+        value == "helXl",
+        format!(
+            "field value {value:?} (expected \"helXl\"), caret {}, active {:?}",
+            number(&state, "caret"),
+            state.as_ref().and_then(|state| state.get("active"))
+        ),
+    );
+
+    // AC4: resize the split; the page re-lays out within a second and the frame matches the pane.
+    let width_before = number(&state, "innerWidth");
+    let pane_before = read(cx, &page, |view| view.pane_bounds().size.width).unwrap_or_default();
+    let resized_at = Instant::now();
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.resize_pane(Axis::Horizontal, px(-250.0), window, cx);
+        })
+        .log_err();
+    let mut width_after = width_before;
+    let mut relaid_in = None;
+    while resized_at.elapsed() < Duration::from_secs(4) {
+        let state = read_state(cx, &page).await;
+        width_after = number(&state, "innerWidth");
+        if (width_after - width_before).abs() > 50.0 {
+            relaid_in = Some(resized_at.elapsed());
+            break;
+        }
+    }
+    pause(cx, 400).await;
+    let (frame_size, bounds) = read(cx, &page, |view| (view.last_frame_size, view.pane_bounds()))
+        .unwrap_or_default();
+    let matches = (frame_size.0 as f32 / scale - f32::from(bounds.size.width)).abs() < 1.5
+        && (frame_size.1 as f32 / scale - f32::from(bounds.size.height)).abs() < 1.5;
+    verdict(
+        "AC4",
+        relaid_in.is_some_and(|elapsed| elapsed < Duration::from_secs(1)) && matches,
+        format!(
+            "pane width {}px -> {}px, page innerWidth {width_before} -> {width_after} after {relaid_in:?}, latest frame {}x{} px for a pane of {}x{} px",
+            f32::from(pane_before),
+            f32::from(bounds.size.width),
+            frame_size.0,
+            frame_size.1,
+            f32::from(bounds.size.width) * scale,
+            f32::from(bounds.size.height) * scale,
+        ),
+    );
+
+    // AC5: another tab hides the page, coming back shows it, Ctrl-W closes and frees it.
+    let live_before = browser_client::live_browsers();
+    let second = workspace
+        .update_in(cx, |workspace, window, cx| {
+            open_url_in_active_pane(workspace, fixture.replace("offscreen.html", "offscreen_next.html"), window, cx).log_err()
+        })
+        .ok()
+        .flatten();
+    pause(cx, 1500).await;
+    let hidden = read(cx, &page, |view| view.is_hidden()).unwrap_or(false);
+    let live_two = browser_client::live_browsers();
+    // The browser's own view of it: the page reports document.visibilityState, which CEF sets from was_hidden.
+    let visibility_hidden = visibility(&read_state(cx, &page).await);
+    let pane = workspace
+        .read_with(cx, |workspace, _| workspace.active_pane().clone())
+        .ok();
+    if let Some(pane) = &pane {
+        pane.update_in(cx, |pane, window, cx| {
+            pane.activate_previous_item(&Default::default(), window, cx);
+        })
+        .log_err();
+    }
+    pause(cx, 1200).await;
+    let shown = !read(cx, &page, |view| view.is_hidden()).unwrap_or(true);
+    let frames_before_close = read(cx, &page, |view| view.frames_painted).unwrap_or(0);
+    verdict(
+        "AC5 hide/show",
+        hidden && shown && second.is_some(),
+        format!("after opening another tab hidden={hidden}, after switching back shown={shown}, live browser views {live_before} -> {live_two}, frames so far {frames_before_close}"),
+    );
+    let visibility_shown = visibility(&read_state(cx, &page).await);
+    verdict(
+        "AC5 browser side",
+        visibility_hidden == "hidden" && visibility_shown == "visible",
+        format!("page document.visibilityState: {visibility_hidden:?} while another tab was active, {visibility_shown:?} after switching back"),
+    );
+    press(
+        cx,
+        "w",
+        None,
+        Modifiers {
+            control: true,
+            ..Default::default()
+        },
+    );
+    let closed = wait_until(cx, 5000, |_| browser_client::live_browsers() < live_two).await;
+    verdict(
+        "AC5 close",
+        closed.is_some(),
+        format!(
+            "Ctrl-W: live browser views {live_two} -> {} after {closed:?}",
+            browser_client::live_browsers()
+        ),
+    );
+
+    // Frame cost: scroll the remaining page continuously and report frames, copy cost and CPU.
+    if let Some(second) = second {
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.resize_pane(Axis::Horizontal, px(250.0), window, cx);
+            })
+            .log_err();
+        // COD_SPIKE_COST_URL measures a real page (a long Wikipedia article) instead of the animated fixture.
+        let cost_url = std::env::var("COD_SPIKE_COST_URL").ok();
+        if let (Some(url), Some(Some(engine))) = (&cost_url, read(cx, &second, |view| view.page())) {
+            engine.load_url(url);
+            pause(cx, 8000).await;
+        }
+        let origin = pane_origin(cx, &second);
+        let center = origin + point(px(200.0), px(300.0));
+        pause(cx, 1500).await;
+        let (idle_zed, idle_helper) = (cpu_seconds(), helper_cpu_seconds());
+        pause(cx, 4000).await;
+        log::info!(
+            "driver: IDLE static page: CPU in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}",
+            (cpu_seconds() - idle_zed) / 4.0 * 100.0,
+            (helper_cpu_seconds() - idle_helper) / 4.0 * 100.0,
+        );
+        // Baseline: ask GPUI for a repaint every 16 ms with an unchanged page, so the page costs nothing and only GPUI's own (software rendered) window repaint is measured.
+        let (refresh_zed, refresh_helper) = (cpu_seconds(), helper_cpu_seconds());
+        let refresh_started = Instant::now();
+        while refresh_started.elapsed() < Duration::from_secs(4) {
+            cx.update(|window, _| window.refresh()).log_err();
+            pause(cx, 16).await;
+        }
+        log::info!(
+            "driver: BASELINE repaint requests every 16 ms, page unchanged: CPU in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}",
+            (cpu_seconds() - refresh_zed) / 4.0 * 100.0,
+            (helper_cpu_seconds() - refresh_helper) / 4.0 * 100.0,
+        );
+        let (frames_a, micros_a) = read(cx, &second, |view| (view.frames_painted, view.image_micros)).unwrap_or_default();
+        let cpu_a = cpu_seconds();
+        let helper_a = helper_cpu_seconds();
+        let started = Instant::now();
+        if cost_url.is_none() {
+            run_script(
+                cx,
+                &second,
+                "document.body.style.height='20000px'; (function tick(){ document.body.style.background = 'hsl(' + (performance.now() / 10 % 360) + ',60%,85%)'; requestAnimationFrame(tick); })();",
+            );
+        }
+        while started.elapsed() < Duration::from_secs(6) {
+            wheel(cx, center, -40.0);
+            pause(cx, 16).await;
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let (frames_b, micros_b) = read(cx, &second, |view| (view.frames_painted, view.image_micros)).unwrap_or_default();
+        let cpu_b = cpu_seconds();
+        let helper_b = helper_cpu_seconds();
+        let frames = frames_b - frames_a;
+        let size = read(cx, &second, |view| view.last_frame_size).unwrap_or_default();
+        log::info!(
+            "driver: COST pane frame {}x{} px: {frames} frames in {elapsed:.1}s = {:.1} fps; image build {} us/frame; CPU over the run in percent of one core: Zed {:.0}, cod-browser and CEF processes {:.0}; CPU per frame: Zed {:.1} ms, helper {:.1} ms",
+            size.0,
+            size.1,
+            frames as f64 / elapsed,
+            if frames > 0 { (micros_b - micros_a) / frames } else { 0 },
+            (cpu_b - cpu_a) / elapsed * 100.0,
+            (helper_b - helper_a) / elapsed * 100.0,
+            (cpu_b - cpu_a) * 1000.0 / frames.max(1) as f64,
+            (helper_b - helper_a) * 1000.0 / frames.max(1) as f64,
+        );
+    }
+    log::info!("driver: done");
+}
