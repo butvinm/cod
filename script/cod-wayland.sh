@@ -21,6 +21,48 @@ fail() {
     exit 1
 }
 
+# Succeeds when every member of the tar.xz archive "$1" is a plain file or folder inside cef/.
+# Absolute names, .. components, links of any kind and special files are refused before anything is extracted.
+check_archive() {
+    names=$(xz -dc "$1" | tar -tf -) || return 1
+    types=$(xz -dc "$1" | tar -tvf -) || return 1
+    [ -n "$names" ] || return 1
+    printf '%s\n' "$names" | while IFS= read -r name; do
+        case $name in
+            cef | cef/ | cef/*) ;;
+            *) exit 1 ;;
+        esac
+        case /$name/ in
+            */../* | //*) exit 1 ;;
+        esac
+    done || return 1
+    # The first character of a verbose listing is the type: '-' file, 'd' folder, 'l' symbolic link, 'h' hard link and so on.
+    # bsdtar lists hard links as files with "link to" in the line.
+    printf '%s\n' "$types" | while IFS= read -r line; do
+        case $line in
+            -* | d*) ;;
+            *) exit 1 ;;
+        esac
+        case $line in
+            *" link to "* | *" -> "*) exit 1 ;;
+        esac
+    done
+}
+
+# Succeeds when "$1" is a real folder (not a link) whose SHA256SUMS lists only plain relative paths inside it.
+check_unpacked() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    [ -f "$1/SHA256SUMS" ] && [ ! -L "$1/SHA256SUMS" ] || return 1
+    [ -f "$1/libcef.so" ] && [ ! -L "$1/libcef.so" ] || return 1
+    if grep -vE '^[0-9a-f]{64}  \./[A-Za-z0-9_][A-Za-z0-9_./-]*$' "$1/SHA256SUMS" > /dev/null; then
+        return 1
+    fi
+    if grep -F '..' "$1/SHA256SUMS" > /dev/null; then
+        return 1
+    fi
+    return 0
+}
+
 # Downloads, checks and unpacks the CEF runtime into "$1" (the final folder). Needs the manifest values in $version, $url and $sha256.
 download_cef() {
     dir=$1
@@ -47,8 +89,10 @@ download_cef() {
         fail "the downloaded archive has sha256 $actual but cef-manifest says $sha256: nothing was installed"
     fi
     echo "Unpacking..." >&2
+    check_archive "$part/cef.tar.xz" || { rm -rf "$part"; fail "the archive has unsafe contents: nothing was installed"; }
     xz -dc "$part/cef.tar.xz" | tar -C "$part" -xf - || { rm -rf "$part"; fail "could not unpack the download"; }
     rm -f "$part/cef.tar.xz"
+    check_unpacked "$part/cef" || { rm -rf "$part"; fail "the unpacked browser runtime is not what was expected: nothing was installed"; }
     (cd "$part/cef" && sha256sum -c --quiet SHA256SUMS) || { rm -rf "$part"; fail "a file of the unpacked browser runtime does not match its checksum: nothing was installed"; }
     test -f "$part/cef/libcef.so" || { rm -rf "$part"; fail "the archive has no libcef.so"; }
     rm -rf "$dir"
