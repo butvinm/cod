@@ -1,0 +1,136 @@
+# Manual check of a published Linux preview on a clean x86_64 Ubuntu 24.04 runner with a headless Wayland compositor.
+# Run: gh workflow run check-preview.yml -R butvinm/cod --ref <branch> -f tag=preview-23
+# It downloads cod-linux-x86_64.tar.xz from the release, starts cod-wayland.sh twice and checks:
+# 1. the first start installs the browser runtime (libcef.so, checksum verified),
+# 2. the second start does not download again,
+# 3. cod-browser runs,
+# 4. a screenshot of the compositor output (uploaded as the artifact "screenshot").
+name: Check preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag of the preview to check
+        required: false
+        default: preview-23
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The packages the README lists (Ubuntu names), libwebkit2gtk-4.1-0 for the cod binary,
+      # sway as the headless Wayland compositor, grim for the screenshot, mesa-vulkan-drivers for software rendering.
+      - name: Install runtime packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 libnspr4 libasound2t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers \
+            libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
+            libwebkit2gtk-4.1-0 libfontconfig1 libvulkan1 xz-utils curl util-linux \
+            sway grim
+
+      - name: Download the preview
+        run: |
+          mkdir -p "$RUNNER_TEMP/preview"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p cod-linux-x86_64.tar.xz -D "$RUNNER_TEMP/preview"
+          tar -C "$RUNNER_TEMP/preview" -xJf "$RUNNER_TEMP/preview/cod-linux-x86_64.tar.xz"
+          ls -l "$RUNNER_TEMP/preview/cod"
+          cat "$RUNNER_TEMP/preview/cod/cef-manifest"
+
+      - name: Start a headless Wayland compositor
+        run: |
+          mkdir -p "$RUNNER_TEMP/xdg"
+          chmod 700 "$RUNNER_TEMP/xdg"
+          {
+            echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg"
+            echo "WLR_BACKENDS=headless"
+            echo "WLR_RENDERER=pixman"
+            echo "WLR_LIBINPUT_NO_DEVICES=1"
+            echo "WAYLAND_DISPLAY=wayland-1"
+            echo "COD_PREVIEW_DIR=$RUNNER_TEMP/cod-preview"
+          } >> "$GITHUB_ENV"
+
+      - name: First start and checks
+        shell: bash
+        run: |
+          set +e
+          export XDG_RUNTIME_DIR WLR_BACKENDS WLR_RENDERER WLR_LIBINPUT_NO_DEVICES WAYLAND_DISPLAY COD_PREVIEW_DIR
+          fails=0
+          check() { # check <label> <command...>
+            local label=$1; shift
+            if "$@" > /dev/null 2>&1; then echo "CHECK PASS: $label"; else echo "CHECK FAIL: $label"; fails=$((fails + 1)); fi
+          }
+          cef="$COD_PREVIEW_DIR/cef-154.0.34"
+          out1="$RUNNER_TEMP/first.log"
+          out2="$RUNNER_TEMP/second.log"
+
+          sway --unsupported-gpu > "$RUNNER_TEMP/sway.log" 2>&1 &
+          sway_pid=$!
+          for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] && break; sleep 1; done
+          ls -l "$XDG_RUNTIME_DIR"
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock 2> /dev/null | head -n 1)
+          echo "wayland socket and sway ipc: $WAYLAND_DISPLAY $SWAYSOCK"
+
+          echo "=== first start ==="
+          cd "$RUNNER_TEMP/preview"
+          timeout 90 ./cod/cod-wayland.sh https://en.wikipedia.org/wiki/Levenshtein_distance > "$out1" 2>&1 &
+          cod_pid=$!
+          # Wait for the install (up to 60 s), then give Cod 30 s to draw the page.
+          for i in $(seq 1 60); do grep -q "browser runtime is installed" "$out1" && break; sleep 1; done
+          sleep 30
+          echo "--- browser processes at the screenshot ---"
+          ps -eo pid,etime,args | grep -E 'cod-browser|/cod/cod|cod --user-data-dir' | grep -v grep
+          grim "$RUNNER_TEMP/screenshot.png"
+          echo "grim exit code: $?"
+          pgrep -af cod-browser > "$RUNNER_TEMP/browser-procs.txt"
+          wait "$cod_pid"
+          echo "first start exit code: $?"
+          echo "--- first start output ---"
+          cat "$out1"
+          echo "--- sha256 files check of the installed folder ---"
+          (cd "$cef" && sha256sum -c --quiet SHA256SUMS && echo "SHA256SUMS ok")
+
+          echo "=== second start ==="
+          timeout 25 ./cod/cod-wayland.sh https://en.wikipedia.org/wiki/Levenshtein_distance > "$out2" 2>&1
+          echo "second start exit code: $? (124 means it was still running at the timeout)"
+          echo "--- second start output ---"
+          cat "$out2"
+
+          echo "=== stderr log ==="
+          cat "$COD_PREVIEW_DIR/logs/cod-stderr.log"
+          echo "=== sway log (tail) ==="
+          tail -n 20 "$RUNNER_TEMP/sway.log"
+
+          echo "=== results ==="
+          check "AC1 libcef.so exists in $cef" test -f "$cef/libcef.so"
+          check "AC1 install message printed" grep -q "browser runtime is installed" "$out1"
+          check "AC1 download message printed" grep -q "Downloading it once" "$out1"
+          check "AC1 checking message printed" grep -q "Checking the download" "$out1"
+          check "AC2 second start did not download" bash -c "! grep -qiE 'Downloading|Checking the download|curl|wget' '$out2'"
+          check "AC3 cod-browser was running" test -s "$RUNNER_TEMP/browser-procs.txt"
+          check "AC4 screenshot exists" test -s "$RUNNER_TEMP/screenshot.png"
+          kill "$sway_pid" 2> /dev/null
+          echo "failed checks: $fails"
+          exit "$fails"
+
+      - name: Upload the screenshot and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot
+          path: |
+            ${{ runner.temp }}/screenshot.png
+            ${{ runner.temp }}/first.log
+            ${{ runner.temp }}/second.log
+            ${{ runner.temp }}/sway.log
+            ${{ runner.temp }}/browser-procs.txt
+            ${{ runner.temp }}/cod-preview/logs/cod-stderr.log
+          if-no-files-found: warn
