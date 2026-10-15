@@ -77,7 +77,23 @@ if [ -z "${COD_CEF_DIR:-}" ] && [ -f "$here/cef-manifest" ]; then
     if [ -z "$version" ] || [ -z "$url" ] || [ -z "$sha256" ]; then
         fail "cef-manifest is incomplete"
     fi
+    # The version goes into file names, so only digits separated by single dots are accepted.
+    case $version in
+        '' | *[!0-9.]* | .* | *. | *..*) fail "cef-manifest has an invalid version: $version" ;;
+    esac
+    case $sha256 in
+        *[!0-9a-f]*) fail "cef-manifest has an invalid sha256" ;;
+    esac
+    [ "${#sha256}" -eq 64 ] || fail "cef-manifest has an invalid sha256"
+    case $url in
+        https://* | file://*) ;;
+        *) fail "cef-manifest has an unsupported url: $url" ;;
+    esac
     COD_CEF_DIR="$data/cef-$version"
+    # A link in place of the folder could point anywhere, so it is never used or replaced.
+    if [ -L "$COD_CEF_DIR" ] || [ -L "$data/cef-$version.part" ]; then
+        fail "$COD_CEF_DIR is a symbolic link: remove it and start again"
+    fi
     if [ ! -f "$COD_CEF_DIR/libcef.so" ]; then
         mkdir -p "$data"
         download_cef "$COD_CEF_DIR"
