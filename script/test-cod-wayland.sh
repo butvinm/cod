@@ -5,6 +5,11 @@
 # It lives next to the script it tests because the repo has no shell test folder; CI does not run it (it is for whoever changes the script).
 set -u
 
+if ! command -v flock > /dev/null 2>&1; then
+    echo "flock (util-linux) is not installed here: run this test on Linux" >&2
+    exit 2
+fi
+
 src=$(cd "$(dirname "$0")" && pwd)
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -56,7 +61,7 @@ check() {
 
 # Nothing may be left installed, staged or locked in data folder $1.
 clean() {
-    if [ -n "$(ls -A "$T/$1" 2> /dev/null | grep -E '^(cef-|\.cef-)' || true)" ]; then
+    if [ -n "$(ls -A "$T/$1" 2> /dev/null | grep -E '^(cef-|\.cef-stage)' || true)" ]; then
         return 1
     fi
     return 0
@@ -182,23 +187,39 @@ while [ "$i" -lt 5 ]; do
     i=$((i + 1))
 done
 [ -f "$T/dp/cef-1.2.4/libcef.so" ] && (cd "$T/dp/cef-1.2.4" && sha256sum -c --quiet SHA256SUMS > /dev/null 2>&1) || ok=no
-[ -z "$(ls -A "$T/dp" | grep -E '^\.cef-' || true)" ] || ok=no
+[ -z "$(ls -A "$T/dp" | grep -E '^\.cef-stage' || true)" ] || ok=no
 cat "$T/conc-out.0" > "$T/out"
 check "5 concurrent first starts install once, cleanly" "$ok" "a start failed or left staging or lock files"
 
-# 13. Installing a new version prunes the old complete one, not other things.
+# 13. A second version is installed next to the first. Both are kept, and so is everything else in the folder.
 manifest 1.2.5 "$T/good.tar.xz"
 mkdir -p "$T/dp/other-folder"
-if run dp && [ -f "$T/dp/cef-1.2.5/libcef.so" ] && [ ! -e "$T/dp/cef-1.2.4" ] && [ -d "$T/dp/other-folder" ]; then ok=ok; else ok=no; fi
-check "new version installs and prunes the old one only" "$ok" "unexpected folders"
+if run dp && [ -f "$T/dp/cef-1.2.5/libcef.so" ] && [ -f "$T/dp/cef-1.2.4/libcef.so" ] && [ -d "$T/dp/other-folder" ]; then ok=ok; else ok=no; fi
+check "second version installs next to the first, both kept" "$ok" "unexpected folders"
 
-# 14. A killed start's stale lock is moved aside after 30 minutes (checked with an old lock).
-manifest 1.2.6 "$T/good.tar.xz"
-rm -rf "$T/ds"
-mkdir -p "$T/ds/.cef-install.lock"
-touch -t 200001010000 "$T/ds/.cef-install.lock"
-if run ds && [ -f "$T/ds/cef-1.2.6/libcef.so" ]; then ok=ok; else ok=no; fi
-check "stale lock is replaced" "$ok" "start failed with an old lock"
+# 14. A failing final mv aborts: non-zero exit, no success message, nothing installed.
+mkdir -p "$T/shim"
+printf '#!/bin/sh\nexit 1\n' > "$T/shim/mv"
+chmod +x "$T/shim/mv"
+manifest 1.2.7 "$T/good.tar.xz"
+if WAYLAND_DISPLAY=x COD_PREVIEW_DIR="$T/dm" PATH="$T/shim:$PATH" sh "$rel/cod-wayland.sh" > "$T/out" 2>&1; then ok=no; else ok=ok; fi
+if grep -q "is installed" "$T/out"; then ok=no; fi
+if [ -e "$T/dm/cef-1.2.7" ]; then ok=no; fi
+if clean dm; then :; else ok=no; fi
+check "failed final mv aborts with no success message" "$ok" "start succeeded, said installed, or left files"
+
+# 15. A held lock is never stolen, however old the lock file is: the start waits for the holder.
+manifest 1.2.8 "$T/good.tar.xz"
+mkdir -p "$T/dk"
+touch -t 200001010000 "$T/dk/.cef-install.lock"
+(flock "$T/dk/.cef-install.lock" sleep 4) &
+sleep 1
+s=$(date +%s)
+if run dk && [ -f "$T/dk/cef-1.2.8/libcef.so" ]; then ok=ok; else ok=no; fi
+e=$(date +%s)
+wait
+[ $((e - s)) -ge 2 ] || ok=no
+check "a held lock is waited for, not stolen" "$ok" "start did not wait for the lock holder or failed"
 
 if [ "$failed" -eq 0 ]; then
     echo "all cases passed"
