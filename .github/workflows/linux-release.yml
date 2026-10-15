@@ -14,10 +14,11 @@ permissions:
   contents: write
 
 # One run at a time, so two runs never publish the CEF release together. A run waits for the one in progress.
-# GitHub keeps one waiting run per group and cancels an older waiting one, so start the next run after the last one has started.
+# queue: max keeps every waiting run in line instead of cancelling an older waiting one.
 concurrency:
   group: linux-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
