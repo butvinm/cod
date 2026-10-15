@@ -8,6 +8,8 @@
 name: Check preview
 
 on:
+  push:
+    branches: [tests/check-preview]
   workflow_dispatch:
     inputs:
       tag:
@@ -23,7 +25,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ inputs.tag || 'preview-23' }}
       GH_TOKEN: ${{ github.token }}
     steps:
       # The packages the README lists (Ubuntu names), libwebkit2gtk-4.1-0 for the cod binary,
