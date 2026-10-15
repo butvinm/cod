@@ -13,6 +13,12 @@ on:
 permissions:
   contents: write
 
+# One run at a time, so two runs never publish the CEF release together. A run waits for the one in progress.
+# GitHub keeps one waiting run per group and cancels an older waiting one, so start the next run after the last one has started.
+concurrency:
+  group: linux-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -128,7 +134,6 @@ jobs:
           mkdir cef-asset
           if gh release view "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "The release cef-$CEF_VERSION exists: reusing its asset"
-            gh release download "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$asset.sha256" --dir cef-asset
             echo false > cef-asset/new
           else
             cef_dir="$CEF_PATH/$CEF_VERSION/cef_linux_x86_64"
@@ -146,6 +151,40 @@ jobs:
             echo true > cef-asset/new
           fi
           ls -l cef-asset
+
+      # The CEF release is published before the preview is packaged, so the manifest always holds the checksum of the
+      # archive that is really in the release: ours when we created the release, otherwise the one stored in it
+      # (a run that lost a race, or a later run, never puts the checksum of its own build into a manifest).
+      - name: Publish the CEF release, or read its checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          if [ "$(cat cef-asset/new)" = true ]; then
+            if gh release create "cef-$CEF_VERSION" "cef-asset/$asset" "cef-asset/$asset.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "cef-$CEF_VERSION" \
+              --notes "The CEF $CEF_VERSION runtime for the Cod preview (x86_64 Linux). cod-wayland.sh downloads it once; it is not a preview."; then
+              echo "Published cef-$CEF_VERSION"
+              cat "cef-asset/$asset.sha256"
+              exit 0
+            fi
+            echo "Publishing failed; another run may have published cef-$CEF_VERSION first. Using the release if it exists."
+            gh release view "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null
+          fi
+          # The checksum asset may still be uploading.
+          rm -f "cef-asset/$asset.sha256"
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if gh release download "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$asset.sha256" --dir cef-asset 2> /dev/null \
+              && [ "$(wc -c < "cef-asset/$asset.sha256")" -ge 64 ]; then
+              break
+            fi
+            echo "Waiting for the checksum asset of cef-$CEF_VERSION (attempt $attempt)"
+            sleep 10
+          done
+          test -s "cef-asset/$asset.sha256"
           cat "cef-asset/$asset.sha256"
 
       - name: Package the Cod tarball (strip, tar, xz)
@@ -169,23 +208,13 @@ jobs:
           tar -tJf cod-linux-x86_64.tar.xz
           df -h /
 
-      # The CEF release goes first, so a preview never points at a CEF asset that does not exist.
-      - name: Upload to prereleases
+      - name: Upload to a prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
-          if [ "$(cat cef-asset/new)" = true ]; then
-            gh release create "cef-$CEF_VERSION" "cef-asset/$asset" "cef-asset/$asset.sha256" \
-              --repo "$GITHUB_REPOSITORY" \
-              --prerelease \
-              --target "$GITHUB_SHA" \
-              --title "cef-$CEF_VERSION" \
-              --notes "The CEF $CEF_VERSION runtime for the Cod preview (x86_64 Linux). cod-wayland.sh downloads it once; it is not a preview."
-          fi
           if [ "$REF_TYPE" = "tag" ]; then
             tag="$REF_NAME"
           else
