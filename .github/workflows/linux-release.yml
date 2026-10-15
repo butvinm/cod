@@ -25,8 +25,6 @@ jobs:
       # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the first two pairs repeat them.
       # The last pair links with mold.
       RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
-      # With the sccache hits most units wait on cache reads, so more jobs than cores keep the CPUs busy.
-      CARGO_BUILD_JOBS: "8"
       CEF_VERSION: 154.0.34
       CEF_PATH: /home/runner/cef
       CC: clang
@@ -91,21 +89,15 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
+          # With the sccache hits most units wait on cache reads, so more jobs than cores keep the CPUs busy.
+          # Set here, not for the job: Swatinem/rust-cache hashes every CARGO_* variable into its key.
+          CARGO_BUILD_JOBS: "8"
         run: |
           sccache --zero-stats
           cargo build --profile release-fast --timings -p zed -p cod_browser
           sccache --show-stats
           df -h /
           du -sh "$CEF_PATH"
-
-      - name: Look at the aws-lc-sys build script (temporary)
-        run: |
-          for d in target/release-fast/build/aws-lc-sys-*/ target/release-fast/build/webrtc-sys-*/; do
-            echo "== $d"
-            ls "$d" | head -20
-            head -c 3000 "$d/stderr" 2>/dev/null || true
-            head -c 1500 "$d/output" 2>/dev/null || true
-          done
 
       # The report shows which crates are on the critical path (open the artifact in a browser).
       - name: Upload the cargo timing report
