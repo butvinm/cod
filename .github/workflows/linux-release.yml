@@ -1,5 +1,7 @@
 # Builds the Cod preview for x86_64 Linux and uploads it to a GitHub prerelease.
 # A pushed tag v* makes a prerelease named for the tag; a manual run makes a prerelease preview-<run number>.
+# The CEF runtime (about 100 MB compressed) is not part of the preview tarball. It is a separate asset of a
+# prerelease named cef-<CEF version>, built once per CEF version, and cod-wayland.sh downloads it on first start.
 name: Linux release
 
 on:
@@ -23,6 +25,8 @@ jobs:
       # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the first two pairs repeat them.
       # The last pair links with mold.
       RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
+      # With the sccache hits most units wait on cache reads, so more jobs than cores keep the CPUs busy.
+      CARGO_BUILD_JOBS: "8"
       CEF_VERSION: 154.0.34
       CEF_PATH: /home/runner/cef
       CC: clang
@@ -37,10 +41,16 @@ jobs:
       - name: Show disk space
         run: df -h /
 
+      # script/linux minus what a release build of zed and cod_browser does not need (the remote server's musl tools,
+      # pipewire, the desktop portal, jq, gettext, elfutils), without recommended packages, in one apt run.
       - name: Install Linux dependencies
         run: |
-          ./script/linux
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev mold
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang lld llvm libstdc++-14-dev \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev libva-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev mold
 
       - name: Install Rust toolchain
         run: |
@@ -88,6 +98,16 @@ jobs:
           df -h /
           du -sh "$CEF_PATH"
 
+      - name: Look at the aws-lc-sys build script (temporary)
+        run: |
+          for d in target/release-fast/build/aws-lc-sys-*/ target/release-fast/build/webrtc-sys-*/; do
+            echo "== $d"
+            ls "$d" | head -20
+            head -c 3000 "$d/stderr" 2>/dev/null || true
+            head -c 1500 "$d/output" 2>/dev/null || true
+          done
+
+      # The report shows which crates are on the critical path (open the artifact in a browser).
       - name: Upload the cargo timing report
         if: always()
         uses: actions/upload-artifact@v4
@@ -104,74 +124,82 @@ jobs:
           path: ${{ env.CEF_PATH }}
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
-      # The CEF runtime goes into cod/cef/, which cod-wayland.sh uses as COD_CEF_DIR.
+      # The CEF runtime is packaged once per CEF version, as the asset of a prerelease named cef-<version>.
       # Not shipped: headers, the wrapper library, chrome-sandbox (the helper runs with --no-sandbox), other locales.
-      - name: Package (strip, tar)
+      # The archive holds a cef/ folder with a SHA256SUMS file of its files. The checksum of the archive itself
+      # is a second asset, and goes into cod/cef-manifest so that cod-wayland.sh can check its download.
+      - name: Package the CEF runtime (once per CEF version)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p cod/cef/locales
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          mkdir cef-asset
+          if gh release view "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "The release cef-$CEF_VERSION exists: reusing its asset"
+            gh release download "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$asset.sha256" --dir cef-asset
+            echo false > cef-asset/new
+          else
+            cef_dir="$CEF_PATH/$CEF_VERSION/cef_linux_x86_64"
+            ls -l "$cef_dir"
+            mkdir -p cef-pkg/cef/locales
+            cp "$cef_dir"/*.so "$cef_dir"/*.so.* "$cef_dir"/*.pak "$cef_dir"/*.bin "$cef_dir"/*.dat "$cef_dir"/*.json cef-pkg/cef/ 2>/dev/null || true
+            cp "$cef_dir"/locales/en-US.pak cef-pkg/cef/locales/
+            rm -f cef-pkg/cef/archive.json
+            strip --strip-unneeded cef-pkg/cef/*.so
+            test -f cef-pkg/cef/libcef.so
+            test -f cef-pkg/cef/icudtl.dat
+            (cd cef-pkg/cef && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
+            tar -C cef-pkg -cf - cef | xz -9e -T0 > "cef-asset/$asset"
+            (cd cef-asset && sha256sum "$asset" | cut -d ' ' -f 1 > "$asset.sha256")
+            echo true > cef-asset/new
+          fi
+          ls -l cef-asset
+          cat "cef-asset/$asset.sha256"
+
+      - name: Package the Cod tarball (strip, tar, xz)
+        run: |
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          mkdir cod
           cp target/release-fast/zed cod/cod
           cp target/release-fast/cod-browser cod/cod-browser
           strip cod/cod cod/cod-browser
-          cef_dir="$CEF_PATH/$CEF_VERSION/cef_linux_x86_64"
-          ls -l "$cef_dir"
-          cp "$cef_dir"/*.so "$cef_dir"/*.so.* "$cef_dir"/*.pak "$cef_dir"/*.bin "$cef_dir"/*.dat "$cef_dir"/*.json cod/cef/ 2>/dev/null || true
-          cp "$cef_dir"/locales/en-US.pak cod/cef/locales/
-          rm -f cod/cef/archive.json
-          strip --strip-unneeded cod/cef/*.so
-          test -f cod/cef/libcef.so
-          test -f cod/cef/icudtl.dat
           cp script/cod-xwayland.sh script/cod-wayland.sh cod/
           chmod +x cod/cod cod/cod-browser cod/cod-xwayland.sh cod/cod-wayland.sh
           cp LICENSE-GPL LICENSE-APACHE README.md cod/
-          tar -czf cod-linux-x86_64.tar.gz cod
-          ls -l cod cod/cef cod-linux-x86_64.tar.gz
-          tar -tzf cod-linux-x86_64.tar.gz | head -50
+          {
+            echo "version=$CEF_VERSION"
+            echo "url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/cef-$CEF_VERSION/$asset"
+            echo "sha256=$(cat "cef-asset/$asset.sha256")"
+          } > cod/cef-manifest
+          cat cod/cef-manifest
+          tar -cf - cod | xz -6 -T0 > cod-linux-x86_64.tar.xz
+          ls -l cod cod-linux-x86_64.tar.xz
+          tar -tJf cod-linux-x86_64.tar.xz
           df -h /
 
-      - name: Compression experiment (temporary)
-        run: |
-          mkdir exp
-          cp target/release-fast/zed exp/cod
-          strip exp/cod
-          cef_dir="$CEF_PATH/$CEF_VERSION/cef_linux_x86_64"
-          mkdir -p exp/cef/locales
-          cp "$cef_dir"/*.so "$cef_dir"/*.so.* "$cef_dir"/*.pak "$cef_dir"/*.bin "$cef_dir"/*.dat "$cef_dir"/*.json exp/cef/ 2>/dev/null || true
-          cp "$cef_dir"/locales/en-US.pak exp/cef/locales/
-          strip --strip-unneeded exp/cef/*.so
-          ls -l exp/cod exp/cef
-          t() { local s=$(date +%s); "$@" > /dev/null; echo "  took $(( $(date +%s) - s )) s"; }
-          for part in cod cef; do
-            tar -cf exp/$part.tar -C exp $part
-            ls -l exp/$part.tar
-            echo "== $part gzip -6"; t sh -c "gzip -6 -c exp/$part.tar > exp/$part.tar.gz"; ls -l exp/$part.tar.gz
-            echo "== $part zstd -3 -T0"; t sh -c "zstd -3 -T0 -c exp/$part.tar > exp/$part.3.zst"; ls -l exp/$part.3.zst
-            echo "== $part zstd -10 -T0"; t sh -c "zstd -10 -T0 -c exp/$part.tar > exp/$part.10.zst"; ls -l exp/$part.10.zst
-            echo "== $part zstd -19 --long=27 -T0"; t sh -c "zstd -19 --long=27 -T0 -c exp/$part.tar > exp/$part.19.zst"; ls -l exp/$part.19.zst
-            echo "== $part xz -6 -T0"; t sh -c "xz -6 -T0 -c exp/$part.tar > exp/$part.6.xz"; ls -l exp/$part.6.xz
-            echo "== $part xz -9e -T0"; t sh -c "xz -9e -T0 -c exp/$part.tar > exp/$part.9.xz"; ls -l exp/$part.9.xz
-          done
-          echo "== decompress times"
-          t sh -c "zstd -d -c exp/cef.19.zst > /dev/null"
-          t sh -c "xz -d -c exp/cef.9.xz > /dev/null"
-          t sh -c "gzip -d -c exp/cef.tar.gz > /dev/null"
-          t sh -c "xz -d -c exp/cod.9.xz > /dev/null"
-          t sh -c "zstd -d -c exp/cod.19.zst > /dev/null"
-          for f in exp/cef/*.so exp/cef/*.pak exp/cef/*.bin exp/cef/*.dat; do echo "$f $(stat -c %s $f) $(xz -6 -c $f | wc -c)"; done
-
-      - name: Upload to a prerelease
-        if: false
+      # The CEF release goes first, so a preview never points at a CEF asset that does not exist.
+      - name: Upload to prereleases
         env:
           GH_TOKEN: ${{ github.token }}
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          if [ "$(cat cef-asset/new)" = true ]; then
+            gh release create "cef-$CEF_VERSION" "cef-asset/$asset" "cef-asset/$asset.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "cef-$CEF_VERSION" \
+              --notes "The CEF $CEF_VERSION runtime for the Cod preview (x86_64 Linux). cod-wayland.sh downloads it once; it is not a preview."
+          fi
           if [ "$REF_TYPE" = "tag" ]; then
             tag="$REF_NAME"
           else
             tag="preview-$RUN_NUMBER"
           fi
-          gh release create "$tag" cod-linux-x86_64.tar.gz \
+          gh release create "$tag" cod-linux-x86_64.tar.xz \
             --repo "$GITHUB_REPOSITORY" \
             --prerelease \
             --target "$GITHUB_SHA" \

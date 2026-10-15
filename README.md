@@ -12,12 +12,12 @@ Cod is in an early preview. Right now it is stock Zed 1.23.2 plus a web page in 
 
 The preview runs on x86_64 Linux. It is built on Ubuntu 24.04, so it needs glibc 2.39 or newer (for example Ubuntu 24.04, Debian 13, Fedora 40 or a current Arch).
 
-On a Wayland desktop, use `cod-wayland.sh` (recommended). Cod runs as a native Wayland client and web pages are drawn by a bundled off-screen browser (Chromium Embedded Framework, in the `cod/cef` folder and the `cod-browser` helper). The tarball is large because of it.
+On a Wayland desktop, use `cod-wayland.sh` (recommended). Cod runs as a native Wayland client and web pages are drawn by an off-screen browser (Chromium Embedded Framework and the `cod-browser` helper). The browser runtime is about 100 MB, so it is not in the tarball: the first `cod-wayland.sh` start downloads it once into `~/.local/share/cod-preview/cef-<version>/`, checks it by checksum, and later starts (and later previews with the same browser version) need no download.
 
 1. Install the libraries the browser needs. On Arch: `sudo pacman -S nss nspr alsa-lib at-spi2-core cups libdrm mesa libxkbcommon pango libxcomposite libxdamage libxrandr`. The `cod` binary is still linked against WebKitGTK, so it also needs `webkit2gtk-4.1` on Arch (`libwebkit2gtk-4.1-0` on Ubuntu 24.04 or Debian 13).
-2. Download `cod-linux-x86_64.tar.gz` from the latest prerelease on the [Releases](https://github.com/butvinm/cod/releases) page.
-3. Unpack it: `tar -xzf cod-linux-x86_64.tar.gz`.
-4. Start it: `./cod/cod-wayland.sh`. It opens a Wikipedia page in a pane.
+2. Download `cod-linux-x86_64.tar.xz` (about 85 MB) from the latest `preview-*` prerelease on the [Releases](https://github.com/butvinm/cod/releases) page. The `cef-*` prereleases only hold the browser runtime for the start script.
+3. Unpack it: `tar -xJf cod-linux-x86_64.tar.xz`.
+4. Start it: `./cod/cod-wayland.sh`. The first time it downloads the browser runtime (needs `curl` or `wget`, `xz` and `sha256sum`). It opens a Wikipedia page in a pane.
 
 To open another page and a folder: `./cod/cod-wayland.sh <url> <folder>`.
 
