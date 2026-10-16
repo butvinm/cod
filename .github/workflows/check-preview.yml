@@ -8,8 +8,6 @@
 name: Check preview
 
 on:
-  push:
-    branches: [tests/check-preview]
   workflow_dispatch:
     inputs:
       tag:
