@@ -53,7 +53,7 @@ class OpenFileTest(CodTestCase):
             )
 
         with self.step("check the active tab"):
-            self.expect_equal("active tab", "invoice.rs", self.state()["active_tab"])
+            self.expect_equal("active tab", "ledger.rs",self.state()["active_tab"])
 
 
 if __name__ == "__main__":
