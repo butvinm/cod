@@ -1512,6 +1512,33 @@ impl SerializableItem for Editor {
 
         let snapshot = buffer.read(cx).snapshot();
 
+        // Cod (#24): the selections are written with the editor record, without the debounce
+        // of a selection change. A restored editor gets a new item id, and its restored cursor
+        // must be on disk under that id before the rows of the old id are removed.
+        let db_selections = (WorkspaceSettings::get(None, cx).restore_on_startup
+            != workspace::RestoreOnStartupBehavior::EmptyTab)
+            .then(|| {
+                let multi_buffer_snapshot = self.buffer().read(cx).snapshot(cx);
+                self.selections
+                    .disjoint_anchors_arc()
+                    .iter()
+                    .map(|selection| {
+                        (
+                            multi_buffer::ToOffset::to_offset(
+                                &selection.start,
+                                &multi_buffer_snapshot,
+                            )
+                            .0,
+                            multi_buffer::ToOffset::to_offset(
+                                &selection.end,
+                                &multi_buffer_snapshot,
+                            )
+                            .0,
+                        )
+                    })
+                    .collect::<Vec<(usize, usize)>>()
+            });
+
         let db = EditorDb::global(cx);
         Some(cx.background_spawn(async move {
             let (contents, language) = if serialize_dirty_buffers && is_dirty {
@@ -1537,7 +1564,13 @@ impl SerializableItem for Editor {
             log::debug!("Serializing editor {item_id:?} in workspace {workspace_id:?}");
             db.save_serialized_editor(item_id, workspace_id, editor)
                 .await
-                .context("failed to save serialized editor")
+                .context("failed to save serialized editor")?;
+            if let Some(db_selections) = db_selections {
+                db.save_editor_selections(item_id, workspace_id, db_selections)
+                    .await
+                    .context("failed to save editor selections")?;
+            }
+            Ok(())
         }))
     }
 

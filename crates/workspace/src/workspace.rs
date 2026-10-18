@@ -8076,6 +8076,28 @@ impl Workspace {
             // the database filling up, we delete items that haven't been loaded now.
             //
             // The items that have been loaded, have been saved after they've been added to the workspace.
+            //
+            // Cod (#24): the new records of the loaded items and the panes that point at them
+            // are written before the old records go, so a crash in between keeps one complete
+            // snapshot on disk.
+            let item_save_tasks = workspace.update_in(cx, |workspace, _, cx| {
+                all_deserialized_items
+                    .iter()
+                    .filter_map(|item| {
+                        item.to_serializable_item_handle(cx)?
+                            .serialize(workspace, false, cx)
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            for item_save_task in item_save_tasks {
+                item_save_task.await.log_err();
+            }
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.serialize_workspace_internal(window, cx)
+                })?
+                .await;
+
             let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
                 item_ids_by_kind
                     .into_iter()
