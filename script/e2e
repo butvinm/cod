@@ -3,12 +3,12 @@
 # Usage: script/e2e [unittest arguments]
 #   script/e2e                                  all tests
 #   script/e2e test_22_open_file                one story file (more names or Class.method names work too)
-#   script/e2e -k invoice                       tests whose name contains "invoice"
+#   script/e2e -k file_finder                   tests whose name contains "file_finder"
 # Optional environment:
 #   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
-# Exits with the status of the tests: 0 when all passed. It fails when a process of this run is still running after the tests.
+# Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -193,6 +193,11 @@ run_tests "$@" 2>&1 | tee "$test_log"
 status=${PIPESTATUS[0]}
 set -e
 say "tests finished at $(date '+%H:%M:%S') with status $status"
+# A selection that matches nothing must not look like a green run.
+if grep -q '^Ran 0 tests' "$test_log"; then
+    say "the selection ran no test: check the test names or the -k pattern in: script/e2e $*"
+    status=5
+fi
 
 # 8. No process of this run may outlive the tests.
 stop_sway

@@ -8,8 +8,10 @@ These tests drive the real Cod app on Linux. Each test makes a throwaway git rep
 script/e2e                                   # all tests
 script/e2e test_22_open_file                 # one story file
 script/e2e test_22_open_file.OpenFileTest.test_open_file_with_the_file_finder
-script/e2e -k invoice                        # tests whose name contains "invoice"
+script/e2e -k file_finder                    # tests whose name contains "file_finder"
 ```
+
+A selection that runs no test fails with status 5 and says so, so a typo never looks like a green run.
 
 `script/e2e` is the same command CI runs. It builds Cod (`cargo build --profile release-fast -p zed -p cod_browser`), puts `cod`, `cod-browser` and `cod-wayland.sh` into `target/e2e-run/cod/` like the release tarball, starts its own headless sway (no window appears on your desktop) and runs `python3 -m unittest` over this folder. It exits with the test status.
 
