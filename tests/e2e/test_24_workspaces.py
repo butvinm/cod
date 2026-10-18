@@ -41,9 +41,10 @@ SHOW_TIMEOUT = 15.0
 RESTORE_TIMEOUT = 45.0
 # How long a cancelled change must stay away before the test believes it.
 SETTLE_TIME = 1.5
-# Seconds after the launch at which the crash-safety test kills Cod: before Zed starts, while it
-# reads the session, while the window's workspaces come back, and after they are back.
-KILL_DELAYS = (0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0)
+# Seconds after the launch at which the crash-safety test kills Cod: right after the launch
+# (while the new session id is published), before Zed starts, while it reads the session, while
+# the window's workspaces come back, and after they are back.
+KILL_DELAYS = (0.05, 0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0)
 
 # The answers of Zed's prompt for an unsaved file (Pane::save_item in crates/workspace/src/pane.rs).
 SAVE_ANSWERS = ["Save", "Don't Save", "Cancel"]
