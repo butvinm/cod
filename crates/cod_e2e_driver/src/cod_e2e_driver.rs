@@ -447,16 +447,18 @@ fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) 
     .context("the workspace window closed")
 }
 
-/// The name of a workspace as the user gave it, or None while it has none.
-/// Cod has no workspace names yet (story #24 adds them); this is the one place that reads them once they exist.
-fn workspace_name(_workspace: &Entity<Workspace>, _cx: &App) -> Option<String> {
-    None
+/// The name of a workspace as the user gave it, or None while it has none (story #24, `workspace::cod_workspace_name`).
+fn workspace_name(workspace: &Entity<Workspace>, cx: &App) -> Option<String> {
+    workspace::cod_workspace_name(workspace.read(cx), cx)
 }
 
 /// The text field of "workspace: rename workspace" while it is shown in the window: `{"text": <its current text>}`, else None.
-/// Cod has no rename field yet (story #24 adds it); this is the one place that reads it once it exists.
-fn rename_input(_multi_workspace: &MultiWorkspace, _window: &Window, _cx: &App) -> Option<Value> {
-    None
+fn rename_input(multi_workspace: &MultiWorkspace, _window: &Window, cx: &App) -> Option<Value> {
+    multi_workspace
+        .workspace()
+        .read(cx)
+        .active_modal::<workspace::RenameWorkspaceModal>(cx)
+        .map(|modal| json!({ "text": modal.read(cx).text(cx) }))
 }
 
 /// Whether the pane is part of the frame the window drew last, read from that frame: the pane's own element (the one that tracks its focus) is in the frame's dispatch tree, with the listener of a pane-only action.
