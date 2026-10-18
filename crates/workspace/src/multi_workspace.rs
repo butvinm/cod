@@ -1501,6 +1501,11 @@ impl MultiWorkspace {
     }
 
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
+        // Cod (#24): while a pending member loads it is held out of its place in the order;
+        // the window's list is saved once the member is put back.
+        if self.cod_materializing {
+            return;
+        }
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
             let Ok(task) = this.update(cx, |this, cx| this.serialize_now(cx)) else {
                 return;

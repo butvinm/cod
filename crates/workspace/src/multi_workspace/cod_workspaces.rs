@@ -456,9 +456,11 @@ impl MultiWorkspace {
                     }
                     (Ok(()), None) => {
                         log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
+                        this.serialize(cx);
                     }
                     (Err(err), _) => {
                         log::error!("Failed to load workspace {id:?}; it stays pending: {err:#}");
+                        this.serialize(cx);
                     }
                 }
                 // Run the switches asked for while the member loaded.
