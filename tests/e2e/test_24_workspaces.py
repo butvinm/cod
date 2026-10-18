@@ -2,6 +2,7 @@
 
 Fixtures are the throwaway git repos billing-api, billing-web and docs-site with invented content.
 The workspace commands are run from the command palette (ctrl-shift-p) by their exact names; run_command() only presses enter when the palette highlights exactly that command.
+test_stock_steps_the_criteria_build_on checks the stock Zed steps the criteria use (Zed's path picker, the save prompt and its answer by keys), so it passes before the story is built.
 """
 
 from __future__ import annotations
@@ -254,6 +255,53 @@ class WorkspacesTest(CodTestCase):
         return self.wait_for(
             lambda state: real_paths(state["worktrees"]) == expected, SHOW_TIMEOUT, f"the folders {[folder.name for folder in folders]}"
         )
+
+    # Stock Zed steps that the criteria build on. This passes before story #24, so a red criterion is never a broken step.
+
+    def test_stock_steps_the_criteria_build_on(self) -> None:
+        with self.step("create the fixture repos billing-api and billing-web"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            billing_web = self.make_repo("billing-web", BILLING_WEB)
+            source = billing_web / "src" / "invoices.ts"
+            source_before = source.read_text()
+
+        with self.step("start Cod on billing-api"):
+            self.start_cod(billing_api)
+            self.wait_for_worktrees([billing_api])
+
+        with self.step("check the starting state: one folder, no file open, no prompt"):
+            start = self.state()
+            self.expect_equal("tabs", [], start["tabs"])
+            self.expect_equal("prompt", None, start["prompt"])
+            self.expect_equal("path picker", None, start["path_prompt"])
+
+        with self.step("add billing-web with add folder to project and Zed's path picker"):
+            self.add_folder(billing_web)
+
+        with self.step("check that the workspace has both folders"):
+            state = self.wait_for_worktrees([billing_api, billing_web])
+            self.expect_equal("workspace count", 1, state["workspace_count"])
+            self.expect_equal("folders of the workspace", [real(billing_api), real(billing_web)], real_paths(active(state)["worktrees"]))
+
+        with self.step("open billing-web's invoices.ts and make an unsaved edit"):
+            self.open_file("invoices.ts")
+            self.type("// draft ")
+            self.wait_for(lambda state: state["dirty_tabs"] == ["invoices.ts"], 10, "invoices.ts to have unsaved changes")
+
+        with self.step("close the tab with ctrl-w and check that Zed asks to save"):
+            self.keys("ctrl-w")
+            self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "a prompt to save invoices.ts")
+
+        with self.step("answer the prompt with enter (Save)"):
+            self.keys("enter")
+
+        with self.step("check that the edit was saved and the tab closed"):
+            state = self.wait_for(lambda state: state["prompt"] is None and state["tabs"] == [], SHOW_TIMEOUT, "the tab to close")
+            self.expect_equal("dirty tabs", [], state["dirty_tabs"])
+            deadline = time.monotonic() + 10
+            while source.read_text() != "// draft " + source_before and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.expect_equal("invoices.ts on disk", "// draft " + source_before, source.read_text())
 
     # AC1
 
