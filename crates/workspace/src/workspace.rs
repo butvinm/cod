@@ -11596,8 +11596,12 @@ pub async fn find_existing_workspace(
                 (candidates, <dyn Fs>::global(cx))
             });
             // A member with exactly these folders first, then the policy used for live ones.
+            // Like live routing, `MatchSubpaths` never matches a root itself.
+            let exact_roots_match =
+                open_options.workspace_matching != WorkspaceMatching::MatchSubpaths;
             let mut selected: Option<(WindowHandle<MultiWorkspace>, WorkspaceId)> = candidates
                 .iter()
+                .filter(|_| exact_roots_match)
                 .find(|(_, _, roots)| PathList::new(roots) == path_list)
                 .map(|(window, id, _)| (*window, *id));
             if selected.is_none() {
