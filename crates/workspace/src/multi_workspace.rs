@@ -1864,6 +1864,30 @@ impl MultiWorkspace {
         self.cod_saved_order = owner.workspace_ids;
     }
 
+    /// Cod (#24): a remote restoration that came up (at start or on a later retry) adds the
+    /// saved local members of its window as pending members; they load when first shown.
+    pub fn cod_join_restored_members(
+        &mut self,
+        owner: crate::persistence::CodRestoreOwner,
+        cx: &mut Context<Self>,
+    ) {
+        for member in owner.members {
+            let local = matches!(
+                member.location,
+                crate::persistence::model::SerializedWorkspaceLocation::Local
+            );
+            if local
+                && member.workspace_id != owner.active_workspace_id
+                && owner.workspace_ids.contains(&member.workspace_id)
+            {
+                self.cod_add_pending_workspace(member.workspace_id, member.paths);
+            }
+        }
+        self.cod_finish_restore(cx);
+        self.serialize(cx);
+        cx.notify();
+    }
+
     /// Cod (#24): after consent, a project group move transfers its complete ordered
     /// membership and shown member to the reserved key in one registry edit, taking them out
     /// of this window in the same step (loaded and pending members alike). The destination's

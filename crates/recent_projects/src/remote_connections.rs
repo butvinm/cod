@@ -542,7 +542,15 @@ async fn cod_open_remote_project_attempt(
 
             // Cod (#24): only a remote workspace that came up keeps the restore owner.
             Ok((Some(_), items)) => {
-                cod_attempt.owner = None;
+                // The saved local members of the restored window join it as pending members
+                // (they load when first shown), on a later retry as at start.
+                if let Some(owner) = cod_attempt.owner.take() {
+                    window
+                        .update(cx, |multi_workspace, _window, cx| {
+                            multi_workspace.cod_join_restored_members(owner, cx)
+                        })
+                        .ok();
+                }
                 navigate_to_positions(&window, items, &paths_with_positions, cx);
             }
             // Cancelled while the remote client started: nothing came up, so the owner goes
