@@ -135,6 +135,18 @@ impl State {
     }
 }
 
+/// One row the project panel lists, as returned by the read-only test hook [`ProjectPanel::listed_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedEntry {
+    /// The name of the root folder the row belongs to.
+    pub root_name: String,
+    /// The path of the row below its root, with `/` between components; empty for the root row itself.
+    pub path: String,
+    pub is_dir: bool,
+    pub is_expanded: bool,
+    pub is_selected: bool,
+}
+
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -4371,6 +4383,38 @@ impl ProjectPanel {
     pub fn selected_entry<'a>(&self, cx: &'a App) -> Option<(&'a Worktree, &'a project::Entry)> {
         let (worktree, entry) = self.selected_entry_handle(cx)?;
         Some((worktree.read(cx), entry))
+    }
+
+    /// Test hook for Cod's end-to-end driver (read-only): the rows the panel lists, in the order it lists them.
+    pub fn listed_entries(&self, cx: &App) -> Vec<ListedEntry> {
+        let project = self.project.read(cx);
+        let mut rows = Vec::new();
+        for visible in &self.state.visible_entries {
+            let Some(worktree) = project.worktree_for_id(visible.worktree_id, cx) else {
+                continue;
+            };
+            let root_name = worktree.read(cx).root_name_str().to_string();
+            let expanded = self
+                .state
+                .expanded_dir_ids
+                .get(&visible.worktree_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            for entry in &visible.entries {
+                rows.push(ListedEntry {
+                    root_name: root_name.clone(),
+                    path: entry.path.as_unix_str().to_string(),
+                    is_dir: entry.is_dir(),
+                    is_expanded: expanded.binary_search(&entry.id).is_ok(),
+                    is_selected: self.selection
+                        == Some(SelectedEntry {
+                            worktree_id: visible.worktree_id,
+                            entry_id: entry.id,
+                        }),
+                });
+            }
+        }
+        rows
     }
 
     pub fn selected_entry_project_path(&self, cx: &App) -> Option<ProjectPath> {

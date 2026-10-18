@@ -62,6 +62,31 @@ pub struct ZedPromptRenderer {
     detail: Option<Entity<Markdown>>,
 }
 
+/// Test hooks for Cod's end-to-end driver (read-only): what the prompt shows.
+impl ZedPromptRenderer {
+    /// The message as given to the prompt (Markdown source).
+    pub fn message<'a>(&self, cx: &'a App) -> &'a str {
+        self.message.read(cx).source()
+    }
+
+    /// The detail under the message (Markdown source), or None when the prompt shows none.
+    pub fn detail<'a>(&self, cx: &'a App) -> Option<&'a str> {
+        self.detail
+            .as_ref()
+            .map(|detail| -> &'a str { detail.read(cx).source() })
+    }
+
+    /// The labels of the answer buttons, in order.
+    pub fn answers(&self) -> &[String] {
+        &self.actions
+    }
+
+    /// The index of the highlighted answer, the one Enter picks.
+    pub fn highlighted_answer(&self) -> usize {
+        self.active_action_id
+    }
+}
+
 impl ZedPromptRenderer {
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(PromptResponse(self.active_action_id));
