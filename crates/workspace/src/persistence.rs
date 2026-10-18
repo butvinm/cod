@@ -407,9 +407,118 @@ pub enum CodWindowRegistryRead {
     Unreadable,
 }
 
+/// A workspace id belongs to at most one window. When a document lists an id more than once
+/// (an older or damaged document), the first window keeps it and the later ones lose it.
+/// Returns whether anything was dropped.
+fn cod_dedupe_window_entries(entries: &mut Vec<CodWindowEntry>) -> bool {
+    let mut seen: HashSet<WorkspaceId> = HashSet::default();
+    let mut changed = false;
+    for entry in entries.iter_mut() {
+        let len = entry.workspace_ids.len();
+        entry.workspace_ids.retain(|id| seen.insert(*id));
+        if entry.workspace_ids.len() != len {
+            log::error!(
+                "The Cod window registry lists a workspace in more than one window; window {} loses it",
+                entry.key
+            );
+            changed = true;
+            if entry
+                .active_workspace_id
+                .is_some_and(|active| !entry.workspace_ids.contains(&active))
+            {
+                entry.active_workspace_id = entry.workspace_ids.first().copied();
+            }
+        }
+    }
+    changed
+}
+
+/// Takes `ids` out of every entry except the one with `keep_key`. Entries that lose their last
+/// member this way go: their workspaces live in another window now. Returns whether anything
+/// changed.
+fn cod_take_ids_from_other_entries(
+    entries: &mut Vec<CodWindowEntry>,
+    ids: &[WorkspaceId],
+    keep_key: &str,
+) -> bool {
+    let mut changed = false;
+    entries.retain_mut(|entry| {
+        if entry.key == keep_key {
+            return true;
+        }
+        let len = entry.workspace_ids.len();
+        entry.workspace_ids.retain(|id| !ids.contains(id));
+        if entry.workspace_ids.len() == len {
+            return true;
+        }
+        changed = true;
+        if entry
+            .active_workspace_id
+            .is_some_and(|active| !entry.workspace_ids.contains(&active))
+        {
+            entry.active_workspace_id = entry.workspace_ids.first().copied();
+        }
+        !entry.workspace_ids.is_empty()
+    });
+    changed
+}
+
+/// Sets a window's entry and takes its ids out of every other window, in one edit.
+fn cod_upsert_window_entry(entries: &mut Vec<CodWindowEntry>, entry: CodWindowEntry) -> bool {
+    let mut changed = cod_take_ids_from_other_entries(entries, &entry.workspace_ids, &entry.key);
+    match entries.iter().position(|existing| existing.key == entry.key) {
+        Some(index) if entries[index] == entry => {}
+        Some(index) => {
+            entries[index] = entry;
+            changed = true;
+        }
+        None => {
+            entries.push(entry);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Moves `ids` to the window with `key` (created at the end when new), in one edit, so no
+/// written document has them in no window or in two.
+fn cod_move_ids_to_entry(
+    entries: &mut Vec<CodWindowEntry>,
+    ids: &[WorkspaceId],
+    key: &str,
+) -> bool {
+    let mut changed = cod_take_ids_from_other_entries(entries, ids, key);
+    let index = match entries.iter().position(|entry| entry.key == key) {
+        Some(index) => index,
+        None => {
+            entries.push(CodWindowEntry {
+                key: key.to_string(),
+                workspace_ids: Vec::new(),
+                active_workspace_id: None,
+            });
+            changed = true;
+            entries.len() - 1
+        }
+    };
+    let entry = &mut entries[index];
+    for id in ids {
+        if !entry.workspace_ids.contains(id) {
+            entry.workspace_ids.push(*id);
+            changed = true;
+        }
+    }
+    if entry.active_workspace_id.is_none() {
+        entry.active_workspace_id = entry.workspace_ids.first().copied();
+    }
+    changed
+}
+
 fn parse_cod_window_registry(json: &str) -> CodWindowRegistryRead {
     match serde_json::from_str::<Vec<CodWindowEntry>>(json) {
-        Ok(entries) => CodWindowRegistryRead::Present(entries),
+        Ok(mut entries) => {
+            cod_dedupe_window_entries(&mut entries);
+            CodWindowRegistryRead::Present(entries)
+        }
         Err(err) => {
             log::error!("The Cod window registry is unreadable, keeping it: {err:#}");
             CodWindowRegistryRead::Unreadable
@@ -462,6 +571,12 @@ pub struct CodWindowRegistry {
     /// document again while this is not zero, so its waiter resolves only after the earlier
     /// writes.
     pending_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Windows closed while the start was still restoring. Their entries go when the start
+    /// finishes, and each waiter then gets the result of that write.
+    queued_removals: Vec<(String, futures::channel::oneshot::Sender<Result<()>>)>,
+    /// The key the next new window takes: a project moving to a new window already has its
+    /// entry under this key.
+    next_window_key: Option<String>,
 }
 
 impl gpui::Global for CodWindowRegistry {}
@@ -470,8 +585,17 @@ impl CodWindowRegistry {
     /// Queues the whole document to the writer. The receiver gets the result of the write; it
     /// is cancelled (a failure for `cod_registry_done`) when the document was never queued.
     fn queue_write(&mut self, cx: &mut App) -> futures::channel::oneshot::Receiver<Result<()>> {
-        use std::sync::atomic::Ordering;
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        self.queue_write_to(done_tx, cx);
+        done_rx
+    }
+
+    fn queue_write_to(
+        &mut self,
+        done_tx: futures::channel::oneshot::Sender<Result<()>>,
+        cx: &mut App,
+    ) {
+        use std::sync::atomic::Ordering;
         let json = serde_json::to_string(&self.entries).log_err();
         if self.writer.is_none() {
             let (tx, rx) = futures::channel::mpsc::unbounded::<CodRegistryWrite>();
@@ -501,7 +625,6 @@ impl CodWindowRegistry {
                 log::error!("The Cod window registry writer stopped");
             }
         }
-        done_rx
     }
 
     fn has_pending_writes(&self) -> bool {
@@ -551,10 +674,19 @@ pub fn cod_registry_write_now(cx: &mut App) -> CodRegistryWriteDone {
 /// Startup finished restoring windows: from now on window changes update the registry. Entries
 /// of windows that did not come back stay.
 pub fn cod_registry_set_writable(cx: &mut App) {
-    let registry = cx.default_global::<CodWindowRegistry>();
+    let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
     if registry.loaded {
         registry.writable = true;
+        // Windows closed during the start leave the registry now.
+        let removals = std::mem::take(&mut registry.queued_removals);
+        registry
+            .entries
+            .retain(|entry| !removals.iter().any(|(key, _)| *key == entry.key));
+        for (_, done_tx) in removals {
+            registry.queue_write_to(done_tx, cx);
+        }
     }
+    *cx.default_global::<CodWindowRegistry>() = registry;
 }
 
 pub fn cod_registry_is_writable(cx: &App) -> bool {
@@ -588,27 +720,44 @@ where
 }
 
 /// Sets a window's entry (members in order and active member), adding it at the end when new.
+/// A workspace belongs to one window: its id leaves every other entry in the same edit.
 pub fn cod_registry_upsert(entry: CodWindowEntry, cx: &mut App) -> CodRegistryWriteDone {
-    cod_registry_edit(cx, move |entries| {
-        let index = entries
-            .iter()
-            .position(|existing| existing.key == entry.key);
-        match index {
-            Some(index) if entries[index] == entry => false,
-            Some(index) => {
-                entries[index] = entry;
-                true
-            }
-            None => {
-                entries.push(entry);
-                true
-            }
-        }
-    })
+    cod_registry_edit(cx, move |entries| cod_upsert_window_entry(entries, entry))
 }
 
-/// Removes a window's entry, after the user agreed to close the window.
+/// Moves workspaces to the window that opens next (a project moving to a new window), in one
+/// edit with their removal from the window they leave. The next new window takes the key.
+pub fn cod_registry_move_to_next_window(
+    ids: Vec<WorkspaceId>,
+    cx: &mut App,
+) -> CodRegistryWriteDone {
+    let key = cx
+        .default_global::<CodWindowRegistry>()
+        .next_window_key
+        .get_or_insert_with(|| Uuid::new_v4().to_string())
+        .clone();
+    cod_registry_edit(cx, move |entries| cod_move_ids_to_entry(entries, &ids, &key))
+}
+
+/// The key a new window takes, when a move reserved one for it.
+pub fn cod_take_next_window_key(cx: &mut App) -> Option<String> {
+    cx.try_global::<CodWindowRegistry>()?;
+    cx.default_global::<CodWindowRegistry>()
+        .next_window_key
+        .take()
+}
+
+/// Removes a window's entry, after the user agreed to close the window. While the start is
+/// still restoring windows the removal waits and is written when the start finishes.
 pub fn cod_registry_remove(key: String, cx: &mut App) -> CodRegistryWriteDone {
+    {
+        let registry = cx.default_global::<CodWindowRegistry>();
+        if registry.loaded && !registry.writable {
+            let (done_tx, done_rx) = futures::channel::oneshot::channel();
+            registry.queued_removals.push((key, done_tx));
+            return cod_registry_done(Some(done_rx));
+        }
+    }
     cod_registry_edit(cx, move |entries| {
         let len = entries.len();
         entries.retain(|entry| entry.key != key);
@@ -3179,6 +3328,79 @@ mod tests {
             parse_cod_window_registry("not json"),
             CodWindowRegistryRead::Unreadable
         );
+    }
+
+    fn cod_entry(key: &str, ids: &[i64], active: Option<i64>) -> CodWindowEntry {
+        CodWindowEntry {
+            key: key.to_string(),
+            workspace_ids: ids.iter().map(|id| WorkspaceId(*id)).collect(),
+            active_workspace_id: active.map(WorkspaceId),
+        }
+    }
+
+    #[test]
+    fn test_cod_window_registry_keeps_a_listed_twice_workspace_in_its_first_window() {
+        let json = r#"[{"key":"w1","workspace_ids":[1,2],"active_workspace_id":2},{"key":"w2","workspace_ids":[2,3],"active_workspace_id":2}]"#;
+        assert_eq!(
+            parse_cod_window_registry(json),
+            CodWindowRegistryRead::Present(vec![
+                cod_entry("w1", &[1, 2], Some(2)),
+                cod_entry("w2", &[3], Some(3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_cod_window_registry_upsert_takes_ids_from_other_windows() {
+        let mut entries = vec![
+            cod_entry("w1", &[1, 2], Some(2)),
+            cod_entry("w2", &[3], Some(3)),
+        ];
+        assert!(cod_upsert_window_entry(
+            &mut entries,
+            cod_entry("w2", &[3, 2], Some(2))
+        ));
+        assert_eq!(
+            entries,
+            vec![
+                cod_entry("w1", &[1], Some(1)),
+                cod_entry("w2", &[3, 2], Some(2)),
+            ]
+        );
+        assert!(!cod_upsert_window_entry(
+            &mut entries,
+            cod_entry("w2", &[3, 2], Some(2))
+        ));
+        // A window that loses its last workspace to another window leaves the registry.
+        assert!(cod_upsert_window_entry(
+            &mut entries,
+            cod_entry("w3", &[1], Some(1))
+        ));
+        assert_eq!(
+            entries,
+            vec![
+                cod_entry("w2", &[3, 2], Some(2)),
+                cod_entry("w3", &[1], Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cod_window_registry_moves_ids_to_a_new_window_in_one_edit() {
+        let mut entries = vec![
+            cod_entry("w1", &[1, 2], Some(2)),
+            cod_entry("w2", &[3], Some(3)),
+        ];
+        assert!(cod_move_ids_to_entry(&mut entries, &[WorkspaceId(2)], "w3"));
+        assert_eq!(
+            entries,
+            vec![
+                cod_entry("w1", &[1], Some(1)),
+                cod_entry("w2", &[3], Some(3)),
+                cod_entry("w3", &[2], Some(2)),
+            ]
+        );
+        assert!(!cod_move_ids_to_entry(&mut entries, &[WorkspaceId(2)], "w3"));
     }
 
     /// Creates a unique directory in a FakeFs, returning the path.

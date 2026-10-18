@@ -417,7 +417,10 @@ impl MultiWorkspace {
             cod_saved_order: Vec::new(),
             cod_pending: std::collections::HashMap::new(),
             cod_materializing: false,
-            cod_window_key: uuid::Uuid::new_v4().to_string(),
+            // Cod (#24): a window opened for a moving project takes the key its entry already
+            // has in the registry.
+            cod_window_key: crate::persistence::cod_take_next_window_key(cx)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             cod_queued_cycles: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
@@ -1101,6 +1104,9 @@ impl MultiWorkspace {
             }));
         }
 
+        // Cod (#24): the moving workspaces go to the registry entry of the window opened below,
+        // under a key reserved now; a key left from an earlier move is not reused.
+        drop(crate::persistence::cod_take_next_window_key(cx));
         let remove_task =
             self.remove_project_group_with_intent(key, RemovalIntent::MoveProject, window, cx);
 
@@ -1109,13 +1115,27 @@ impl MultiWorkspace {
 
             let removed = remove_task.await?;
             if !removed {
+                cx.update(|cx| drop(crate::persistence::cod_take_next_window_key(cx)));
                 return Ok(());
             }
 
-            cx.update(|cx| {
-                Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
-            })
-            .await?;
+            let opened = cx
+                .update(|cx| {
+                    Workspace::new_local(
+                        paths,
+                        app_state,
+                        None,
+                        None,
+                        None,
+                        OpenMode::NewWindow,
+                        cx,
+                    )
+                })
+                .await;
+            // The new window took the reserved key; one it did not take must not go to a
+            // later window.
+            cx.update(|cx| drop(crate::persistence::cod_take_next_window_key(cx)));
+            opened?;
 
             Ok(())
         })
@@ -1473,21 +1493,34 @@ impl MultiWorkspace {
             let db = crate::persistence::WorkspaceDb::global(cx);
             // Cod (#24): a removed workspace loses its name on every removal path (palette close,
             // sidebar, discarded empty workspace). The steps run in one awaited sequence off the
-            // GPUI thread: the session binding goes first, which alone keeps the workspace from
-            // coming back (a restore skips saved ids without a binding), then the name, then the
-            // window's workspace list without it. A crash between steps never brings back a
-            // half removed workspace.
-            // Until the binding is gone, any save of the list in between still lists it.
+            // GPUI thread: the window's registry entry without it goes first, since the registry
+            // alone decides what a start restores, then the session binding, then the name. A
+            // crash between steps never brings back a removed workspace.
+            // A project moving to a new window goes to that window's registry entry in the same
+            // edit that takes it out of this window, so no written registry has it in no window
+            // or in two.
             let kvp = db::kvp::KeyValueStore::global(cx);
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);
-            self.cod_removing_workspace_ids.push(workspace_id);
+            let moved = if keep_name {
+                Some(crate::persistence::cod_registry_move_to_next_window(
+                    vec![workspace_id],
+                    cx,
+                ))
+            } else {
+                None
+            };
+            let membership = self.serialize_now(cx);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
-                .push(cx.spawn(async move |this, cx| {
+                .push(cx.spawn(async move |_this, _cx| {
+                    if let Some(moved) = moved {
+                        moved.await.log_err();
+                    }
+                    membership.await;
                     db.set_session_binding(workspace_id, None, None)
                         .await
                         .log_err();
@@ -1496,14 +1529,6 @@ impl MultiWorkspace {
                             .await
                             .log_err();
                     }
-                    let Ok(membership) = this.update(cx, |this, cx| {
-                        this.cod_removing_workspace_ids
-                            .retain(|id| *id != workspace_id);
-                        this.serialize_now(cx)
-                    }) else {
-                        return;
-                    };
-                    membership.await;
                 }));
         }
     }
