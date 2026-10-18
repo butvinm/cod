@@ -12172,14 +12172,12 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    restore_id: Option<WorkspaceId>,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
+    // Cod (#24): `restore_id` is the saved row of the restoration this open is (the shown
+    // member of the restore owner it reserved), `None` for an ordinary open.
     cx.spawn(async move |cx| {
-        // Cod (#24): a window built from its restore owner loads the owner's saved row.
-        let restore_id = window
-            .update(cx, |multi_workspace, _window, _cx| multi_workspace.cod_remote_restore_id())
-            .ok()
-            .flatten();
         let (workspace_id, serialized_workspace) = deserialize_remote_project(
             remote_connection.connection_options(),
             paths.clone(),
@@ -12389,15 +12387,22 @@ fn deserialize_remote_project(
     // previous session, so a remote project opened now gets a new row instead of taking over one.
     let reuse_saved_by_roots = cx.update(|cx| !cod_registry_seed_failed(cx));
     cx.background_spawn(async move {
+        let identity = remote_connection_identity(&connection_options);
         let remote_connection_id = db
             .get_or_create_remote_connection(connection_options)
             .await?;
 
         // Cod (#24): a restore names its saved row by id. It is used only when that row is
-        // remote and has these folders; root-based selection is for ordinary opens.
+        // remote on this same connection and has these folders; otherwise the open selects its
+        // row as an ordinary open does.
         let restored = restore_id.and_then(|id| db.workspace_for_id(id)).filter(|saved| {
-            matches!(saved.location, SerializedWorkspaceLocation::Remote(_))
-                && saved.paths == PathList::new(&paths)
+            let same_connection = match &saved.location {
+                SerializedWorkspaceLocation::Remote(options) => {
+                    remote_connection_identity(options) == identity
+                }
+                SerializedWorkspaceLocation::Local => false,
+            };
+            same_connection && saved.paths == PathList::new(&paths)
         });
         let serialized_workspace = if restored.is_some() {
             restored
