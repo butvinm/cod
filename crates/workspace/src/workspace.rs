@@ -94,8 +94,7 @@ pub use pane_group::{
 pub use persistence::{
     CodRemoteRestoreDone, CodRestoreOwner, RecentWorkspace, WorkspaceDb,
     cod_add_restore_owner, cod_begin_remote_restore, cod_end_remote_restore,
-    cod_remote_restore_in_progress,
-    delete_unloaded_items,
+    cod_remote_restore_in_progress, delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
         SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
@@ -12174,9 +12173,7 @@ pub fn open_remote_project_with_new_connection(
     cx.spawn(async move |cx| {
         // Cod (#24): a window built from its restore owner loads the owner's saved row.
         let restore_id = window
-            .update(cx, |multi_workspace, _window, _cx| {
-                multi_workspace.cod_remote_restore_id()
-            })
+            .update(cx, |multi_workspace, _window, _cx| multi_workspace.cod_remote_restore_id())
             .ok()
             .flatten();
         let (workspace_id, serialized_workspace) = deserialize_remote_project(
