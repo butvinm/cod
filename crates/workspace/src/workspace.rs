@@ -1930,14 +1930,7 @@ impl Workspace {
         cx.subscribe_in(&center_pane, window, Self::handle_pane_event)
             .detach();
 
-        // Cod (#24): a workspace built into a window that already shows another workspace
-        // (a hidden workspace being restored or added) leaves the focus where it is; the
-        // window's multi-workspace focuses it when it is shown.
-        let window_shows_another_workspace = window.root::<MultiWorkspace>().flatten().is_some()
-            && window.focused(cx).is_some();
-        if !window_shows_another_workspace {
-            window.focus(&center_pane.focus_handle(cx), cx);
-        }
+        window.focus(&center_pane.focus_handle(cx), cx);
 
         cx.emit(Event::PaneAdded(center_pane.clone()));
 
@@ -2337,6 +2330,12 @@ impl Workspace {
                         .unwrap_or(false);
 
                     let workspace = window.update(cx, |multi_workspace, window, cx| {
+                        // Cod (#24): a workspace added behind the shown one (a restored hidden
+                        // workspace) gives the focus back once it is built: Workspace::new
+                        // focused its pane, and a focused pane that is not drawn loses keys.
+                        let focus_before_add = (open_mode == OpenMode::Add)
+                            .then(|| window.focused(cx))
+                            .flatten();
                         let workspace = cx.new(|cx| {
                             let mut workspace = Workspace::new(
                                 Some(workspace_id),
@@ -2361,6 +2360,12 @@ impl Workspace {
                             }
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
+                                if multi_workspace.workspace() != &workspace {
+                                    match focus_before_add {
+                                        Some(focus) => window.focus(&focus, cx),
+                                        None => multi_workspace.focus_active_workspace(window, cx),
+                                    }
+                                }
                             }
                             OpenMode::NewWindow => {
                                 unreachable!()
