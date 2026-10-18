@@ -7795,11 +7795,30 @@ impl Workspace {
     }
 
     fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
-        let Some(database_id) = self.database_id() else {
+        if self.database_id().is_none()
+            || self.cod_restore_in_progress
+            || self.cod_layout_save_blocked
+        {
             return Task::ready(());
+        }
+        let task = self.cod_serialize_workspace_checked(window, cx);
+        cx.background_spawn(async move {
+            task.await.log_err();
+        })
+    }
+
+    /// Cod (#24): saves the workspace like `serialize_workspace_internal` and resolves to Ok only
+    /// once the database acknowledged the commit, so a caller can delete old records after it.
+    fn cod_serialize_workspace_checked(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(Err(anyhow!("the workspace has no database id")));
         };
         if self.cod_restore_in_progress || self.cod_layout_save_blocked {
-            return Task::ready(());
+            return Task::ready(Err(anyhow!("layout saves are blocked")));
         }
 
         fn build_serialized_pane_group(
@@ -7907,7 +7926,7 @@ impl Workspace {
                             .await
                             .log_err();
                     }
-                    db.save_workspace(serialized_workspace).await;
+                    db.cod_try_save_workspace(serialized_workspace).await
                 })
             }
             WorkspaceLocation::None => {
@@ -7918,6 +7937,7 @@ impl Workspace {
                     persistence::write_default_dock_state(&kvp, docks)
                         .await
                         .log_err();
+                    anyhow::Ok(())
                 })
             }
         }
@@ -8148,12 +8168,23 @@ impl Workspace {
                     .ok();
                 return Ok(opened_items);
             }
-            workspace
+            let layout_saved = workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.cod_restore_in_progress = false;
-                    workspace.serialize_workspace_internal(window, cx)
+                    workspace.cod_serialize_workspace_checked(window, cx)
                 })?
                 .await;
+            if let Err(err) = layout_saved {
+                // Cod (#24): the new layout is not committed, so the saved one still points at
+                // the old item records: they stay. They are removed by a later restore.
+                log::error!("Restored layout was not saved; old item records are kept: {err:#}");
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.update_window_edited(window, cx);
+                    })
+                    .ok();
+                return Ok(opened_items);
+            }
 
             let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
                 item_ids_by_kind
