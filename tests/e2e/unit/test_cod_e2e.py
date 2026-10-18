@@ -6,12 +6,14 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import cod_e2e
 
@@ -206,6 +208,44 @@ class StartCommandTest(unittest.TestCase):
         self.assertIs(settings["auto_update"], False)
         self.assertEqual(settings["telemetry"], {"diagnostics": False, "metrics": False})
         self.assertEqual(json.loads(json.dumps(settings)), settings)
+
+
+class ArtifactsTest(unittest.TestCase):
+    """The artifact folder of a test: failure.txt after a failed step, final.txt otherwise, never both."""
+
+    class Sample(cod_e2e.CodTestCase):
+        def test_sample(self) -> None:
+            pass
+
+    def run_sample(self, fail_step: bool) -> Path:
+        folder = Path(tempfile.mkdtemp(prefix="cod-e2e-unit-"))
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        sample = self.Sample("test_sample")
+        stderr = io.StringIO()
+        shot = subprocess.CompletedProcess(["grim"], 0, "", "")
+        with (
+            mock.patch.dict(os.environ, {"COD_E2E_ARTIFACTS": str(folder)}),
+            mock.patch.object(cod_e2e.subprocess, "run", return_value=shot) as run,
+            contextlib.redirect_stderr(stderr),
+        ):
+            sample.setUp()
+            if fail_step:
+                with contextlib.suppress(AssertionError), sample.step("check the active tab"):
+                    raise AssertionError("expected active tab 'ledger.rs', actual 'invoice.rs'")
+            sample._save_final_artifacts()
+            sample.doCleanups()
+        self.assertEqual(run.call_args.args[0][0], "grim")
+        return folder / cod_e2e.artifact_name(sample.id())
+
+    def test_a_failed_step_saves_failure_txt_only(self) -> None:
+        target = self.run_sample(fail_step=True)
+        self.assertEqual(sorted(path.name for path in target.iterdir()), ["failure.txt"])
+        self.assertIn("failed step: check the active tab", (target / "failure.txt").read_text())
+
+    def test_a_passing_test_saves_final_txt(self) -> None:
+        target = self.run_sample(fail_step=False)
+        self.assertEqual(sorted(path.name for path in target.iterdir()), ["final.txt"])
+        self.assertIn("no step failed", (target / "final.txt").read_text())
 
 
 if __name__ == "__main__":

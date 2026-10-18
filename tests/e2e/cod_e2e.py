@@ -365,11 +365,16 @@ class Cod:
             leftovers = processes_with_marker(marker)
             if not leftovers:
                 break
+            log(f"  killing processes of this test that left its process group: {leftovers}")
             for pid in leftovers:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(pid, signal.SIGKILL)
             time.sleep(0.5)
         self.process = None
+        left = processes_with_marker(marker)
+        if left:
+            raise RuntimeError(f"processes of this test are still running after Cod was stopped: {left}")
+        log("  Cod stopped; no process of this test is left")
 
 
 class CodTestCase(unittest.TestCase):
@@ -396,6 +401,8 @@ class CodTestCase(unittest.TestCase):
             raise RuntimeError("Cod is already running in this test")
         self.cod = Cod(self.workdir, folder)
         self.addCleanup(self._stop_cod)
+        # Cleanups run last in, first out: the final artifacts are taken while Cod still runs.
+        self.addCleanup(self._save_final_artifacts)
         self.cod.start()
         self.cod.connect(timeout)
 
@@ -438,14 +445,27 @@ class CodTestCase(unittest.TestCase):
         return step(description, self._save_artifacts)
 
     def _save_artifacts(self, description: str, error: BaseException) -> None:
-        """Saves a screenshot, Cod's logs and the last state into $COD_E2E_ARTIFACTS/<test id>/, once per test."""
+        """On the first failed step: failure.txt plus the artifacts of _collect_artifacts."""
+        self._collect_artifacts(
+            "failure.txt", f"test: {self.id()}\nfailed step: {description}\n{type(error).__name__}: {error}\n", show_stderr=True
+        )
+
+    def _save_final_artifacts(self) -> None:
+        """At the end of every test that started Cod and had no failed step: final.txt plus the artifacts of _collect_artifacts."""
+        try:
+            self._collect_artifacts("final.txt", f"test: {self.id()}\nno step failed; saved at the end of the test\n", show_stderr=False)
+        except Exception as error:  # The final artifacts are a convenience; they never fail a test.
+            log(f"  could not save the final artifacts: {error}")
+
+    def _collect_artifacts(self, note_name: str, note: str, show_stderr: bool) -> None:
+        """Saves a note, a screenshot, Cod's logs, its hang traces and the last state into $COD_E2E_ARTIFACTS/<test id>/, once per test."""
         if self._artifacts_saved:
             return
         self._artifacts_saved = True
         target = artifacts_root() / artifact_name(self.id())
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
-        (target / "failure.txt").write_text(f"test: {self.id()}\nfailed step: {description}\n{type(error).__name__}: {error}\n")
+        (target / note_name).write_text(note)
         try:
             shot = subprocess.run(["grim", str(target / "screenshot.png")], capture_output=True, text=True, timeout=20)
             if shot.returncode != 0:
@@ -467,7 +487,7 @@ class CodTestCase(unittest.TestCase):
             if self.cod.output_path.exists():
                 shutil.copy2(self.cod.output_path, target / "cod-output.log")
             stderr_log = logs / "cod-stderr.log"
-            if stderr_log.exists():
+            if show_stderr and stderr_log.exists():
                 tail = stderr_log.read_text(errors="replace").splitlines()[-30:]
                 log("  last lines of cod-stderr.log:")
                 for line in tail:
