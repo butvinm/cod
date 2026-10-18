@@ -377,6 +377,22 @@ impl MultiWorkspace {
         })
     }
 
+    /// The pending members of this window with the folders of each, in saved order.
+    pub fn cod_pending_members(&self) -> Vec<(WorkspaceId, Vec<std::path::PathBuf>)> {
+        let mut members: Vec<(WorkspaceId, Vec<std::path::PathBuf>)> = self
+            .cod_pending
+            .iter()
+            .map(|(id, paths)| (*id, paths.clone()))
+            .collect();
+        members.sort_by_key(|(id, _)| {
+            self.cod_saved_order
+                .iter()
+                .position(|saved| saved == id)
+                .unwrap_or(usize::MAX)
+        });
+        members
+    }
+
     /// Loads and shows a pending member (see `cod_activate_pending`).
     pub fn cod_show_pending(
         &mut self,
@@ -434,9 +450,7 @@ impl MultiWorkspace {
                             }
                             Task::ready(Ok(()))
                         }
-                        None => Task::ready(Err(anyhow::anyhow!(
-                            "workspace {id:?} is not in this window"
-                        ))),
+                        None => Task::ready(Err(anyhow::anyhow!("workspace {id:?} is gone"))),
                     }
                 })?
                 .await

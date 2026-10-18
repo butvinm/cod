@@ -11526,22 +11526,52 @@ pub async fn find_existing_workspace(
             }
         });
 
-        // Cod (#24): a registered workspace that has exactly these folders but is still
-        // pending in its restored window is shown there, instead of a second copy elsewhere.
-        if existing.is_none() {
+        // Cod (#24): a registered workspace that is still pending in its restored window and
+        // matches these paths under the requested matching policy is loaded and shown there,
+        // instead of a second copy or an unrelated window picked as a fallback.
+        if best_match.is_none() {
             let path_list = PathList::new(abs_paths);
-            let pending = cx.update(|cx| {
-                workspace_windows_for_location(location, cx)
-                    .into_iter()
-                    .find_map(|window| {
-                        let id = window
-                            .read(cx)
-                            .ok()?
-                            .cod_pending_id_for_paths(&path_list)?;
-                        Some((window, id))
-                    })
+            let (candidates, fs) = cx.update(|cx| {
+                let mut candidates = Vec::new();
+                for window in workspace_windows_for_location(location, cx) {
+                    if let Ok(multi_workspace) = window.read(cx) {
+                        for (id, roots) in multi_workspace.cod_pending_members() {
+                            candidates.push((window, id, roots));
+                        }
+                    }
+                }
+                (candidates, <dyn Fs>::global(cx))
             });
-            if let Some((window, id)) = pending {
+            // A member with exactly these folders first, then the policy used for live ones.
+            let mut selected: Option<(WindowHandle<MultiWorkspace>, WorkspaceId)> = candidates
+                .iter()
+                .find(|(_, _, roots)| PathList::new(roots) == path_list)
+                .map(|(window, id, _)| (*window, *id));
+            if selected.is_none() {
+                'candidates: for (window, id, roots) in &candidates {
+                    for path in abs_paths {
+                        for root in roots {
+                            let Ok(relative) = path.strip_prefix(root) else {
+                                continue;
+                            };
+                            let is_subpath = !relative.as_os_str().is_empty();
+                            let contains = match open_options.workspace_matching {
+                                WorkspaceMatching::None => false,
+                                WorkspaceMatching::MatchExact => {
+                                    !is_subpath || !fs.is_dir(path).await
+                                }
+                                WorkspaceMatching::MatchSubpaths => is_subpath,
+                                WorkspaceMatching::MatchSubdirectory => true,
+                            };
+                            if contains {
+                                selected = Some((*window, *id));
+                                break 'candidates;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((window, id)) = selected {
                 let show = window
                     .update(cx, |multi_workspace, window, cx| {
                         multi_workspace.cod_show_pending(id, window, cx)
@@ -11550,7 +11580,7 @@ pub async fn find_existing_workspace(
                 if let Some(show) = show {
                     if show.await.log_err().is_some() {
                         // The workspace with the requested id, never whichever one is active.
-                        existing = cx.update(|cx| {
+                        let shown = cx.update(|cx| {
                             let workspace = window
                                 .read(cx)
                                 .ok()?
@@ -11559,6 +11589,9 @@ pub async fn find_existing_workspace(
                                 .cloned()?;
                             Some((window, workspace))
                         });
+                        if shown.is_some() {
+                            existing = shown;
+                        }
                     }
                 }
             }
