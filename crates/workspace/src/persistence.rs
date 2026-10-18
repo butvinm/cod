@@ -348,12 +348,12 @@ pub fn read_serialized_multi_workspaces(
 
     window_groups
         .into_iter()
-        .filter_map(|group| {
+        .filter_map(|mut group| {
             let window_id = group.first().and_then(|sw| sw.window_id);
             let state = window_id
                 .map(|wid| read_multi_workspace_state(wid, cx))
                 .unwrap_or_default();
-            let active_workspace = state
+            let index = state
                 .active_workspace_id
                 .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
                 // If the persisted active workspace can't be matched (e.g. its
@@ -363,10 +363,15 @@ pub fn read_serialized_multi_workspaces(
                 // restored as the focused window. Only if none have paths do we
                 // fall back to the first entry.
                 .or_else(|| group.iter().position(|ws| !ws.paths.is_empty()))
-                .or(Some(0))
-                .and_then(|index| group.into_iter().nth(index))?;
+                .unwrap_or(0);
+            if index >= group.len() {
+                return None;
+            }
+            let active_workspace = group.remove(index);
+            // Cod (#24): the window's other workspaces come back too.
             Some(model::SerializedMultiWorkspace {
                 active_workspace,
+                other_workspaces: group,
                 state,
             })
         })
@@ -4733,6 +4738,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: true,
                 sidebar_state: None,
+                cod_workspace_ids: vec![],
             },
         )
         .await;
@@ -4745,6 +4751,7 @@ mod tests {
                 project_groups: vec![],
                 sidebar_open: false,
                 sidebar_state: None,
+                cod_workspace_ids: vec![],
             },
         )
         .await;

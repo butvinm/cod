@@ -31,6 +31,10 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
+    CloseWorkspace, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name,
+};
+pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
     NextProject, NextThread, PreviousProject, PreviousThread, ProjectGroup, ProjectGroupKey,
@@ -6717,6 +6721,15 @@ impl Workspace {
             title = render_window_title_format(default_template, separator, &context);
         }
 
+        // Cod (#24): the title of a named workspace starts with its name.
+        if let Some(name) = cod_workspace_name(self, cx) {
+            title = if title.trim().is_empty() {
+                name
+            } else {
+                format!("{name}{separator}{title}")
+            };
+        }
+
         if project.is_via_collab() {
             title.push_str(" ↙");
         } else if project.is_shared() {
@@ -10253,6 +10266,7 @@ pub async fn restore_multiworkspace(
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
     let SerializedMultiWorkspace {
         active_workspace,
+        other_workspaces,
         state,
     } = multi_workspace;
 
@@ -10321,6 +10335,46 @@ pub async fn restore_multiworkspace(
             fallback_handle.ok_or(err)?
         }
     };
+
+    // Cod (#24): bring back the window's other workspaces without activating them, then put
+    // all of them in the order the window held them.
+    for other in other_workspaces {
+        if !matches!(other.location, SerializedWorkspaceLocation::Local) {
+            continue;
+        }
+        let result = if other.paths.is_empty() {
+            cx.update(|cx| {
+                open_workspace_by_id(other.workspace_id, app_state.clone(), Some(window_handle), cx)
+            })
+            .await
+            .map(|_| ())
+        } else {
+            cx.update(|cx| {
+                Workspace::new_local(
+                    other.paths.paths().to_vec(),
+                    app_state.clone(),
+                    Some(window_handle),
+                    None,
+                    None,
+                    OpenMode::Add,
+                    cx,
+                )
+            })
+            .await
+            .map(|_| ())
+        };
+        if let Err(err) = result {
+            log::error!(
+                "Failed to restore workspace {:?}: {err:#}",
+                other.workspace_id
+            );
+        }
+    }
+    window_handle
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
+        })
+        .ok();
 
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 

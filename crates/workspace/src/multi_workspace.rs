@@ -25,6 +25,12 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+mod cod_workspaces;
+pub use cod_workspaces::{
+    CloseWorkspace, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name,
+};
+
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -353,8 +359,11 @@ impl MultiWorkspace {
                 && AgentSettings::get_global(cx).enabled;
             move |this, window, cx| {
                 let multi_workspace_enabled = this.multi_workspace_enabled(cx);
-                if previous_multi_workspace_enabled && !multi_workspace_enabled {
-                    this.collapse_to_single_workspace(window, cx);
+                // Cod (#24): the window keeps its workspaces whatever the AI setting; only the
+                // threads sidebar goes away with AI.
+                if previous_multi_workspace_enabled && !multi_workspace_enabled && this.sidebar_open
+                {
+                    this.close_sidebar(window, cx);
                 }
                 previous_multi_workspace_enabled = multi_workspace_enabled;
             }
@@ -1321,7 +1330,8 @@ impl MultiWorkspace {
 
         let old_active_workspace = self.workspace().clone();
         let old_active_was_retained = self.active_workspace_is_retained();
-        let should_retain_workspaces = self.multi_workspace_enabled(cx);
+        // Cod (#24): a window always keeps the workspaces it switches between.
+        let should_retain_workspaces = true;
 
         if should_retain_workspaces && !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
@@ -1381,6 +1391,8 @@ impl MultiWorkspace {
 
     /// Collapses to a single workspace, discarding all groups.
     /// Used when multi-workspace is disabled by settings.
+    /// Cod (#24) keeps the workspaces when AI is disabled, so nothing calls this now.
+    #[allow(dead_code)]
     fn collapse_to_single_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_open {
             self.close_sidebar(window, cx);
@@ -1464,6 +1476,11 @@ impl MultiWorkspace {
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
             sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+            cod_workspace_ids: self
+                .held
+                .iter()
+                .filter_map(|held| held.workspace.read(cx).database_id())
+                .collect(),
         };
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
@@ -2079,6 +2096,11 @@ impl Render for MultiWorkspace {
                 .font(ui_font)
                 .text_color(text_color)
                 .on_action(cx.listener(Self::close_window))
+                .on_action(cx.listener(Self::new_workspace))
+                .on_action(cx.listener(Self::rename_workspace))
+                .on_action(cx.listener(Self::next_workspace))
+                .on_action(cx.listener(Self::previous_workspace))
+                .on_action(cx.listener(Self::close_workspace))
                 .when(self.multi_workspace_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
