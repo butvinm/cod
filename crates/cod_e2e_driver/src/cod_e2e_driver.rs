@@ -6,7 +6,7 @@
 //!
 //! - `{"cmd":"keys","keys":"ctrl-p enter"}` presses each space-separated keystroke (Zed keystroke syntax). Reply `{"ok":true}`.
 //! - `{"cmd":"type","text":"invoice"}` presses one key per character, with the character as the typed text. Reply `{"ok":true}`.
-//! - `{"cmd":"state"}` replies `{"ok":true,"state":{"active_tab":..,"tabs":[..],"worktrees":[..],"modal":..}}`.
+//! - `{"cmd":"state"}` replies `{"ok":true,"state":{...}}` with the fields of `read_state` (listed in `tests/e2e/README.md`).
 //! - A failed request replies `{"ok":false,"error":"..."}`.
 //!
 //! Keys enter the window the way the Linux platform layer delivers them: `Window::dispatch_event` with `PlatformInput::KeyDown` and `KeyUp`, and when the key down is not handled and carries text, the window's text input receives that text (`Window::dispatch_keystroke` does both).
@@ -15,13 +15,22 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use gpui::{App, AsyncApp, Keystroke, Modifiers, WindowHandle};
+use command_palette::CommandPaletteDelegate;
+use editor::{Editor, ToPoint as _};
+use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
+use gpui::{
+    App, AppContext as _, AsyncApp, Entity, Keystroke, Modifiers, SharedString, WeakEntity, Window,
+    WindowHandle,
+};
+use open_path_prompt::OpenPathDelegate;
+use picker::{Picker, PickerDelegate as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use workspace::{ItemHandle as _, MultiWorkspace};
+use settings::{Settings as _, SettingsStore};
+use workspace::{ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings};
 
 /// The environment variable that names the driver socket.
 pub const SOCKET_ENV: &str = "COD_E2E_SOCKET";
@@ -39,7 +48,26 @@ pub fn init(cx: &mut App) {
         return;
     };
     let path = std::path::PathBuf::from(path);
-    cx.spawn(async move |cx| serve(path, cx).await).detach();
+    let memory = Rc::new(RefCell::new(Memory::default()));
+    // The command palette keeps its picker private; the driver remembers each new palette picker to read its query and its matches.
+    cx.observe_new({
+        let memory = memory.clone();
+        move |_: &mut Picker<CommandPaletteDelegate>, _, cx| {
+            memory.borrow_mut().palette = Some(cx.weak_entity());
+        }
+    })
+    .detach();
+    cx.spawn(async move |cx| serve(path, memory, cx).await).detach();
+}
+
+/// What the driver remembers between requests. It only ever holds observations, never anything the app reads.
+#[derive(Default)]
+struct Memory {
+    /// The picker of the newest command palette.
+    palette: Option<WeakEntity<Picker<CommandPaletteDelegate>>>,
+    /// The command names the palette would list if it opened now, taken before every key press while no palette is open.
+    /// The palette builds its list from the same call (`Window::available_actions` with the palette filter) when the key that opens it is handled, so the list taken before that key is the palette's list.
+    palette_candidates: Vec<SharedString>,
 }
 
 /// The driver uses Unix sockets, so other platforms never start it.
@@ -147,6 +175,129 @@ fn typed_keystroke(character: char) -> Result<Keystroke> {
     })
 }
 
+/// How the root of the center pane layout is split, named by the divider the user sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Split {
+    /// A vertical divider: panes side by side, left to right (Zed's `Axis::Horizontal`, made by "pane: split right").
+    Vertical,
+    /// A horizontal divider: panes stacked, top to bottom (Zed's `Axis::Vertical`, made by "pane: split down").
+    Horizontal,
+}
+
+impl Split {
+    pub fn name(self) -> &'static str {
+        match self {
+            Split::Vertical => "vertical",
+            Split::Horizontal => "horizontal",
+        }
+    }
+}
+
+/// The screen rectangle of one pane, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+/// Panes closer than this many pixels count as touching: the divider between two panes may overlap them a little.
+const EDGE_TOLERANCE: f32 = 2.0;
+
+/// Orders panes the way the layout tree holds them and names the split at its root, from the rectangles the panes cover on screen.
+/// The root split is the line, crossing no pane, that cuts all panes into groups; each group is ordered the same way, recursively.
+/// Returns the indices into `rects` in layout order. One pane, or none, has no split.
+pub fn pane_layout(rects: &[Rect]) -> (Option<Split>, Vec<usize>) {
+    order_group(rects, (0..rects.len()).collect())
+}
+
+fn order_group(rects: &[Rect], group: Vec<usize>) -> (Option<Split>, Vec<usize>) {
+    if group.len() < 2 {
+        return (None, group);
+    }
+    for split in [Split::Vertical, Split::Horizontal] {
+        if let Some(parts) = cut(rects, &group, split) {
+            let order = parts
+                .into_iter()
+                .flat_map(|part| order_group(rects, part).1)
+                .collect();
+            return (Some(split), order);
+        }
+    }
+    // No straight cut exists (Zed's layouts always have one): fall back to reading order.
+    let mut order = group;
+    order.sort_by(|&a, &b| {
+        rects[a]
+            .top
+            .total_cmp(&rects[b].top)
+            .then(rects[a].left.total_cmp(&rects[b].left))
+    });
+    (None, order)
+}
+
+/// Cuts the group at every line across `split` that no pane crosses. None when there is no such line.
+fn cut(rects: &[Rect], group: &[usize], split: Split) -> Option<Vec<Vec<usize>>> {
+    let span = |index: usize| {
+        let rect = rects[index];
+        match split {
+            Split::Vertical => (rect.left, rect.right),
+            Split::Horizontal => (rect.top, rect.bottom),
+        }
+    };
+    let mut sorted = group.to_vec();
+    sorted.sort_by(|&a, &b| {
+        let (a_start, a_end) = span(a);
+        let (b_start, b_end) = span(b);
+        a_start.total_cmp(&b_start).then(a_end.total_cmp(&b_end))
+    });
+    let mut parts = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut reach = f32::NEG_INFINITY;
+    for index in sorted {
+        let (start, end) = span(index);
+        if !current.is_empty() && start >= reach - EDGE_TOLERANCE {
+            parts.push(std::mem::take(&mut current));
+        }
+        current.push(index);
+        reach = reach.max(end);
+    }
+    parts.push(current);
+    (parts.len() > 1).then_some(parts)
+}
+
+/// The command the palette highlights, worked out the way the palette ranks its matches (`CommandPaletteDelegate::update_matches`): the candidates sorted by name, the query normalized, nucleo with smart case and the length penalty.
+/// That ranking holds only without command history, so the tests turn `command_palette.use_command_history` off; with history the caller passes no candidates.
+/// `candidates` must be the palette's own list. The answer is None unless the ranking gives exactly as many matches as the palette shows (`match_count`), which also rules out a palette that is still updating its matches.
+pub fn palette_selection(
+    candidates: &[SharedString],
+    query: &str,
+    match_count: usize,
+    selected_index: usize,
+) -> Option<String> {
+    let mut names = candidates.to_vec();
+    names.sort();
+    let candidates: Vec<StringMatchCandidate> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| StringMatchCandidate::new(index, name.clone()))
+        .collect();
+    let query = command_palette::normalize_action_query(query);
+    let matches = fuzzy_nucleo::match_strings(
+        &candidates,
+        &query,
+        Case::Smart,
+        LengthPenalty::On,
+        10000,
+    );
+    if matches.is_empty() || matches.len() != match_count {
+        return None;
+    }
+    matches
+        .get(selected_index)
+        .map(|found| found.string.to_string())
+}
+
 /// The reply line, without the final newline.
 pub fn encode_reply(reply: &Result<Option<Value>>) -> String {
     let value = match reply {
@@ -166,7 +317,7 @@ struct Job {
 
 /// Waits for the first workspace window, opens the socket and runs every request on the foreground.
 #[cfg(unix)]
-async fn serve(path: std::path::PathBuf, cx: &mut AsyncApp) {
+async fn serve(path: std::path::PathBuf, memory: Rc<RefCell<Memory>>, cx: &mut AsyncApp) {
     use futures::StreamExt as _;
 
     while cx.update(|cx| workspace_window(cx)).is_none() {
@@ -186,24 +337,42 @@ async fn serve(path: std::path::PathBuf, cx: &mut AsyncApp) {
         }
     }
     while let Some(job) = incoming.next().await {
-        let reply = run(job.request, cx).await;
+        let reply = run(job.request, &memory, cx).await;
         job.reply.send(reply).ok();
     }
 }
 
 #[cfg(unix)]
-async fn run(request: Request, cx: &mut AsyncApp) -> Result<Option<Value>> {
+async fn run(
+    request: Request,
+    memory: &Rc<RefCell<Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<Option<Value>> {
     match request {
         Request::Keys(keystrokes) | Request::Type(keystrokes) => {
             for (index, keystroke) in keystrokes.into_iter().enumerate() {
                 if index > 0 {
                     cx.background_executor().timer(KEY_PAUSE).await;
                 }
-                press(keystroke, cx)?;
+                press(keystroke, memory, cx)?;
             }
             Ok(None)
         }
-        Request::State => cx.update(|cx| read_state(cx)).map(Some),
+        Request::State => {
+            // Counted outside update_window: while a window is being updated, App::windows leaves it out.
+            let window_count = cx.update(|cx| cx.windows().len());
+            let window = cx
+                .update(|cx| workspace_window(cx))
+                .context("Cod has no workspace window")?;
+            cx.update_window(window.into(), |root, window, cx| {
+                let multi_workspace = root
+                    .downcast::<MultiWorkspace>()
+                    .map_err(|_| anyhow!("the window does not show a workspace"))?;
+                read_state(&multi_workspace, window, window_count, &memory.borrow(), cx)
+            })
+            .context("the workspace window closed")?
+            .map(Some)
+        }
     }
 }
 
@@ -220,13 +389,24 @@ fn workspace_window(cx: &App) -> Option<WindowHandle<MultiWorkspace>> {
 
 /// Presses one key: key down, then key up, as the platform layer delivers them.
 #[cfg(unix)]
-fn press(keystroke: Keystroke, cx: &mut AsyncApp) -> Result<()> {
-    use gpui::{AppContext as _, KeyDownEvent, KeyUpEvent, PlatformInput};
+fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) -> Result<()> {
+    use gpui::{KeyDownEvent, KeyUpEvent, PlatformInput};
 
     let window = cx
         .update(|cx| workspace_window(cx))
         .context("Cod has no workspace window")?;
-    cx.update_window(window.into(), |_, window, cx| {
+    cx.update_window(window.into(), |root, window, cx| {
+        if let Ok(multi_workspace) = root.downcast::<MultiWorkspace>() {
+            let palette_open = multi_workspace
+                .read(cx)
+                .workspace()
+                .read(cx)
+                .active_modal::<command_palette::CommandPalette>(cx)
+                .is_some();
+            if !palette_open {
+                memory.borrow_mut().palette_candidates = palette_candidates(window, cx);
+            }
+        }
         // The Linux platform layer gives unhandled text keys without modifiers other than shift to the text input.
         let types_text = keystroke.key_char.is_some()
             && keystroke.modifiers.is_subset_of(&Modifiers::shift());
@@ -247,27 +427,184 @@ fn press(keystroke: Keystroke, cx: &mut AsyncApp) -> Result<()> {
     .context("the workspace window closed")
 }
 
-/// What the window shows: the active tab, the tabs of the active pane, the folders of the project and the open modal.
-fn read_state(cx: &App) -> Result<Value> {
-    let window = workspace_window(cx).context("Cod has no workspace window")?;
-    let workspace = window
-        .read(cx)
-        .context("the workspace window closed")?
-        .workspace()
-        .read(cx);
+/// The command names the palette lists when it opens now: `CommandPalette::new` takes `Window::available_actions`, drops the actions the palette filter hides and humanizes the names.
+fn palette_candidates(window: &Window, cx: &App) -> Vec<SharedString> {
+    let filter = command_palette_hooks::CommandPaletteFilter::try_global(cx);
+    window
+        .available_actions(cx)
+        .into_iter()
+        .filter_map(|action| {
+            if filter.is_some_and(|filter| filter.is_hidden(&*action)) {
+                return None;
+            }
+            Some(SharedString::from(command_palette::humanize_action_name(
+                action.name(),
+            )))
+        })
+        .collect()
+}
+
+/// The name of a workspace as the user gave it, or None while it has none.
+/// Cod has no workspace names yet (story #24 adds them); this is the one place that reads them once they exist.
+fn workspace_name(_workspace: &Entity<Workspace>, _cx: &App) -> Option<String> {
+    None
+}
+
+fn worktrees_of(workspace: &Workspace, cx: &App) -> Vec<String> {
+    workspace
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn tab_title(item: &dyn ItemHandle, cx: &App) -> String {
+    item.tab_content_text(0, cx).to_string()
+}
+
+/// What the window shows. The fields are described in `tests/e2e/README.md`; the first four are the ones of story #22.
+fn read_state(
+    multi_workspace: &Entity<MultiWorkspace>,
+    window: &Window,
+    window_count: usize,
+    memory: &Memory,
+    cx: &App,
+) -> Result<Value> {
+    let multi_workspace = multi_workspace.read(cx);
+    let active = multi_workspace.workspace().clone();
+    let held: Vec<Entity<Workspace>> = multi_workspace.workspaces().cloned().collect();
+    let active_workspace = held.iter().position(|workspace| *workspace == active);
+    let workspaces: Vec<Value> = held
+        .iter()
+        .map(|workspace| {
+            json!({
+                "name": workspace_name(workspace, cx),
+                "worktrees": worktrees_of(workspace.read(cx), cx),
+            })
+        })
+        .collect();
+    let workspace = active.read(cx);
     let active_tab = workspace
         .active_item(cx)
-        .map(|item| item.tab_content_text(0, cx).to_string());
+        .map(|item| tab_title(&*item, cx));
     let tabs: Vec<String> = workspace
         .active_pane()
         .read(cx)
         .items()
-        .map(|item| item.tab_content_text(0, cx).to_string())
+        .map(|item| tab_title(&**item, cx))
         .collect();
-    let worktrees: Vec<String> = workspace
-        .visible_worktrees(cx)
-        .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+    let worktrees = worktrees_of(workspace, cx);
+
+    // The center panes in layout order, read from where they are on screen: the pane tree itself is private to the workspace.
+    let panes = workspace.panes();
+    let rects: Option<Vec<Rect>> = panes
+        .iter()
+        .map(|pane| {
+            workspace.bounding_box_for_pane(pane).map(|bounds| Rect {
+                left: f32::from(bounds.origin.x),
+                top: f32::from(bounds.origin.y),
+                right: f32::from(bounds.origin.x + bounds.size.width),
+                bottom: f32::from(bounds.origin.y + bounds.size.height),
+            })
+        })
         .collect();
+    let (split, order): (Value, Vec<usize>) = match rects {
+        _ if panes.len() < 2 => (Value::Null, (0..panes.len()).collect()),
+        Some(rects) => {
+            let (split, order) = pane_layout(&rects);
+            (json!(split.map(Split::name)), order)
+        }
+        // Several panes that are not laid out yet: the split cannot be told.
+        None => (json!("unknown"), (0..panes.len()).collect()),
+    };
+    let ordered_panes: Vec<&Entity<Pane>> =
+        order.iter().map(|&index| &panes[index]).collect();
+    let panes_json: Vec<Value> = ordered_panes
+        .iter()
+        .map(|pane| {
+            let pane = pane.read(cx);
+            json!({
+                "tabs": pane.items().map(|item| tab_title(&**item, cx)).collect::<Vec<_>>(),
+                "active_tab": pane.active_item().map(|item| tab_title(&*item, cx)),
+            })
+        })
+        .collect();
+    let dirty_tabs: Vec<String> = ordered_panes
+        .iter()
+        .flat_map(|pane| pane.read(cx).items())
+        .filter(|item| item.is_dirty(cx))
+        .map(|item| tab_title(&**item, cx))
+        .collect();
+
+    // The cursor of the active editor as the status bar shows it: 1-based line, 1-based column (in bytes).
+    let cursor = workspace.active_item_as::<Editor>(cx).map(|editor| {
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let point = editor.selections.newest_anchor().head().to_point(&snapshot);
+        json!({ "row": point.row + 1, "column": point.column + 1 })
+    });
+
+    // The command palette: its query, how many matches it shows, which one is highlighted, and the name of that command.
+    let palette_open = workspace
+        .active_modal::<command_palette::CommandPalette>(cx)
+        .is_some();
+    let palette_picker = memory
+        .palette
+        .as_ref()
+        .and_then(|picker| picker.upgrade())
+        .filter(|_| palette_open);
+    let (palette, selection) = match palette_picker {
+        Some(picker) => {
+            let picker = picker.read(cx);
+            let query = picker.query(cx);
+            let match_count = picker.delegate.match_count();
+            let selected_index = picker.delegate.selected_index();
+            let history = cx
+                .global::<SettingsStore>()
+                .merged_settings()
+                .command_palette
+                .as_ref()
+                .and_then(|settings| settings.use_command_history)
+                .unwrap_or(true);
+            let aliased = WorkspaceSettings::get_global(cx)
+                .command_aliases
+                .contains_key(&query);
+            let selection = if history || aliased {
+                None
+            } else {
+                palette_selection(
+                    &memory.palette_candidates,
+                    &query,
+                    match_count,
+                    selected_index,
+                )
+            };
+            (
+                json!({
+                    "query": query,
+                    "match_count": match_count,
+                    "selected_index": selected_index,
+                }),
+                json!(selection),
+            )
+        }
+        None => (Value::Null, Value::Null),
+    };
+
+    // Zed's own path picker (with use_system_path_prompts off): its query and how many entries match it.
+    let path_prompt = workspace
+        .active_modal::<Picker<OpenPathDelegate>>(cx)
+        .map(|picker| {
+            let picker = picker.read(cx);
+            json!({
+                "query": picker.query(cx),
+                "match_count": picker.delegate.match_count(),
+            })
+        });
+
+    // A prompt drawn in the window (Zed's ui_prompt, always used on Linux). It does not expose its text, so message and answers stay null.
+    let prompt = window
+        .has_active_prompt()
+        .then(|| json!({ "message": null, "answers": null }));
     let modal = if workspace
         .active_modal::<file_finder::FileFinder>(cx)
         .is_some()
@@ -288,6 +625,18 @@ fn read_state(cx: &App) -> Result<Value> {
         "tabs": tabs,
         "worktrees": worktrees,
         "modal": modal,
+        "window_count": window_count,
+        "workspace_count": held.len(),
+        "active_workspace": active_workspace,
+        "workspaces": workspaces,
+        "panes": panes_json,
+        "split": split,
+        "cursor": cursor,
+        "dirty_tabs": dirty_tabs,
+        "palette": palette,
+        "palette_selection": selection,
+        "path_prompt": path_prompt,
+        "prompt": prompt,
     }))
 }
 
@@ -618,6 +967,100 @@ mod tests {
                 keystroke("enter", None, Modifiers::none()),
                 keystroke("tab", None, Modifiers::none()),
             ]
+        );
+    }
+
+    fn rect(left: f32, top: f32, right: f32, bottom: f32) -> Rect {
+        Rect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn one_pane_has_no_split() {
+        assert_eq!(pane_layout(&[]), (None, vec![]));
+        assert_eq!(
+            pane_layout(&[rect(0., 0., 800., 600.)]),
+            (None, vec![0])
+        );
+    }
+
+    #[test]
+    fn side_by_side_panes_are_a_vertical_split_in_left_to_right_order() {
+        let right = rect(400., 0., 800., 600.);
+        let left = rect(0., 0., 401., 600.);
+        assert_eq!(
+            pane_layout(&[right, left]),
+            (Some(Split::Vertical), vec![1, 0])
+        );
+    }
+
+    #[test]
+    fn stacked_panes_are_a_horizontal_split_in_top_to_bottom_order() {
+        let bottom = rect(0., 300., 800., 600.);
+        let top = rect(0., 0., 800., 300.);
+        assert_eq!(
+            pane_layout(&[bottom, top]),
+            (Some(Split::Horizontal), vec![1, 0])
+        );
+    }
+
+    #[test]
+    fn nested_layouts_name_the_root_split_and_keep_tree_order() {
+        // Left column split into top and bottom, one full-height pane on the right.
+        let right = rect(400., 0., 800., 600.);
+        let left_bottom = rect(0., 300., 400., 600.);
+        let left_top = rect(0., 0., 400., 300.);
+        assert_eq!(
+            pane_layout(&[right, left_bottom, left_top]),
+            (Some(Split::Vertical), vec![2, 1, 0])
+        );
+        // A top row split into left and right, one full-width pane below.
+        let bottom = rect(0., 300., 800., 600.);
+        let top_right = rect(400., 0., 800., 300.);
+        let top_left = rect(0., 0., 400., 300.);
+        assert_eq!(
+            pane_layout(&[bottom, top_right, top_left]),
+            (Some(Split::Horizontal), vec![2, 1, 0])
+        );
+    }
+
+    fn names(names: &[&str]) -> Vec<SharedString> {
+        names.iter().map(|name| SharedString::from(*name)).collect()
+    }
+
+    #[test]
+    fn the_exact_command_name_is_the_selection() {
+        let candidates = names(&[
+            "workspace: close window",
+            "multi workspace: close workspace sidebar",
+            "workspace: close workspace",
+        ]);
+        assert_eq!(
+            palette_selection(&candidates, "workspace: close workspace", 2, 0).as_deref(),
+            Some("workspace: close workspace")
+        );
+        assert_eq!(
+            palette_selection(&candidates, "workspace: close workspace", 2, 1).as_deref(),
+            Some("multi workspace: close workspace sidebar")
+        );
+    }
+
+    #[test]
+    fn no_selection_when_the_palette_shows_other_matches() {
+        let candidates = names(&["workspace: close window", "workspace: new window"]);
+        // The palette shows a different number of matches: it is still updating or lists other commands.
+        assert_eq!(
+            palette_selection(&candidates, "workspace: new window", 2, 0),
+            None
+        );
+        // Nothing matches: no selection, whatever the palette shows.
+        assert_eq!(
+            palette_selection(&candidates, "workspace: new workspace", 0, 0),
+            None
         );
     }
 
