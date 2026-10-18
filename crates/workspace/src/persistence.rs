@@ -382,6 +382,205 @@ fn merge_cod_restore_manifest(
     ids
 }
 
+/// Cod (#24): the Cod window registry. One KV document lists every Cod window: its stable key
+/// (created once per window and kept in the window's saved state), its member workspace ids in
+/// window order and its active member. A start restores Cod windows from it instead of finding
+/// them through session bindings, so a start that stops early loses nothing: the document only
+/// changes when a window's membership, order or active member changes, never because a start
+/// re-bound rows to a new session. Quit keeps the entries; closing a window removes its entry.
+const COD_WINDOW_REGISTRY_KEY: &str = "cod_windows";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodWindowEntry {
+    pub key: String,
+    pub workspace_ids: Vec<WorkspaceId>,
+    #[serde(default)]
+    pub active_workspace_id: Option<WorkspaceId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodWindowRegistryRead {
+    /// No registry yet (the first start after the update).
+    Absent,
+    Present(Vec<CodWindowEntry>),
+    /// The document could not be read or parsed. It is kept as it is and never overwritten.
+    Unreadable,
+}
+
+fn parse_cod_window_registry(json: &str) -> CodWindowRegistryRead {
+    match serde_json::from_str::<Vec<CodWindowEntry>>(json) {
+        Ok(entries) => CodWindowRegistryRead::Present(entries),
+        Err(err) => {
+            log::error!("The Cod window registry is unreadable, keeping it: {err:#}");
+            CodWindowRegistryRead::Unreadable
+        }
+    }
+}
+
+pub fn read_cod_window_registry(kvp: &KeyValueStore) -> CodWindowRegistryRead {
+    match kvp.read_kvp(COD_WINDOW_REGISTRY_KEY) {
+        Ok(None) => CodWindowRegistryRead::Absent,
+        Ok(Some(json)) => parse_cod_window_registry(&json),
+        Err(err) => {
+            log::error!("Failed to read the Cod window registry: {err:#}");
+            CodWindowRegistryRead::Unreadable
+        }
+    }
+}
+
+/// Every workspace id the registry holds (empty when it is absent or unreadable).
+pub fn cod_registered_workspace_ids(kvp: &KeyValueStore) -> Vec<WorkspaceId> {
+    match read_cod_window_registry(kvp) {
+        CodWindowRegistryRead::Present(entries) => entries
+            .into_iter()
+            .flat_map(|entry| entry.workspace_ids)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+type CodRegistryWrite = (String, futures::channel::oneshot::Sender<()>);
+
+/// The application-owned copy of the registry and its one writer. Every change edits this copy
+/// on the main thread and queues the whole document to one writer task, which writes the
+/// documents in the order they were made, so two windows saving at once cannot overwrite each
+/// other's entries with an older document.
+#[derive(Default)]
+pub struct CodWindowRegistry {
+    entries: Vec<CodWindowEntry>,
+    /// The registry was read (or seeded) at this start, so it may be written.
+    loaded: bool,
+    /// The start finished restoring its windows. Until then windows do not change the
+    /// registry, so a start that stops early leaves it as the previous run left it.
+    writable: bool,
+    writer: Option<futures::channel::mpsc::UnboundedSender<CodRegistryWrite>>,
+}
+
+impl gpui::Global for CodWindowRegistry {}
+
+impl CodWindowRegistry {
+    fn queue_write(&mut self, cx: &mut App) -> futures::channel::oneshot::Receiver<()> {
+        let (done_tx, done_rx) = futures::channel::oneshot::channel();
+        let json = serde_json::to_string(&self.entries).log_err();
+        if self.writer.is_none() {
+            let (tx, rx) = futures::channel::mpsc::unbounded::<CodRegistryWrite>();
+            let kvp = KeyValueStore::global(cx);
+            cx.spawn(async move |_cx| {
+                use futures::StreamExt as _;
+                let mut rx = rx;
+                while let Some((json, done)) = rx.next().await {
+                    kvp.write_kvp(COD_WINDOW_REGISTRY_KEY.to_string(), json)
+                        .await
+                        .log_err();
+                    done.send(()).ok();
+                }
+            })
+            .detach();
+            self.writer = Some(tx);
+        }
+        if let (Some(json), Some(writer)) = (json, self.writer.as_ref()) {
+            if writer.unbounded_send((json, done_tx)).is_err() {
+                log::error!("The Cod window registry writer stopped");
+            }
+        }
+        done_rx
+    }
+}
+
+/// Resolves once the registry write it stands for is done (at once when nothing was written).
+pub type CodRegistryWriteDone = futures::future::BoxFuture<'static, ()>;
+
+fn cod_registry_done(
+    done: Option<futures::channel::oneshot::Receiver<()>>,
+) -> CodRegistryWriteDone {
+    Box::pin(async move {
+        if let Some(done) = done {
+            done.await.ok();
+        }
+    })
+}
+
+/// Startup: takes the registry read at this start (or seeded from the session) as the copy all
+/// later changes apply to. Windows still do not write until `cod_registry_set_writable`.
+pub fn cod_registry_start(entries: Vec<CodWindowEntry>, cx: &mut App) {
+    let registry = cx.default_global::<CodWindowRegistry>();
+    registry.entries = entries;
+    registry.loaded = true;
+}
+
+/// Startup: writes the whole registry now, for a registry seeded from the session data before
+/// any workspace is re-bound.
+pub fn cod_registry_write_now(cx: &mut App) -> CodRegistryWriteDone {
+    let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
+    let write = registry.queue_write(cx);
+    *cx.default_global::<CodWindowRegistry>() = registry;
+    cod_registry_done(Some(write))
+}
+
+/// Startup finished restoring windows: from now on window changes update the registry. Entries
+/// of windows that did not come back stay.
+pub fn cod_registry_set_writable(cx: &mut App) {
+    let registry = cx.default_global::<CodWindowRegistry>();
+    if registry.loaded {
+        registry.writable = true;
+    }
+}
+
+pub fn cod_registry_is_writable(cx: &App) -> bool {
+    cx.try_global::<CodWindowRegistry>()
+        .is_some_and(|registry| registry.writable)
+}
+
+/// Number of windows in this start's copy of the registry.
+pub fn cod_registry_window_count(cx: &App) -> Option<usize> {
+    cx.try_global::<CodWindowRegistry>()
+        .filter(|registry| registry.loaded)
+        .map(|registry| registry.entries.len())
+}
+
+fn cod_registry_edit<F>(cx: &mut App, edit: F) -> CodRegistryWriteDone
+where
+    F: FnOnce(&mut Vec<CodWindowEntry>) -> bool,
+{
+    let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
+    let write = if registry.writable && edit(&mut registry.entries) {
+        Some(registry.queue_write(cx))
+    } else {
+        None
+    };
+    *cx.default_global::<CodWindowRegistry>() = registry;
+    cod_registry_done(write)
+}
+
+/// Sets a window's entry (members in order and active member), adding it at the end when new.
+pub fn cod_registry_upsert(entry: CodWindowEntry, cx: &mut App) -> CodRegistryWriteDone {
+    cod_registry_edit(cx, move |entries| {
+        let index = entries
+            .iter()
+            .position(|existing| existing.key == entry.key);
+        match index {
+            Some(index) if entries[index] == entry => false,
+            Some(index) => {
+                entries[index] = entry;
+                true
+            }
+            None => {
+                entries.push(entry);
+                true
+            }
+        }
+    })
+}
+
+/// Removes a window's entry, after the user agreed to close the window.
+pub fn cod_registry_remove(key: String, cx: &mut App) -> CodRegistryWriteDone {
+    cod_registry_edit(cx, move |entries| {
+        let len = entries.len();
+        entries.retain(|entry| entry.key != key);
+        entries.len() != len
+    })
+}
+
 pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
@@ -2237,12 +2436,28 @@ impl WorkspaceDb {
         current_session_id: &str,
         last_session_id: Option<&str>,
     ) -> Result<()> {
+        self.cod_garbage_collect_workspaces_keeping(fs, current_session_id, last_session_id, &[])
+            .await
+    }
+
+    /// Cod (#24): `garbage_collect_workspaces` that never deletes the workspaces in `keep` (the
+    /// ids of the Cod window registry).
+    pub async fn cod_garbage_collect_workspaces_keeping(
+        &self,
+        fs: &dyn Fs,
+        current_session_id: &str,
+        last_session_id: Option<&str>,
+        keep: &[WorkspaceId],
+    ) -> Result<()> {
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
         for (id, paths, _identity_paths_hint, remote_connection_id, session_id, timestamp) in
             self.recent_workspaces()?
         {
+            if keep.contains(&id) {
+                continue;
+            }
             if let Some(session_id) = session_id.as_deref() {
                 if session_id == current_session_id || Some(session_id) == last_session_id {
                     continue;
@@ -2908,6 +3123,27 @@ mod tests {
         // A workspace the new window added since is kept after the interrupted list.
         assert_eq!(merge_cod_restore_manifest(&[a, c], &[a, b]), vec![a, b, c]);
         assert_eq!(merge_cod_restore_manifest(&[a, b], &[]), vec![a, b]);
+    }
+
+    #[test]
+    fn test_cod_window_registry_parses_present_empty_and_unreadable() {
+        let json = r#"[{"key":"w1","workspace_ids":[1,2],"active_workspace_id":2}]"#;
+        assert_eq!(
+            parse_cod_window_registry(json),
+            CodWindowRegistryRead::Present(vec![CodWindowEntry {
+                key: "w1".to_string(),
+                workspace_ids: vec![WorkspaceId(1), WorkspaceId(2)],
+                active_workspace_id: Some(WorkspaceId(2)),
+            }])
+        );
+        assert_eq!(
+            parse_cod_window_registry("[]"),
+            CodWindowRegistryRead::Present(vec![])
+        );
+        assert_eq!(
+            parse_cod_window_registry("not json"),
+            CodWindowRegistryRead::Unreadable
+        );
     }
 
     /// Creates a unique directory in a FakeFs, returning the path.
@@ -4814,6 +5050,8 @@ mod tests {
                 sidebar_open: true,
                 sidebar_state: None,
                 cod_workspace_ids: vec![],
+                cod_window_key: None,
+                cod_from_registry: false,
             },
         )
         .await;
@@ -4827,6 +5065,8 @@ mod tests {
                 sidebar_open: false,
                 sidebar_state: None,
                 cod_workspace_ids: vec![],
+                cod_window_key: None,
+                cod_from_registry: false,
             },
         )
         .await;

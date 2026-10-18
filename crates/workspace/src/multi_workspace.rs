@@ -342,6 +342,9 @@ pub struct MultiWorkspace {
     cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
     /// Cod (#24): true while a pending member loads; other activation requests wait for it.
     cod_materializing: bool,
+    /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
+    /// key it was saved under.
+    cod_window_key: String,
     /// Cod (#24): next (true) and previous (false) switches asked for while a pending member
     /// loads; they run in order once it is shown.
     cod_queued_cycles: Vec<bool>,
@@ -414,6 +417,7 @@ impl MultiWorkspace {
             cod_saved_order: Vec::new(),
             cod_pending: std::collections::HashMap::new(),
             cod_materializing: false,
+            cod_window_key: uuid::Uuid::new_v4().to_string(),
             cod_queued_cycles: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
@@ -603,6 +607,17 @@ impl MultiWorkspace {
             }
 
             crate::flush_windows_serialization(&[window_handle], cx).await;
+
+            // Cod (#24): the user agreed to close the window, so it leaves the registry (quit
+            // keeps it there).
+            let registry_removal = window_handle
+                .update(cx, |this, _window, cx| {
+                    crate::persistence::cod_registry_remove(this.cod_window_key.clone(), cx)
+                })
+                .ok();
+            if let Some(registry_removal) = registry_removal {
+                registry_removal.await;
+            }
 
             window_handle
                 .update(cx, |_, window, _cx| {
@@ -1530,12 +1545,33 @@ impl MultiWorkspace {
             sidebar_open: self.sidebar_open,
             sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
             cod_workspace_ids: self.cod_saved_workspace_ids(cx),
+            cod_window_key: Some(self.cod_window_key.clone()),
+            cod_from_registry: false,
         };
+        // Cod (#24): the registry entry of this window follows its saved list. Ids are database
+        // ids, so their workspace rows are already saved.
+        let registry_entry = crate::persistence::CodWindowEntry {
+            key: self.cod_window_key.clone(),
+            workspace_ids: state.cod_workspace_ids.clone(),
+            active_workspace_id: state.active_workspace_id,
+        };
+        let registry_write = crate::persistence::cod_registry_upsert(registry_entry, cx);
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
         async move {
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
+            registry_write.await;
         }
+    }
+
+    /// Cod (#24): this window's key in the Cod window registry.
+    pub fn cod_window_key(&self) -> &str {
+        &self.cod_window_key
+    }
+
+    /// Cod (#24): a restored window takes the registry key it was saved under.
+    pub fn cod_set_window_key(&mut self, key: String) {
+        self.cod_window_key = key;
     }
 
     /// Used by the quit handler to ensure pending DB writes

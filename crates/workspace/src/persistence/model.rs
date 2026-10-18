@@ -117,6 +117,13 @@ pub struct MultiWorkspaceState {
     /// Cod (#24): the database ids of every workspace the window holds, in window order.
     #[serde(default)]
     pub cod_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): the window's key in the Cod window registry, created once per window.
+    #[serde(default)]
+    pub cod_window_key: Option<String>,
+    /// Cod (#24): this state was built from the Cod window registry at startup, so its id list
+    /// is the window's membership as it is (no session-binding checks apply).
+    #[serde(skip)]
+    pub cod_from_registry: bool,
 }
 
 /// The serialized state of a single MultiWorkspace window from a previous session:
