@@ -1283,8 +1283,13 @@ impl MultiWorkspace {
             }
 
             // Nothing saved to open by id: open the folders as a new window, as stock does. The
-            // window still takes the reserved key.
+            // window still takes the reserved key, together with the complete moved membership
+            // (remote members included), so its first save under that key keeps every moved id.
             if members.is_empty() {
+                let moved_membership = cx
+                    .update(|cx| crate::persistence::cod_take_restore_owner_by_key(&move_key, cx))
+                    .map(|owner| owner.workspace_ids)
+                    .unwrap_or_else(|| moved_ids.clone());
                 let opened = cx
                     .update(|cx| {
                         Workspace::new_local(
@@ -1301,7 +1306,8 @@ impl MultiWorkspace {
                 opened
                     .window
                     .update(cx, |multi_workspace, _window, cx| {
-                        multi_workspace.cod_set_window_key(move_key, cx);
+                        multi_workspace.cod_adopt_moved_group(move_key, moved_membership, cx);
+                        multi_workspace.serialize(cx);
                     })
                     .ok();
                 return Ok(());
@@ -1828,6 +1834,25 @@ impl MultiWorkspace {
         }
         let first_key = std::mem::replace(&mut self.cod_window_key, key.clone());
         drop(crate::persistence::cod_registry_rename(first_key, key, cx));
+    }
+
+    /// Cod (#24): a window opened for a moving group whose members could not be opened by id
+    /// (remote members, or rows not found) takes the reserved key and the complete moved
+    /// membership in the same step, so every save under that key keeps each moved id. The
+    /// moved members stay saved and not loaded; the window's own workspace stays a member.
+    pub fn cod_adopt_moved_group(
+        &mut self,
+        key: String,
+        workspace_ids: Vec<WorkspaceId>,
+        cx: &mut App,
+    ) {
+        self.cod_set_window_key(key, cx);
+        for id in &workspace_ids {
+            if !self.cod_unrestored_workspace_ids.contains(id) {
+                self.cod_unrestored_workspace_ids.push(*id);
+            }
+        }
+        self.cod_saved_order = workspace_ids;
     }
 
     /// Cod (#24): a window just built for a remote restore (its first workspace is a placeholder)
