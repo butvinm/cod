@@ -597,13 +597,9 @@ impl MultiWorkspace {
                 CodMember::Pending(id) => Some(id),
             })
             .collect();
-        // Registry edits apply while the start still restores this window, so members of the
-        // saved list that are not back yet stay in it.
-        for id in self
-            .cod_removing_workspace_ids
-            .iter()
-            .chain(self.cod_unrestored_workspace_ids.iter())
-        {
+        // Members of the saved list that are not back yet are pending members above, so a
+        // registry edit made while the start still restores this window keeps them.
+        for id in &self.cod_removing_workspace_ids {
             if !ids.contains(id) {
                 ids.push(*id);
             }
