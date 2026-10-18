@@ -229,6 +229,8 @@ class WorkspacesTest(CodTestCase):
         """Opens the file with the file finder (ctrl-p), as in story #22."""
         self.keys("ctrl-p")
         self.wait_for(lambda state: state["modal"] == "file_finder", 10, "the file finder to open")
+        # Keys sent before the finder is drawn reach no element of it and are lost (beta run 39128519357).
+        self.wait_for(lambda state: state["file_finder_ready"], 10, "the file finder to be drawn with the focus")
         self.type(name)
         self.keys("enter")
         self.wait_for(

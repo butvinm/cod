@@ -701,6 +701,16 @@ fn read_state(
     let prompt = prompt_state(window, memory, cx);
     let project_panel = project_panel_state(workspace, window, cx);
     let rename = rename_input(multi_workspace, window, cx);
+    // Whether the file finder is in the frame the window drew last and holds the focus there, so
+    // typed keys reach its query: an action only the finder's element handles is available from
+    // its focus handle in that frame.
+    let file_finder_ready = workspace
+        .active_modal::<file_finder::FileFinder>(cx)
+        .is_some_and(|finder| {
+            let focus_handle = finder.read(cx).focus_handle(cx);
+            focus_handle.contains_focused(window, cx)
+                && window.is_action_available_in(&file_finder::OpenWithoutDismiss, &focus_handle)
+        });
     let modal = if workspace
         .active_modal::<file_finder::FileFinder>(cx)
         .is_some()
@@ -736,6 +746,7 @@ fn read_state(
         "palette": palette,
         "palette_selection": selection,
         "path_prompt": path_prompt,
+        "file_finder_ready": file_finder_ready,
         "prompt": prompt,
     }))
 }
