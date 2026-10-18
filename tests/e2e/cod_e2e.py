@@ -9,7 +9,7 @@ The protocol is one JSON object per line, one JSON reply per line:
 
 Every reply has "ok". A failed command replies {"ok": false, "error": "..."}.
 Actions go through keys and typing only, never through private calls that a user cannot make. "state" only observes what the user sees.
-CodTestCase.state() adds "window_title", the title the compositor shows for Cod's window, read from sway (the platform cannot read a Wayland title back).
+CodTestCase.state() adds "window_title", the title the compositor shows for Cod's window, and "sway_windows", sway's ids of Cod's windows, both read from sway (the platform cannot read a Wayland title back).
 
 Run the tests with script/e2e, which builds Cod, assembles a run folder like the release tarball and starts a private headless sway.
 See tests/e2e/README.md.
@@ -71,6 +71,11 @@ def expect_equal(what: str, expected: Any, actual: Any) -> None:
     """Fails with a message that names what was checked, the expected value and the actual value."""
     if expected != actual:
         raise AssertionError(failure_message(what, expected, actual))
+
+
+def differences(what: str, expected: Mapping[str, Any], actual: Mapping[str, Any]) -> list[str]:
+    """One failure message for each key of expected whose value differs in actual (a missing key counts as None), for example: expected workspace A split 'vertical', actual None."""
+    return [failure_message(f"{what} {key}", value, actual.get(key)) for key, value in expected.items() if actual.get(key) != value]
 
 
 @contextlib.contextmanager
@@ -250,8 +255,8 @@ def cod_settings() -> dict[str, Any]:
 
     Trusted worktrees, so no trust prompt covers the window.
     No unsolicited network work: no automatic install of the html extension, no extension or app updates, no telemetry.
-    Zed's own path picker and prompts instead of the system dialogs: the headless sway has no desktop portal, and the driver can read Zed's picker.
-    No command history in the palette, so the palette ranks matches by the query alone and the driver can tell which command is highlighted.
+    Zed's own path picker and prompts instead of the system dialogs: the headless sway has no desktop portal, and the driver can read Zed's picker and prompts.
+    No command history in the palette, so the palette ranks matches by the query alone and earlier commands of a test never change which row a command name highlights.
     """
     return {
         "session": {"trust_all_worktrees": True},
@@ -285,18 +290,23 @@ def sway_socket(runtime_dir: Path) -> Path | None:
     return sockets[0] if sockets else None
 
 
-def window_titles(tree: Mapping[str, Any], pids: set[int]) -> list[tuple[str | None, bool]]:
-    """(title, focused) of every window in sway's tree (swaymsg -t get_tree) whose process is one of pids."""
-    found: list[tuple[str | None, bool]] = []
+def compositor_windows(tree: Mapping[str, Any], pids: set[int]) -> list[dict[str, Any]]:
+    """{"id", "title", "focused"} of every window in sway's tree (swaymsg -t get_tree) whose process is one of pids, in tree order. The id is sway's id of the window."""
+    found: list[dict[str, Any]] = []
 
     def walk(node: Mapping[str, Any]) -> None:
         if node.get("pid") in pids and node.get("type") in ("con", "floating_con"):
-            found.append((node.get("name"), bool(node.get("focused"))))
+            found.append({"id": node.get("id"), "title": node.get("name"), "focused": bool(node.get("focused"))})
         for child in [*node.get("nodes", []), *node.get("floating_nodes", [])]:
             walk(child)
 
     walk(tree)
     return found
+
+
+def window_titles(tree: Mapping[str, Any], pids: set[int]) -> list[tuple[str | None, bool]]:
+    """(title, focused) of every window in sway's tree (swaymsg -t get_tree) whose process is one of pids."""
+    return [(window["title"], window["focused"]) for window in compositor_windows(tree, pids)]
 
 
 def window_title(windows: list[tuple[str | None, bool]]) -> str | None:
@@ -558,13 +568,19 @@ class CodTestCase(unittest.TestCase):
         self.driver.type(text)
 
     def state(self) -> dict[str, Any]:
-        """The driver's state plus "window_title": the title sway shows for Cod's window."""
+        """The driver's state plus what sway shows: "window_title", the title of Cod's window, and "sway_windows", sway's ids of Cod's windows."""
         state = self.driver.state()
-        state["window_title"] = self.window_title()
+        windows = self.compositor_windows()
+        state["window_title"] = window_title([(window["title"], window["focused"]) for window in windows])
+        state["sway_windows"] = [window["id"] for window in windows]
         return state
 
     def window_title(self) -> str | None:
         """The title of Cod's window as the compositor shows it (the focused one when there are several), or None when Cod has no window."""
+        return window_title([(window["title"], window["focused"]) for window in self.compositor_windows()])
+
+    def compositor_windows(self) -> list[dict[str, Any]]:
+        """Cod's windows as sway shows them: {"id", "title", "focused"} each."""
         if self.cod is None:
             raise DriverError("Cod is not running: call start_cod first")
         runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -580,7 +596,7 @@ class CodTestCase(unittest.TestCase):
         if reply.returncode != 0:
             raise DriverError(f"swaymsg failed with status {reply.returncode}: {reply.stderr.strip()}")
         pids = set(processes_with_marker(self.cod.marker))
-        return window_title(window_titles(json.loads(reply.stdout), pids))
+        return compositor_windows(json.loads(reply.stdout), pids)
 
     def wait_for(self, predicate: Callable[[dict[str, Any]], bool], timeout: float, description: str) -> dict[str, Any]:
         """Reads the state until predicate(state) is true and returns that state. Fails after timeout seconds."""
@@ -591,6 +607,23 @@ class CodTestCase(unittest.TestCase):
                 return state
             if time.monotonic() >= deadline:
                 raise AssertionError(f"timed out after {timeout:g} s waiting for {description}; last state: {json.dumps(state)}")
+            time.sleep(POLL_INTERVAL)
+
+    def wait_for_values(
+        self, what: str, expected: Mapping[str, Any], read: Callable[[dict[str, Any]], Mapping[str, Any]], timeout: float
+    ) -> dict[str, Any]:
+        """Reads the state until read(state) has every value of expected, and returns that state.
+
+        Fails after timeout seconds with one "expected <what> <key> ..., actual ..." message per value that still differs, then the last state.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.state()
+            problems = differences(what, expected, read(state))
+            if not problems:
+                return state
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"timed out after {timeout:g} s waiting for {what}: {'; '.join(problems)}; last state: {json.dumps(state)}")
             time.sleep(POLL_INTERVAL)
 
     # Checks and failures

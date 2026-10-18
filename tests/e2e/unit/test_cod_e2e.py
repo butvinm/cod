@@ -25,6 +25,13 @@ class MessagesTest(unittest.TestCase):
             "expected active tab 'ledger.rs', actual 'invoice.rs'",
         )
 
+    def test_differences_name_each_differing_value(self) -> None:
+        self.assertEqual(
+            cod_e2e.differences("workspace A", {"split": "vertical", "active_tab": "ledger.rs", "cursor": None}, {"split": None, "active_tab": "ledger.rs"}),
+            ["expected workspace A split 'vertical', actual None"],
+        )
+        self.assertEqual(cod_e2e.differences("workspace A", {"split": None}, {"split": None}), [])
+
     def test_failure_message_shows_a_missing_value(self) -> None:
         self.assertEqual(cod_e2e.failure_message("active tab", "invoice.rs", None), "expected active tab 'invoice.rs', actual None")
 
@@ -230,7 +237,7 @@ class StartCommandTest(unittest.TestCase):
         # The headless sway has no desktop portal: Zed's own path picker and prompts must render (assets/settings/default.json).
         self.assertIs(settings["use_system_path_prompts"], False)
         self.assertIs(settings["use_system_prompts"], False)
-        # Without history the palette ranks by the query alone, which the driver needs to name the highlighted command.
+        # Without history the palette ranks by the query alone, so earlier commands of a test never change which row a command name highlights.
         self.assertEqual(settings["command_palette"], {"use_command_history": False})
 
 
@@ -287,7 +294,7 @@ class RunCommandTest(unittest.TestCase):
         sample = self.Sample("test_sample")
         driver = StubDriver(states)
         sample.cod = mock.Mock(driver=driver)
-        patcher = mock.patch.object(sample, "window_title", return_value=None)
+        patcher = mock.patch.object(sample, "compositor_windows", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
         return sample, driver
@@ -299,6 +306,31 @@ class RunCommandTest(unittest.TestCase):
         sample, driver = self.sample([palette, palette, ready, closed])
         sample.run_command("workspace: new workspace", timeout=5)
         self.assertEqual(driver.actions, [("keys", "ctrl-shift-p"), ("type", "workspace: new workspace"), ("keys", "enter")])
+
+    def test_state_adds_what_sway_shows(self) -> None:
+        sample, _ = self.sample([{"modal": None}])
+        windows = [{"id": 7, "title": "billing-api", "focused": False}, {"id": 9, "title": "docs-site", "focused": True}]
+        with mock.patch.object(sample, "compositor_windows", return_value=windows):
+            state = sample.state()
+        self.assertEqual(state, {"modal": None, "window_title": "docs-site", "sway_windows": [7, 9]})
+
+    def test_wait_for_values_returns_the_first_state_with_every_value(self) -> None:
+        early = {"split": None, "panes": [{"tabs": ["invoice.rs"]}]}
+        done = {"split": "vertical", "panes": [{"tabs": ["invoice.rs"]}, {"tabs": ["ledger.rs"]}]}
+        sample, _ = self.sample([early, early, done])
+        state = sample.wait_for_values("workspace A", {"split": "vertical", "panes": done["panes"]}, lambda state: state, timeout=5)
+        self.assertEqual(state["split"], "vertical")
+
+    def test_wait_for_values_names_every_value_that_differs(self) -> None:
+        sample, _ = self.sample([{"split": None, "active_tab": "ledger.rs", "cursor": None}])
+        with self.assertRaises(AssertionError) as caught:
+            sample.wait_for_values(
+                "workspace A", {"split": "vertical", "active_tab": "ledger.rs", "cursor": {"row": 18}}, lambda state: state, timeout=0.2
+            )
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("timed out after 0.2 s waiting for workspace A: "), message)
+        self.assertIn("expected workspace A split 'vertical', actual None; expected workspace A cursor {'row': 18}, actual None", message)
+        self.assertNotIn("workspace A active_tab", message)
 
     def test_never_presses_enter_on_another_command(self) -> None:
         near = {
@@ -359,6 +391,16 @@ class SwayTest(unittest.TestCase):
             }
         ],
     }
+
+    def test_compositor_windows_of_the_cod_processes_with_their_ids(self) -> None:
+        tree = json.loads(json.dumps(self.TREE))
+        tree["nodes"][0]["nodes"][0]["nodes"][0]["id"] = 12
+        tree["nodes"][0]["nodes"][0]["floating_nodes"][0]["id"] = 15
+        self.assertEqual(
+            cod_e2e.compositor_windows(tree, {41, 42}),
+            [{"id": 12, "title": "billing-api - invoice.rs", "focused": False}, {"id": 15, "title": "docs-site", "focused": True}],
+        )
+        self.assertEqual(cod_e2e.compositor_windows(tree, {7}), [])
 
     def test_window_titles_of_the_cod_processes(self) -> None:
         self.assertEqual(
