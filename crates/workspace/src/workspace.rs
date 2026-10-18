@@ -10345,6 +10345,23 @@ pub async fn restore_multiworkspace(
         state,
     } = multi_workspace;
 
+    // Cod (#24): restoring a member re-binds it to this session and the new window before the
+    // window saves its list under its new id. Store the full ordered list first, keyed by every
+    // member, so a crash in between still finds every member at the next start.
+    let manifest: Vec<WorkspaceId> = if state.cod_workspace_ids.is_empty() {
+        std::iter::once(active_workspace.workspace_id)
+            .chain(other_workspaces.iter().map(|other| other.workspace_id))
+            .collect()
+    } else {
+        state.cod_workspace_ids.clone()
+    };
+    let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    if manifest.len() > 1 {
+        persistence::write_cod_restore_manifest(&kvp, &manifest)
+            .await
+            .log_err();
+    }
+
     let workspace_result = if active_workspace.paths.is_empty() {
         cx.update(|cx| {
             open_workspace_by_id(active_workspace.workspace_id, app_state.clone(), None, cx)
@@ -10505,13 +10522,23 @@ pub async fn restore_multiworkspace(
         }
     }
     // Opening a hidden workspace can move the focus into it; give it back to the active one.
-    window_handle
+    let saved_list = window_handle
         .update(cx, |multi_workspace, window, cx| {
             multi_workspace.cod_finish_restore(cx);
             multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
             multi_workspace.focus_active_workspace(window, cx);
+            multi_workspace.cod_save_workspace_list_now(cx)
         })
         .ok();
+    // Only once the window's list is saved under its new id may the restore list go.
+    if let Some(saved_list) = saved_list {
+        saved_list.await;
+        if manifest.len() > 1 {
+            persistence::delete_cod_restore_manifest(&kvp, &manifest)
+                .await
+                .log_err();
+        }
+    }
 
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 

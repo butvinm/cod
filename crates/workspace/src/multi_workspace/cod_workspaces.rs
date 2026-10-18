@@ -389,6 +389,14 @@ impl MultiWorkspace {
         self.cod_unrestored_workspace_ids = saved.to_vec();
     }
 
+    /// Saves the window's state with its workspace list now; the future ends once it is written.
+    pub fn cod_save_workspace_list_now(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl std::future::Future<Output = ()> + use<> {
+        self.serialize_now(cx)
+    }
+
     /// Drops from the saved list the ids of workspaces that were closed (no session binding)
     /// but were still listed when the app stopped.
     pub fn cod_forget_closed_workspaces(&mut self, closed: &[WorkspaceId]) {

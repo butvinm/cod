@@ -324,6 +324,64 @@ pub async fn write_multi_workspace_state(
     }
 }
 
+/// Cod (#24): while a window's workspaces come back, each member's id maps to the window's full
+/// ordered workspace list. Restoring a member re-binds it to the new session and window before
+/// the window saves its list under its new id; a crash in between would leave the members not
+/// yet re-bound out of the next start. The next start merges this list in (see
+/// `read_serialized_multi_workspaces`); a finished restore removes it.
+const COD_RESTORE_MANIFEST_SCOPE: &str = "cod_restore_manifest";
+
+fn cod_manifest_key(id: WorkspaceId) -> String {
+    i64::from(id).to_string()
+}
+
+pub(crate) async fn write_cod_restore_manifest(
+    kvp: &KeyValueStore,
+    ids: &[WorkspaceId],
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(ids)?;
+    let scope = kvp.scoped(COD_RESTORE_MANIFEST_SCOPE);
+    for id in ids {
+        scope.write(cod_manifest_key(*id), json.clone()).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_cod_restore_manifest(
+    kvp: &KeyValueStore,
+    ids: &[WorkspaceId],
+) -> anyhow::Result<()> {
+    let scope = kvp.scoped(COD_RESTORE_MANIFEST_SCOPE);
+    for id in ids {
+        scope.delete(cod_manifest_key(*id)).await?;
+    }
+    Ok(())
+}
+
+fn read_cod_restore_manifest(kvp: &KeyValueStore, id: WorkspaceId) -> Vec<WorkspaceId> {
+    kvp.scoped(COD_RESTORE_MANIFEST_SCOPE)
+        .read(&cod_manifest_key(id))
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// The saved list of an interrupted restore first, in its order, then the ids the window saved
+/// since that are not in it.
+fn merge_cod_restore_manifest(
+    saved: &[WorkspaceId],
+    interrupted: &[WorkspaceId],
+) -> Vec<WorkspaceId> {
+    let mut ids = interrupted.to_vec();
+    for id in saved {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    ids
+}
+
 pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
@@ -350,9 +408,18 @@ pub fn read_serialized_multi_workspaces(
         .into_iter()
         .filter_map(|mut group| {
             let window_id = group.first().and_then(|sw| sw.window_id);
-            let state = window_id
+            let mut state: model::MultiWorkspaceState = window_id
                 .map(|wid| read_multi_workspace_state(wid, cx))
                 .unwrap_or_default();
+            // Cod (#24): a restore that stopped half way left its full list behind.
+            let kvp = KeyValueStore::global(cx);
+            for member in &group {
+                let interrupted = read_cod_restore_manifest(&kvp, member.workspace_id);
+                if !interrupted.is_empty() {
+                    state.cod_workspace_ids =
+                        merge_cod_restore_manifest(&state.cod_workspace_ids, &interrupted);
+                }
+            }
             let index = state
                 .active_workspace_id
                 .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
@@ -2828,6 +2895,16 @@ mod tests {
     use remote::SshConnectionOptions;
     use serde_json::json;
     use std::{thread, time::Duration};
+
+    #[test]
+    fn test_cod_interrupted_restore_list_comes_first() {
+        let [a, b, c] = [WorkspaceId(1), WorkspaceId(2), WorkspaceId(3)];
+        // The new window saved only A before the crash; B stays in the merged list.
+        assert_eq!(merge_cod_restore_manifest(&[a], &[b, a]), vec![b, a]);
+        // A workspace the new window added since is kept after the interrupted list.
+        assert_eq!(merge_cod_restore_manifest(&[a, c], &[a, b]), vec![a, b, c]);
+        assert_eq!(merge_cod_restore_manifest(&[a, b], &[]), vec![a, b]);
+    }
 
     /// Creates a unique directory in a FakeFs, returning the path.
     /// Uses a UUID suffix to avoid collisions with other tests sharing the global DB.
