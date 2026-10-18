@@ -4985,6 +4985,25 @@ impl Workspace {
     }
 
     fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        self.cod_add_pane(true, window, cx)
+    }
+
+    /// Cod (#24): a pane created while a workspace restores. It never takes the focus; the
+    /// restore focuses once, after the whole tree and the docks are installed.
+    pub(crate) fn cod_add_restored_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
+        self.cod_add_pane(false, window, cx)
+    }
+
+    fn cod_add_pane(
+        &mut self,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(
                 self.weak_handle(),
@@ -5005,7 +5024,7 @@ impl Workspace {
 
         // Cod (#24): a pane added to a workspace the window does not show stays unfocused; a
         // focused pane that is not drawn would take the keys away from the shown workspace.
-        if self.owns_window_chrome() {
+        if focus && self.owns_window_chrome() {
             window.focus(&pane.focus_handle(cx), cx);
         }
 
@@ -8072,6 +8091,7 @@ impl Workspace {
 
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
+                let restored_center = center_group.is_some();
                 if let Some((center_group, active_pane)) = center_group {
                     workspace.remove_panes(workspace.center.root.clone(), window, cx);
 
@@ -8082,11 +8102,6 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        // Cod (#24): a workspace restored behind the active one does not take
-                        // the focus; it focuses its active pane when it is shown.
-                        if workspace.cod_restore_may_focus(cx) {
-                            workspace.cod_focus_restored(window, cx);
-                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
@@ -8104,6 +8119,13 @@ impl Workspace {
                     dock.update(cx, |dock, cx| {
                         dock.restore_serialized_state(serialized_dock.clone(), window, cx);
                     });
+                }
+
+                // Cod (#24): the restored panes and items took no focus. Focus once, now that
+                // the tree and the docks are installed, and only for the shown workspace with
+                // no modal open; a workspace restored behind it focuses when it is shown.
+                if restored_center && workspace.cod_restore_may_focus(cx) {
+                    workspace.cod_focus_restored(window, cx);
                 }
 
                 workspace.restoring_workspace = false;

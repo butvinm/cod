@@ -307,7 +307,7 @@ impl SerializedPaneGroup {
             SerializedPaneGroup::Pane(serialized_pane) => {
                 let pane = workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_pane(window, cx).downgrade()
+                        workspace.cod_add_restored_pane(window, cx).downgrade()
                     })
                     .log_err()?;
                 let active = serialized_pane.active;
@@ -396,11 +396,11 @@ impl SerializedPane {
 
             if let Some(item_handle) = item_handle {
                 pane.update_in(cx, |pane, window, cx| {
-                    // Cod (#24): a workspace restored behind the shown one, or under a modal
-                    // the user opened, adds its items without taking the focus.
+                    // Cod (#24): a restoring workspace adds its items without taking the focus;
+                    // the restore focuses once, after the tree and the docks are installed.
                     let focus_item = workspace
                         .upgrade()
-                        .is_none_or(|workspace| workspace.read(cx).cod_restore_may_focus(cx));
+                        .is_none_or(|workspace| !workspace.read(cx).cod_restore_in_progress);
                     pane.add_item(item_handle.clone(), true, focus_item, None, window, cx);
                 })?;
             }
