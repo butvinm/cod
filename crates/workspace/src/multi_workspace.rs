@@ -1151,11 +1151,16 @@ impl MultiWorkspace {
                     }
                 }
                 CodMember::Pending(id) => {
+                    // The same identity as a loaded member's group key: a linked worktree
+                    // belongs to the group of its main repository.
                     let in_group = group_is_local
-                        && self
+                        && (self
                             .cod_pending
                             .get(&id)
-                            .is_some_and(|paths| PathList::new(paths) == *key.path_list());
+                            .is_some_and(|paths| PathList::new(paths) == *key.path_list())
+                            || self
+                                .cod_pending_group_paths(id)
+                                .is_some_and(|paths| paths == *key.path_list()));
                     if in_group && !moved_ids.contains(&id) {
                         moved_ids.push(id);
                         pending_ids.push(id);

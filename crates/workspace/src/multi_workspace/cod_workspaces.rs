@@ -377,6 +377,21 @@ impl MultiWorkspace {
         })
     }
 
+    /// The project group key paths of a pending local member: each folder that is a linked git
+    /// worktree stands for its main repository, as for a loaded workspace's group key. Other
+    /// folders (plain checkouts, submodules, non-git folders) stand for themselves.
+    pub(super) fn cod_pending_group_paths(
+        &self,
+        id: WorkspaceId,
+    ) -> Option<util::path_list::PathList> {
+        let paths = self.cod_pending.get(&id)?;
+        let mains: Vec<std::path::PathBuf> = paths
+            .iter()
+            .map(|path| cod_linked_worktree_main_path(path).unwrap_or_else(|| path.clone()))
+            .collect();
+        Some(util::path_list::PathList::new(&mains))
+    }
+
     /// The pending members of this window with the folders of each, in saved order.
     pub fn cod_pending_members(&self) -> Vec<(WorkspaceId, Vec<std::path::PathBuf>)> {
         let mut members: Vec<(WorkspaceId, Vec<std::path::PathBuf>)> = self
@@ -724,4 +739,18 @@ impl MultiWorkspace {
         self.serialize(cx);
         cx.notify();
     }
+}
+
+/// Cod (#24): the main repository folder of a linked git worktree, read from its `.git` file
+/// (`gitdir: <dir>`) and that directory's `commondir` file. None for anything else.
+fn cod_linked_worktree_main_path(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dot_git = std::fs::read_to_string(folder.join(".git")).ok()?;
+    let gitdir = dot_git.trim().strip_prefix("gitdir:")?.trim();
+    let gitdir = folder.join(gitdir);
+    let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(gitdir.join(commondir.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(|main| main.to_path_buf())
 }
