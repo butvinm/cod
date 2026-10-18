@@ -992,7 +992,13 @@ fn main() {
             async move |cx| {
                 restore_finished.await;
                 // Cod (#24): workspaces in the Cod window registry are never collected.
-                let registered = cx.update(|cx| workspace::cod_registered_workspace_ids(cx));
+                // An unreadable registry hides which workspaces it protects: skip the cleanup.
+                let Some(registered) =
+                    cx.update(|cx| workspace::cod_registered_workspace_ids(cx))
+                else {
+                    log::warn!("Skipping workspace cleanup: the Cod window registry is unreadable");
+                    return anyhow::Ok(());
+                };
                 db.cod_garbage_collect_workspaces_keeping(
                     fs.as_ref(),
                     &current_session_id,

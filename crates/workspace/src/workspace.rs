@@ -10901,7 +10901,8 @@ pub fn cod_registry_window_count(cx: &App) -> Option<usize> {
 }
 
 /// Cod (#24): every workspace id the stored registry holds; the database cleanup keeps them.
-pub fn cod_registered_workspace_ids(cx: &App) -> Vec<WorkspaceId> {
+/// `None` when the registry is present but unreadable, so the cleanup must not run.
+pub fn cod_registered_workspace_ids(cx: &App) -> Option<Vec<WorkspaceId>> {
     persistence::cod_registered_workspace_ids(&db::kvp::KeyValueStore::global(cx))
 }
 

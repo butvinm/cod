@@ -428,14 +428,18 @@ pub fn read_cod_window_registry(kvp: &KeyValueStore) -> CodWindowRegistryRead {
     }
 }
 
-/// Every workspace id the registry holds (empty when it is absent or unreadable).
-pub fn cod_registered_workspace_ids(kvp: &KeyValueStore) -> Vec<WorkspaceId> {
+/// Every workspace id the registry holds (empty when it is absent). `None` when the registry is
+/// present but unreadable: its members are unknown, so nothing may be collected.
+pub fn cod_registered_workspace_ids(kvp: &KeyValueStore) -> Option<Vec<WorkspaceId>> {
     match read_cod_window_registry(kvp) {
-        CodWindowRegistryRead::Present(entries) => entries
-            .into_iter()
-            .flat_map(|entry| entry.workspace_ids)
-            .collect(),
-        _ => Vec::new(),
+        CodWindowRegistryRead::Present(entries) => Some(
+            entries
+                .into_iter()
+                .flat_map(|entry| entry.workspace_ids)
+                .collect(),
+        ),
+        CodWindowRegistryRead::Absent => Some(Vec::new()),
+        CodWindowRegistryRead::Unreadable => None,
     }
 }
 
