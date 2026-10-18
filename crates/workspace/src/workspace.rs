@@ -10543,7 +10543,10 @@ pub async fn restore_multiworkspace(
         state.cod_workspace_ids.clone()
     };
     let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
-    if manifest.len() > 1 {
+    // A window from the registry needs no restore list: the registry keeps its members until
+    // the window itself changes them.
+    let write_manifest = manifest.len() > 1 && !state.cod_from_registry;
+    if write_manifest {
         persistence::write_cod_restore_manifest(&kvp, &manifest)
             .await
             .log_err();
@@ -10624,9 +10627,13 @@ pub async fn restore_multiworkspace(
     // for the next start.
     window_handle
         .update(cx, |multi_workspace, _window, _cx| {
+            if let Some(key) = state.cod_window_key.clone() {
+                multi_workspace.cod_set_window_key(key);
+            }
             multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
         })
         .ok();
+    let from_registry = state.cod_from_registry;
     let mut other_workspaces = other_workspaces;
     let missing_ids: Vec<WorkspaceId> = state
         .cod_workspace_ids
@@ -10648,15 +10655,19 @@ pub async fn restore_multiworkspace(
                 let mut closed = Vec::new();
                 for id in missing_ids {
                     // A workspace closed from the window has no session binding any more; a
-                    // crash before its id left the list must not bring it back.
-                    let bound = db
-                        .select_row_bound::<WorkspaceId, Option<String>>(
+                    // crash before its id left the list must not bring it back. The registry
+                    // drops a closed workspace itself, so its members need no such check.
+                    let bound = if from_registry {
+                        Some(String::new())
+                    } else {
+                        db.select_row_bound::<WorkspaceId, Option<String>>(
                             "SELECT session_id FROM workspaces WHERE workspace_id = ?",
                         )
                         .and_then(|mut select| select(id))
                         .log_err()
                         .flatten()
-                        .flatten();
+                        .flatten()
+                    };
                     if bound.is_none() {
                         closed.push(id);
                         continue;
@@ -10739,7 +10750,7 @@ pub async fn restore_multiworkspace(
     // Only once the window's list is saved under its new id may the restore list go.
     if let Some(saved_list) = saved_list {
         saved_list.await;
-        if manifest.len() > 1 {
+        if write_manifest {
             persistence::delete_cod_restore_manifest(&kvp, &manifest)
                 .await
                 .log_err();
@@ -10755,6 +10766,138 @@ pub async fn restore_multiworkspace(
         .ok();
 
     Ok(window_handle)
+}
+
+/// Cod (#24): whether the Cod window registry was never written in this database (the first
+/// start after the update). An unreadable registry is not absent.
+pub fn cod_window_registry_absent(cx: &App) -> bool {
+    let kvp = db::kvp::KeyValueStore::global(cx);
+    matches!(
+        persistence::read_cod_window_registry(&kvp),
+        persistence::CodWindowRegistryRead::Absent
+    )
+}
+
+/// Cod (#24): the windows of the Cod window registry, ready to restore (the shown member by id,
+/// the others as pending members), or `None` when there is no readable registry and the caller
+/// takes the stock session path. A present but empty registry gives no windows. Takes the
+/// registry as this start's copy, so windows that do not come back keep their entries.
+pub fn cod_registry_multi_workspaces(cx: &mut App) -> Option<Vec<SerializedMultiWorkspace>> {
+    let kvp = db::kvp::KeyValueStore::global(cx);
+    let entries = match persistence::read_cod_window_registry(&kvp) {
+        persistence::CodWindowRegistryRead::Present(entries) => entries,
+        _ => return None,
+    };
+    persistence::cod_registry_start(entries.clone(), cx);
+    let db = WorkspaceDb::global(cx);
+    let mut windows = Vec::new();
+    for entry in entries {
+        let mut members: Vec<SessionWorkspace> = Vec::new();
+        for id in &entry.workspace_ids {
+            match db.workspace_for_id(*id) {
+                Some(saved) => members.push(SessionWorkspace {
+                    workspace_id: *id,
+                    location: saved.location,
+                    paths: saved.paths,
+                    window_id: None,
+                }),
+                None => log::error!("Workspace {id:?} of a registered window was not found"),
+            }
+        }
+        let index = entry
+            .active_workspace_id
+            .and_then(|active| {
+                members
+                    .iter()
+                    .position(|member| member.workspace_id == active)
+            })
+            .unwrap_or(0);
+        if index >= members.len() {
+            continue;
+        }
+        let active_workspace = members.remove(index);
+        windows.push(SerializedMultiWorkspace {
+            state: MultiWorkspaceState {
+                active_workspace_id: Some(active_workspace.workspace_id),
+                cod_workspace_ids: entry.workspace_ids.clone(),
+                cod_window_key: Some(entry.key.clone()),
+                cod_from_registry: true,
+                ..Default::default()
+            },
+            active_workspace,
+            other_workspaces: members,
+        });
+    }
+    Some(windows)
+}
+
+/// Cod (#24): the first start after the update builds the registry from the windows the stock
+/// session path found, before any of them is restored (restoring re-binds their workspaces),
+/// and waits until it is written. Each window keeps its saved key or gets a new one.
+pub async fn cod_seed_window_registry(
+    windows: &mut [SerializedMultiWorkspace],
+    cx: &mut AsyncApp,
+) {
+    let mut entries = Vec::new();
+    for window in windows.iter_mut() {
+        let key = window
+            .state
+            .cod_window_key
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        window.state.cod_window_key = Some(key.clone());
+        let workspace_ids: Vec<WorkspaceId> = if window.state.cod_workspace_ids.is_empty() {
+            std::iter::once(window.active_workspace.workspace_id)
+                .chain(
+                    window
+                        .other_workspaces
+                        .iter()
+                        .map(|other| other.workspace_id),
+                )
+                .collect()
+        } else {
+            window.state.cod_workspace_ids.clone()
+        };
+        entries.push(persistence::CodWindowEntry {
+            key,
+            workspace_ids,
+            active_workspace_id: Some(window.active_workspace.workspace_id),
+        });
+    }
+    let write = cx.update(|cx| {
+        persistence::cod_registry_start(entries, cx);
+        persistence::cod_registry_write_now(cx)
+    });
+    write.await;
+}
+
+/// Cod (#24): the start restored its windows. From now on every window change updates the
+/// registry, and every open window saves its entry now (entries of windows that did not come
+/// back stay).
+pub fn cod_finish_registry_startup(cx: &mut App) {
+    persistence::cod_registry_set_writable(cx);
+    if !persistence::cod_registry_is_writable(cx) {
+        return;
+    }
+    for window in cx.windows() {
+        if let Some(window) = window.downcast::<MultiWorkspace>() {
+            window
+                .update(cx, |multi_workspace, _window, cx| {
+                    multi_workspace.serialize(cx);
+                })
+                .ok();
+        }
+    }
+}
+
+/// Cod (#24): the number of windows in the registry copy of this start, if it has one.
+pub fn cod_registry_window_count(cx: &App) -> Option<usize> {
+    persistence::cod_registry_window_count(cx)
+}
+
+/// Cod (#24): every workspace id the stored registry holds; the database cleanup keeps them.
+pub fn cod_registered_workspace_ids(cx: &App) -> Vec<WorkspaceId> {
+    persistence::cod_registered_workspace_ids(&db::kvp::KeyValueStore::global(cx))
 }
 
 pub async fn apply_restored_multiworkspace_state(

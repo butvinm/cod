@@ -942,10 +942,29 @@ fn main() {
                     }
                 }
             }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
-            }
+            Some(request) => cx.spawn({
+                let app_state = app_state.clone();
+                async move |cx| {
+                    // Cod (#24): a launch with folders brings the registered Cod windows back
+                    // as a plain launch does, then opens the folders as stock does.
+                    let registry_windows =
+                        cx.update(|cx| workspace::cod_registry_multi_workspaces(cx));
+                    for window in registry_windows.unwrap_or_default() {
+                        if matches!(
+                            window.active_workspace.location,
+                            SerializedWorkspaceLocation::Local
+                        ) {
+                            restore_multiworkspace(window, app_state.clone(), cx)
+                                .await
+                                .log_err();
+                        }
+                    }
+                    cx.update(|cx| {
+                        workspace::cod_finish_registry_startup(cx);
+                        handle_open_request(request, app_state, cx);
+                    });
+                }
+            }),
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
@@ -970,12 +989,15 @@ fn main() {
             let db = workspace::WorkspaceDb::global(cx);
             let fs = app_state.fs.clone();
             let restore_finished = restore_finished.clone();
-            async move |_cx| {
+            async move |cx| {
                 restore_finished.await;
-                db.garbage_collect_workspaces(
+                // Cod (#24): workspaces in the Cod window registry are never collected.
+                let registered = cx.update(|cx| workspace::cod_registered_workspace_ids(cx));
+                db.cod_garbage_collect_workspaces_keeping(
                     fs.as_ref(),
                     &current_session_id,
                     last_session_id.as_deref(),
+                    &registered,
                 )
                 .await
             }
@@ -1429,7 +1451,38 @@ pub(crate) async fn restore_or_create_workspace(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
+    // Cod (#24): Cod windows come back from the Cod window registry, not from session
+    // bindings. Without a registry (the first start after the update) the stock session path
+    // finds the windows, and the registry is built from them before any is restored. An
+    // unreadable registry is kept as it is and the stock session path is used.
+    let registry_windows = cx.update(|cx| workspace::cod_registry_multi_workspaces(cx));
+    let restorable = match registry_windows {
+        Some(windows) => Some(windows),
+        None => {
+            let mut restorable = restorable_workspaces(cx, &app_state).await;
+            if cx.update(|cx| workspace::cod_window_registry_absent(cx)) {
+                let mut no_windows: Vec<workspace::SerializedMultiWorkspace> = Vec::new();
+                workspace::cod_seed_window_registry(
+                    restorable.as_mut().unwrap_or(&mut no_windows),
+                    cx,
+                )
+                .await;
+            }
+            restorable
+        }
+    };
+    let result = restore_or_create_from(restorable, app_state, &kvp, cx).await;
+    cx.update(|cx| workspace::cod_finish_registry_startup(cx));
+    result
+}
+
+async fn restore_or_create_from(
+    restorable: Option<Vec<workspace::SerializedMultiWorkspace>>,
+    app_state: Arc<AppState>,
+    kvp: &KeyValueStore,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    if let Some(multi_workspaces) = restorable {
         let mut error_count = 0;
         for multi_workspace in multi_workspaces {
             let result = match &multi_workspace.active_workspace.location {
