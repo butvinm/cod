@@ -582,6 +582,85 @@ pub struct CodWindowRegistry {
     /// Restore owners of the windows this start restores, installed before any window is
     /// created. Each is taken once, by the window built for its shown member.
     restore_owners: Vec<CodRestoreOwner>,
+    /// Remote restorations in progress: a window took the restore owner of a remote shown
+    /// member and connects. A matching remote open waits for it instead of connecting again.
+    remote_restores: Vec<CodRemoteRestore>,
+    next_remote_restore_id: u64,
+}
+
+/// Resolves once a remote restoration is done (connected, failed or cancelled).
+pub type CodRemoteRestoreDone = futures::future::Shared<futures::channel::oneshot::Receiver<()>>;
+
+struct CodRemoteRestore {
+    id: u64,
+    identity: RemoteConnectionIdentity,
+    paths: PathList,
+    done: CodRemoteRestoreDone,
+}
+
+/// Cod (#24): the window built for a remote open takes the restore owner whose shown member is
+/// the remote workspace on `connection` with exactly `paths`, and registers the restoration
+/// before it connects. The restoration is done when the returned sender is dropped or sent.
+pub fn cod_begin_remote_restore(
+    connection: &RemoteConnectionOptions,
+    paths: &[PathBuf],
+    cx: &mut App,
+) -> Option<(CodRestoreOwner, futures::channel::oneshot::Sender<()>)> {
+    if !cx.has_global::<CodWindowRegistry>() {
+        return None;
+    }
+    let identity = remote_connection_identity(connection);
+    let wanted = PathList::new(paths);
+    let registry = cx.global_mut::<CodWindowRegistry>();
+    let index = registry.restore_owners.iter().position(|owner| {
+        owner.members.iter().any(|member| {
+            member.workspace_id == owner.active_workspace_id
+                && match &member.location {
+                    SerializedWorkspaceLocation::Remote(options) => {
+                        remote_connection_identity(options) == identity
+                            && PathList::new(&member.paths) == wanted
+                    }
+                    SerializedWorkspaceLocation::Local => false,
+                }
+        })
+    })?;
+    let owner = registry.restore_owners.remove(index);
+    let (done_tx, done_rx) = futures::channel::oneshot::channel();
+    registry.next_remote_restore_id += 1;
+    let id = registry.next_remote_restore_id;
+    registry.remote_restores.push(CodRemoteRestore {
+        id,
+        identity,
+        paths: wanted,
+        done: futures::future::FutureExt::shared(done_rx),
+    });
+    Some((owner, done_tx))
+}
+
+/// Cod (#24): the remote restoration in progress for the workspace on `connection` with exactly
+/// `paths`, if any: its id and the future that resolves once it is done.
+pub fn cod_remote_restore_in_progress(
+    connection: &RemoteConnectionOptions,
+    paths: &[PathBuf],
+    cx: &App,
+) -> Option<(u64, CodRemoteRestoreDone)> {
+    let registry = cx.try_global::<CodWindowRegistry>()?;
+    let identity = remote_connection_identity(connection);
+    let wanted = PathList::new(paths);
+    registry
+        .remote_restores
+        .iter()
+        .find(|restore| restore.identity == identity && restore.paths == wanted)
+        .map(|restore| (restore.id, restore.done.clone()))
+}
+
+/// Cod (#24): forgets a remote restoration that is done.
+pub fn cod_end_remote_restore(id: u64, cx: &mut App) {
+    if cx.has_global::<CodWindowRegistry>() {
+        cx.global_mut::<CodWindowRegistry>()
+            .remote_restores
+            .retain(|restore| restore.id != id);
+    }
 }
 
 /// Cod (#24): one member of a window that a start restores: its saved id, where it lives

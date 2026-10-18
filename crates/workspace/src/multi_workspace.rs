@@ -1781,6 +1781,25 @@ impl MultiWorkspace {
         drop(crate::persistence::cod_registry_rename(first_key, key, cx));
     }
 
+    /// Cod (#24): a window just built for a remote restore (its first workspace is a placeholder)
+    /// takes the saved key and complete membership of its restore owner, before it can save
+    /// itself. Its first key was never written, so nothing moves in the registry.
+    pub fn cod_adopt_restore_owner(&mut self, owner: crate::persistence::CodRestoreOwner) {
+        self.cod_window_key = owner.key;
+        self.cod_unrestored_workspace_ids = owner.workspace_ids.clone();
+        self.cod_saved_order = owner.workspace_ids;
+    }
+
+    /// Cod (#24): a remote restore that was cancelled before its workspace joined the window.
+    /// The window takes a new key and drops the saved membership, so closing it leaves the
+    /// saved window in the registry for the next start.
+    pub fn cod_release_restore_owner(&mut self) {
+        self.cod_window_key = crate::persistence::cod_new_window_key();
+        self.cod_unrestored_workspace_ids.clear();
+        self.cod_saved_order.clear();
+        self.cod_pending.clear();
+    }
+
     /// Used by the quit handler to ensure pending DB writes
     /// complete before the process exits.
     pub fn flush_serialization(&mut self, cx: &mut Context<Self>) -> Task<()> {

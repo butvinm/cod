@@ -134,6 +134,16 @@ pub async fn open_remote_project(
 ) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
 
+    // Cod (#24): a restoration of this remote workspace is connecting. Wait for it, then use
+    // the workspace it brought back (found below) instead of connecting a second time, so no
+    // second live workspace takes the same saved one. Unrelated opens do not wait.
+    if let Some((restore_id, restore_done)) = cx.update(|cx| {
+        workspace::cod_remote_restore_in_progress(&connection_options, &paths, cx)
+    }) {
+        restore_done.await.ok();
+        cx.update(|cx| workspace::cod_end_remote_restore(restore_id, cx));
+    }
+
     let (existing, open_visible) = find_existing_workspace(
         &paths,
         &open_options,
@@ -201,6 +211,20 @@ pub async fn open_remote_project(
         );
     }
 
+    // Cod (#24): a new window for a remote workspace that this start restores takes that
+    // window's restore owner, and the restoration is registered before connecting, so a
+    // matching open waits for it. It is done when this function returns (`cod_restore_done`
+    // drops).
+    let (cod_restore_owner, cod_restore_done) = if created_new_window {
+        match cx.update(|cx| workspace::cod_begin_remote_restore(&connection_options, &paths, cx))
+        {
+            Some((owner, done)) => (Some(owner), Some(done)),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()
@@ -237,7 +261,15 @@ pub async fn open_remote_project(
                 workspace.centered_layout = workspace_position.centered_layout;
                 workspace
             });
-            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            cx.new(|cx| {
+                let mut multi_workspace = MultiWorkspace::new(workspace, window, cx);
+                // Cod (#24): a restored remote window has its saved key and full membership
+                // before it can save itself.
+                if let Some(owner) = cod_restore_owner {
+                    multi_workspace.cod_adopt_restore_owner(owner);
+                }
+                multi_workspace
+            })
         })?;
         let workspace = window.update(cx, |multi_workspace, _, _cx| {
             multi_workspace.workspace().clone()
@@ -295,6 +327,16 @@ pub async fn open_remote_project(
                         ui.update(cx, |modal, cx| modal.finished(cx))
                     }
                 });
+                // Cod (#24): the restore was cancelled and the window stays without its
+                // members. It gives back the saved key, so closing it keeps the saved window
+                // for the next start.
+                if cod_restore_done.is_some() {
+                    window
+                        .update(cx, |multi_workspace, _, _| {
+                            multi_workspace.cod_release_restore_owner()
+                        })
+                        .ok();
+                }
 
                 break;
             },

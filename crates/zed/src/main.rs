@@ -1621,6 +1621,19 @@ async fn restore_or_create_from(
                         .map(PathBuf::from)
                         .collect::<Vec<_>>();
                     let state = multi_workspace.state.clone();
+                    // Cod (#24): the window's local members come back as pending members of
+                    // the remote window, as in a local window. They load when first shown.
+                    let cod_local_members: Vec<_> = multi_workspace
+                        .other_workspaces
+                        .iter()
+                        .filter(|other| {
+                            matches!(other.location, SerializedWorkspaceLocation::Local)
+                                && (!other.paths.is_empty()
+                                    || state.cod_workspace_ids.is_empty()
+                                    || state.cod_workspace_ids.contains(&other.workspace_id))
+                        })
+                        .map(|other| (other.workspace_id, other.paths.paths().to_vec()))
+                        .collect();
                     async {
                         let window = open_remote_project(
                             connection_options,
@@ -1630,6 +1643,23 @@ async fn restore_or_create_from(
                             cx,
                         )
                         .await?;
+                        // Only the window that holds this saved window's key (its restore
+                        // owner) takes them; a cancelled restore gave the key back.
+                        window
+                            .update(cx, |multi_workspace, _window, cx| {
+                                if state.cod_window_key.as_deref()
+                                    != Some(multi_workspace.cod_window_key())
+                                {
+                                    return;
+                                }
+                                for (id, paths) in cod_local_members {
+                                    multi_workspace.cod_add_pending_workspace(id, paths);
+                                }
+                                multi_workspace.cod_finish_restore(cx);
+                                multi_workspace.serialize(cx);
+                                cx.notify();
+                            })
+                            .ok();
                         workspace::apply_restored_multiworkspace_state(
                             window,
                             &state,

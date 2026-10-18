@@ -92,7 +92,9 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
+    CodRemoteRestoreDone, CodRestoreOwner, RecentWorkspace, WorkspaceDb,
+    cod_begin_remote_restore, cod_end_remote_restore, cod_remote_restore_in_progress,
+    delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
         SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
