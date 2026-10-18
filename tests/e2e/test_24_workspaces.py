@@ -975,6 +975,73 @@ class WorkspacesTest(CodTestCase):
             state = self.wait_for_title(PAY_NAME)
             self.expect_equal("workspaces", before, workspace_list(state))
 
+    def test_ac5_each_workspace_project_panel_comes_back_after_quit_and_start(self) -> None:
+        """Each workspace's project panel comes back after a restart as it was: open or closed, roots, expanded folders and selected entry. No tab stays open, so nothing but the saved panel state can expand or select an entry after the restart."""
+        a_panel = {"open": True, "roots": ["billing-api"], "expanded": ["billing-api/src"], "selected": "billing-api/src/invoice.rs"}
+        b_panel = {"open": False, "roots": ["docs-site"], "expanded": ["docs-site/guide"], "selected": "docs-site/guide/getting-started.md"}
+
+        def panel_of(state: dict[str, Any]) -> dict[str, Any]:
+            return panel_summary(state["project_panel"]) or {}
+
+        with self.step("create the fixture repos billing-api and docs-site"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            docs_site = self.make_repo("docs-site", DOCS_SITE)
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for_worktrees([billing_api])
+            self.wait_for_values("the project panel at the start", {"open": True, "roots": ["billing-api"]}, panel_of, SHOW_TIMEOUT)
+
+        with self.step("workspace A: open invoice.rs, so the project panel expands src and selects invoice.rs"):
+            self.open_file("invoice.rs")
+            self.wait_for_values("workspace A's project panel with invoice.rs", a_panel, panel_of, SHOW_TIMEOUT)
+
+        with self.step("workspace A: close the tab with ctrl-w and check that the panel keeps src expanded and invoice.rs selected"):
+            self.keys("ctrl-w")
+            self.wait_for(lambda state: state["tabs"] == [] and state["prompt"] is None, SHOW_TIMEOUT, "the tab of invoice.rs to close")
+            self.wait_for_values("workspace A's project panel", a_panel, panel_of, SHOW_TIMEOUT)
+            a_index = self.state()["active_workspace"]
+
+        with self.step(f"workspace B: run {NEW_WORKSPACE!r}, add docs-site and show the project panel"):
+            self.new_workspace()
+            self.add_folder(docs_site)
+            self.show_project_panel()
+            b_index = self.state()["active_workspace"]
+            if b_index == a_index:
+                raise AssertionError(f"expected workspace B at another index than A ({a_index}), actual {b_index}")
+
+        with self.step("workspace B: open getting-started.md, so the project panel expands guide and selects it, then close the tab with ctrl-w"):
+            self.open_file("getting-started.md")
+            self.wait_for_values("workspace B's project panel with getting-started.md", {**b_panel, "open": True}, panel_of, SHOW_TIMEOUT)
+            self.keys("ctrl-w")
+            self.wait_for(lambda state: state["tabs"] == [] and state["prompt"] is None, SHOW_TIMEOUT, "the tab of getting-started.md to close")
+
+        with self.step(f"workspace B: close the project panel with {CLOSE_ALL_DOCKS!r}"):
+            self.run_command(CLOSE_ALL_DOCKS)
+            self.wait_for_values("workspace B's closed project panel", b_panel, panel_of, SHOW_TIMEOUT)
+
+        with self.step(f"check workspace A's project panel with {PREVIOUS_WORKSPACE!r}, then leave workspace B active with {NEXT_WORKSPACE!r}"):
+            self.switch_workspace(PREVIOUS_WORKSPACE, a_index, "workspace A", {"tabs": [], "panel": a_panel})
+            self.switch_workspace(NEXT_WORKSPACE, b_index, "workspace B", {"tabs": [], "panel": b_panel})
+
+        with self.step("quit Cod with ctrl-q and start it again"):
+            self.restart_cod()
+
+        with self.step("check that workspace B, the active one, came back with its project panel closed, guide expanded and getting-started.md selected"):
+            state = self.wait_for_values(
+                "the restored workspace B",
+                {"workspace_count": 2, "active_workspace": b_index, "modal": None, "worktrees": [real(docs_site)], "tabs": [], "panel": b_panel},
+                layout,
+                RESTORE_TIMEOUT,
+            )
+            self.expect_equal("workspace B's project panel", b_panel, panel_of(state))
+
+        with self.step(f"switch to workspace A with {PREVIOUS_WORKSPACE!r} and check that its project panel came back open with src expanded and invoice.rs selected"):
+            state = self.switch_workspace(
+                PREVIOUS_WORKSPACE, a_index, "workspace A", {"worktrees": [real(billing_api)], "tabs": [], "panel": a_panel}
+            )
+            self.expect_equal("workspace A's project panel", a_panel, panel_of(state))
+
     # AC6
 
     def test_ac6_close_workspace_asks_to_save_and_it_stays_closed(self) -> None:
