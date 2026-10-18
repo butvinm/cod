@@ -7695,6 +7695,7 @@ impl Workspace {
 
         fn build_serialized_pane_group(
             pane_group: &Member,
+            hidden_active_pane: Option<&Entity<Pane>>,
             window: &mut Window,
             cx: &mut App,
         ) -> SerializedPaneGroup {
@@ -7708,12 +7709,20 @@ impl Workspace {
                     axis: SerializedAxis(*axis),
                     children: members
                         .iter()
-                        .map(|member| build_serialized_pane_group(member, window, cx))
+                        .map(|member| {
+                            build_serialized_pane_group(member, hidden_active_pane, window, cx)
+                        })
                         .collect::<Vec<_>>(),
                     flexes: Some(flexes.lock().clone()),
                 },
                 Member::Pane(pane_handle) => {
-                    SerializedPaneGroup::Pane(serialize_pane_handle(pane_handle, window, cx))
+                    let mut pane = serialize_pane_handle(pane_handle, window, cx);
+                    // Cod (#24): no pane of a workspace hidden behind another one has the focus,
+                    // so its active pane is the one it would focus when shown again.
+                    if let Some(active_pane) = hidden_active_pane {
+                        pane.active = pane_handle == active_pane;
+                    }
+                    SerializedPaneGroup::Pane(pane)
                 }
             }
         }
@@ -7747,7 +7756,14 @@ impl Workspace {
                     .user_toolchains(cx)
                     .unwrap_or_default();
 
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
+                let hidden_active_pane =
+                    (!self.owns_window_chrome()).then(|| self.active_pane.clone());
+                let center_group = build_serialized_pane_group(
+                    &self.center.root,
+                    hidden_active_pane.as_ref(),
+                    window,
+                    cx,
+                );
                 let docks = build_serialized_docks(self, window, cx);
                 let default_docks = (paths.is_empty()
                     && location == SerializedWorkspaceLocation::Local)
@@ -7936,7 +7952,11 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
+                        // Cod (#24): a workspace restored behind the active one does not take
+                        // the focus; it focuses its active pane when it is shown.
+                        if workspace.owns_window_chrome() {
+                            cx.focus_self(window);
+                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
