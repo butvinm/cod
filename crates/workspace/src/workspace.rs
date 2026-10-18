@@ -10630,14 +10630,24 @@ pub async fn restore_multiworkspace(
     // saved id list is the window's manifest: a member the last session never re-bound (an
     // interrupted restore) is found by its id, and a member that is not found stays in the list
     // for the next start.
-    window_handle
+    let key_taken = window_handle
         .update(cx, |multi_workspace, _window, cx| {
             if let Some(key) = state.cod_window_key.clone() {
                 multi_workspace.cod_set_window_key(key, cx);
             }
             multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
         })
-        .ok();
+        .is_ok();
+    // The window is gone before it took its saved key: the user closed it while its shown
+    // workspace still loaded. That close removed only the window's first key, so the saved key
+    // goes now; the window's other members must not come back at the next start.
+    if !key_taken {
+        if let Some(key) = state.cod_window_key.clone() {
+            let removal = cx.update(|cx| persistence::cod_registry_remove(key, cx));
+            removal.await.log_err();
+        }
+        return Ok(window_handle);
+    }
     let from_registry = state.cod_from_registry;
     let mut other_workspaces = other_workspaces;
     let missing_ids: Vec<WorkspaceId> = state
