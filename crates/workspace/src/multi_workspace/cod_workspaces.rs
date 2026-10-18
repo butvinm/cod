@@ -285,8 +285,10 @@ impl MultiWorkspace {
 
     /// Shows the workspace after (or before) the active one in window order, wrapping around.
     fn cycle_workspace(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // A pending member is still loading: the next switch waits until it is shown.
+        // A pending member is still loading: the switch runs once it is shown, in the order
+        // the switches were asked for.
         if self.cod_materializing {
+            self.cod_queued_cycles.push(forward);
             return;
         }
         let members = self.cod_members(cx);
@@ -440,6 +442,17 @@ impl MultiWorkspace {
                         if *this.workspace() != workspace {
                             this.activate(workspace, None, window, cx);
                         }
+                        // The items are loaded now: the shown workspace takes the keys, unless
+                        // the user opened a modal in it meanwhile.
+                        let has_modal = this
+                            .workspace()
+                            .read(cx)
+                            .modal_layer()
+                            .read(cx)
+                            .has_active_modal();
+                        if !has_modal {
+                            this.focus_active_workspace(window, cx);
+                        }
                     }
                     (Ok(()), None) => {
                         log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
@@ -447,6 +460,10 @@ impl MultiWorkspace {
                     (Err(err), _) => {
                         log::error!("Failed to load workspace {id:?}; it stays pending: {err:#}");
                     }
+                }
+                // Run the switches asked for while the member loaded.
+                for forward in std::mem::take(&mut this.cod_queued_cycles) {
+                    this.cycle_workspace(forward, window, cx);
                 }
             })?;
             result

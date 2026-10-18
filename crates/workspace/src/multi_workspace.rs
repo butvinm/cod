@@ -342,6 +342,9 @@ pub struct MultiWorkspace {
     cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
     /// Cod (#24): true while a pending member loads; other activation requests wait for it.
     cod_materializing: bool,
+    /// Cod (#24): next (true) and previous (false) switches asked for while a pending member
+    /// loads; they run in order once it is shown.
+    cod_queued_cycles: Vec<bool>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -411,6 +414,7 @@ impl MultiWorkspace {
             cod_saved_order: Vec::new(),
             cod_pending: std::collections::HashMap::new(),
             cod_materializing: false,
+            cod_queued_cycles: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
