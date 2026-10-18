@@ -12,7 +12,7 @@ import unittest
 from typing import Any
 
 import test_24_workspaces as w24
-from cod_e2e import CodTestCase, artifact_name, artifacts_root, log
+from cod_e2e import DRIVER_START_TIMEOUT, CodTestCase, artifact_name, artifacts_root, log
 
 TAX_NAME = "[SHOP-210] (checkout-api) Fix tax rounding"
 REFUND_NAME = "[SHOP-233] (checkout-api) Refund export"
@@ -352,6 +352,63 @@ class BetaWorkspacesTest(CodTestCase):
             self.wait_for_title(TAX_NAME)
             self.observe("final restart")
             self.snap("10-final-restart")
+
+    def test_path_launch_then_plain_start_keeps_each_workspace_once(self) -> None:
+        """After a session with two named workspaces, Rowan starts Cod once with the repo path (cod checkout-api), quits, and starts it plainly: every workspace shows once."""
+        with self.step("create the invented repo checkout-api"):
+            repo = self.make_repo("checkout-api", CHECKOUT_API)
+
+        with self.step("start Cod on checkout-api, keeping its session"):
+            self.start_cod(repo, persistent=True)
+            self.wait_for_worktrees([repo])
+
+        with self.step(f"name the first workspace {TAX_NAME!r} with tax.rs open"):
+            self.open_file("tax.rs")
+            self.rename_workspace(TAX_NAME)
+            self.wait_for_title(TAX_NAME)
+
+        with self.step(f"second workspace on the same folder, refund.rs open, named {REFUND_NAME!r}"):
+            self.new_workspace()
+            self.add_folder(repo)
+            self.open_file("refund.rs")
+            self.rename_workspace(REFUND_NAME)
+            self.wait_for_title(REFUND_NAME)
+            before = self.observe("before the path launch")
+            self.expect_equal("names before", sorted([TAX_NAME, REFUND_NAME]), sorted(workspace["name"] for workspace in before["workspaces"]))
+
+        with self.step("quit Cod with ctrl-q and start it with the folder argument checkout-api"):
+            assert self.cod is not None
+            self.cod.quit()
+            self.cod.folder = repo
+            self.cod.start()
+            self.cod.connect(DRIVER_START_TIMEOUT)
+            self.wait_for(lambda state: state["active_workspace"] is not None and repo.name in str(state["worktrees"]), w24.RESTORE_TIMEOUT, "a workspace with checkout-api")
+            time.sleep(w24.SETTLE_TIME * 2)
+            self.observe("after the path launch")
+            self.snap("p1-after-path-launch")
+
+        with self.step("quit Cod with ctrl-q and start it plainly"):
+            self.restart_cod()
+
+        with self.step("check that every workspace appears exactly once, in one window, and both named tickets are there"):
+            deadline = time.monotonic() + w24.RESTORE_TIMEOUT
+            while time.monotonic() < deadline:
+                names = [workspace["name"] for workspace in self.state()["workspaces"]]
+                if TAX_NAME in names and REFUND_NAME in names:
+                    break
+                time.sleep(0.2)
+            time.sleep(w24.SETTLE_TIME * 2)
+            state = self.observe("after the plain start")
+            self.snap("p2-after-plain-start")
+            entries = w24.workspace_list(state)
+            names = [entry["name"] for entry in entries]
+            log(f"OBSERVE [path launch then plain start]: windows={state['window_count']} workspaces={entries}")
+            duplicates = [entry for index, entry in enumerate(entries) if entry in entries[:index]]
+            if duplicates:
+                raise AssertionError(f"expected every workspace once, actual duplicates {duplicates} in {entries}")
+            self.expect_equal("window count", 1, state["window_count"])
+            self.expect_equal(f"times {TAX_NAME!r} shows", 1, names.count(TAX_NAME))
+            self.expect_equal(f"times {REFUND_NAME!r} shows", 1, names.count(REFUND_NAME))
 
 
 if __name__ == "__main__":
