@@ -711,6 +711,13 @@ fn read_state(
             focus_handle.contains_focused(window, cx)
                 && window.is_action_available_in(&file_finder::OpenWithoutDismiss, &focus_handle)
         });
+    // Whether the command palette holds the focus (null while no palette is open): a palette
+    // that lost the focus keeps an empty query whatever is typed.
+    let palette_focused = workspace
+        .active_modal::<command_palette::CommandPalette>(cx)
+        .map(|palette| palette.read(cx).focus_handle(cx).contains_focused(window, cx));
+    // Whether the platform reports Cod's window as the active (keyboard) window.
+    let window_active = window.is_window_active();
     let modal = if workspace
         .active_modal::<file_finder::FileFinder>(cx)
         .is_some()
@@ -747,6 +754,8 @@ fn read_state(
         "palette_selection": selection,
         "path_prompt": path_prompt,
         "file_finder_ready": file_finder_ready,
+        "palette_focused": palette_focused,
+        "window_active": window_active,
         "prompt": prompt,
     }))
 }
