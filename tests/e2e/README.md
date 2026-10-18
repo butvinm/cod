@@ -27,7 +27,7 @@ The build dependencies of Cod (`script/linux`), plus:
 
 | Tool                                           | Ubuntu                | Arch            |
 | ---------------------------------------------- | --------------------- | --------------- |
-| sway                                           | `sway`                | `sway`          |
+| sway (with swaymsg)                            | `sway`                | `sway`          |
 | grim                                           | `grim`                | `grim`          |
 | dbus-run-session                               | `dbus`                | `dbus`          |
 | software Vulkan                                | `mesa-vulkan-drivers` | `vulkan-swrast` |
@@ -78,18 +78,48 @@ A machine without the Rust toolchain can run the tests against a `zed` binary wi
 
 Each Cod start has its own data folder (`--user-data-dir`) in the test's temp folder, with a `settings.json` from `cod_settings()` in `cod_e2e.py`: trusted worktrees, no automatic install of the html extension, no extension or app updates and no telemetry. A test that needs more settings adds them there.
 
+The settings also turn on Zed's own path picker and prompts (`use_system_path_prompts: false`, `use_system_prompts: false`), because the headless sway has no desktop portal, and turn off the command history of the palette (`command_palette.use_command_history: false`), so the palette ranks matches by the query alone and the driver can name the highlighted command.
+
+By default Cod runs with `ZED_STATELESS=1`: Zed keeps its database in memory and forgets the session. `self.start_cod(folder, persistent=True)` leaves it out, so Zed keeps its database and session in the test's data folder. `self.start_cod(None)` starts Cod without a folder.
+
 ## Add a story test
 
 1. Copy `test_22_open_file.py` to `test_<issue>_<slug>.py`. One file per story.
 2. Make the fixture repos in the test with `self.make_repo(name, files)`. They live in a temp folder of that test and are deleted after it. Use invented content only.
 3. Put every action in its own `with self.step("..."):`. A failure then logs `FAILED STEP: <step>` and saves the artifacts.
 4. Drive the app only with `self.keys("ctrl-p")` (Zed keystroke syntax, space-separated) and `self.type("text")`. Never call into the app in a way a user cannot.
-5. Read the app with `self.state()` (`active_tab`, `tabs`, `worktrees`, `modal`) and `self.wait_for(predicate, timeout, description)`. Check with `self.expect_equal("active tab", "invoice.rs", actual)`, which fails with `expected active tab 'invoice.rs', actual '...'`.
-6. Check the starting state in its own step before the first key, as the sample does in "check that no file is open". Without it, a test can pass because the expected result was already on the screen.
+5. Run a command from the command palette with `self.run_command("pane: split and move right")`: it presses ctrl-shift-p, types the command, waits until the palette highlights exactly that command and presses enter. When the palette highlights another command, or none, it fails with `expected palette selection '...', actual '...'` and never presses enter. Type the full command name as the palette shows it.
+6. Read the app with `self.state()` (fields below) and `self.wait_for(predicate, timeout, description)`. Check with `self.expect_equal("active tab", "invoice.rs", actual)`, which fails with `expected active tab 'invoice.rs', actual '...'`.
+7. Check the starting state in its own step before the first key, as the sample does in "check that no file is open". Without it, a test can pass because the expected result was already on the screen.
+8. To check what survives a restart, start Cod with `persistent=True` and call `self.restart_cod()`: it quits Cod with ctrl-q, waits until Cod and every process it started have exited (and fails when Cod exits with an error or does not exit in time), then starts Cod again with the same data folder and home and no folder, so Zed restores its last session.
+
+### State fields
+
+| Field               | Value                                                                                                                                                                                                                                    |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `active_tab`        | title of the active tab of the active workspace, or null                                                                                                                                                                                 |
+| `tabs`              | tab titles of the active pane                                                                                                                                                                                                            |
+| `worktrees`         | absolute paths of the folders of the active workspace                                                                                                                                                                                    |
+| `modal`             | `"file_finder"`, `"command_palette"`, `"other"` or null                                                                                                                                                                                  |
+| `window_count`      | number of open Cod windows                                                                                                                                                                                                               |
+| `window_title`      | the title sway shows for Cod's window (the focused one when there are several), or null; added by `CodTestCase.state()`                                                                                                                  |
+| `workspace_count`   | number of workspaces the window holds                                                                                                                                                                                                    |
+| `active_workspace`  | index of the active workspace in `workspaces`                                                                                                                                                                                            |
+| `workspaces`        | `{"name", "worktrees"}` for each workspace in window order; `name` is null while the workspace has no name                                                                                                                               |
+| `panes`             | `{"tabs", "active_tab"}` for each center pane of the active workspace, in layout order (left to right, top to bottom, following the split tree)                                                                                          |
+| `split`             | how the center panes are split at the root: `"vertical"` (a vertical divider, panes side by side, as "pane: split right" makes), `"horizontal"` (panes stacked), null for one pane, `"unknown"` while several panes are not laid out yet |
+| `cursor`            | `{"row", "column"}` of the cursor in the active editor, both 1-based as the status bar shows them (column in bytes), or null                                                                                                             |
+| `dirty_tabs`        | titles of the tabs with unsaved changes in the active workspace, in pane order                                                                                                                                                           |
+| `palette`           | `{"query", "match_count", "selected_index"}` while the command palette is open, else null                                                                                                                                                |
+| `palette_selection` | name of the command the palette highlights, or null when it is closed or the driver cannot tell                                                                                                                                          |
+| `path_prompt`       | `{"query", "match_count"}` while Zed's path picker (for example of "workspace: add folder to project") is open, else null                                                                                                                |
+| `prompt`            | `{"message": null, "answers": null}` while a prompt is shown in the window, else null; Zed's prompt does not expose its text                                                                                                             |
+
+The command palette keeps its matches private. The driver takes the palette's candidate list the way the palette does, before the key that opens it, and ranks it the way the palette does; it names the highlighted command only when its number of matches equals the palette's. With command history on, or with a command alias for the query, `palette_selection` is null.
 
 ## Artifacts and failures
 
-Every test that starts Cod saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `hang_traces/` (when Zed's hang detector saved any), `cod-output.log` and `state.json`. A failed test saves them at its first failed step, with `failure.txt` naming the step; a passing test saves them at its end, with `final.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`, and `run.txt` holds the commit, the command and the status. In CI they are the `e2e-artifacts-<commit>` artifact of every run.
+Every test that starts Cod saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `hang_traces/` (when Zed's hang detector saved any), `cod-output.log` (the output of every start of the test, one after the other) and `state.json`. A failed test saves them at its first failed step, with `failure.txt` naming the step; a passing test saves them at its end, with `final.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`, and `run.txt` holds the commit, the command and the status. In CI they are the `e2e-artifacts-<commit>` artifact of every run.
 
 When Cod stops at the end of a test, the test fails if a process carrying its driver socket is still running. After all tests, `script/e2e` lists any process of the run that is still running and fails if there is one.
 
@@ -99,7 +129,7 @@ Cod started with `COD_E2E_SOCKET=<path>` listens on that Unix socket. Each reque
 
 - `{"cmd":"keys","keys":"ctrl-p"}` presses each keystroke. Reply `{"ok":true}`.
 - `{"cmd":"type","text":"invoice"}` types one key event per character. Reply `{"ok":true}`.
-- `{"cmd":"state"}` replies `{"ok":true,"state":{"active_tab":"invoice.rs","tabs":["invoice.rs"],"worktrees":["/abs/path"],"modal":null}}`.
+- `{"cmd":"state"}` replies `{"ok":true,"state":{"active_tab":"invoice.rs","tabs":["invoice.rs"],"worktrees":["/abs/path"],"modal":null,...}}` with every field of the table above except `window_title`.
 - Errors reply `{"ok":false,"error":"..."}`.
 
 The unit tests of the library are in `unit/` and need no running Cod: `python3 -m unittest discover -s tests/e2e -t tests/e2e -p 'test_cod_e2e.py'`.
