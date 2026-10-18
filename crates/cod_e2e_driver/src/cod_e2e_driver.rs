@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use settings::Settings as _;
 use ui_prompt::ZedPromptRenderer;
 use workspace::{
-    ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
+    CodMember, ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
 };
 
 /// The environment variable that names the driver socket.
@@ -552,13 +552,40 @@ fn read_state(
 ) -> Result<Value> {
     let multi_workspace = multi_workspace.read(cx);
     let active = multi_workspace.workspace().clone();
-    let held: Vec<Entity<Workspace>> = multi_workspace.workspaces().cloned().collect();
-    let active_workspace = held.iter().position(|workspace| *workspace == active);
+    // The members in window order: loaded workspaces, and pending ones (lazy restore) that have saved data.
+    let held: Vec<CodMember> = multi_workspace
+        .cod_members(cx)
+        .into_iter()
+        .filter(|member| match member {
+            CodMember::Live(_) => true,
+            CodMember::Pending(id) => multi_workspace.cod_pending_paths(*id).is_some(),
+        })
+        .collect();
+    let active_workspace = held
+        .iter()
+        .position(|member| matches!(member, CodMember::Live(workspace) if *workspace == active));
     // What the last drawn frame holds of each workspace: whether any of its center panes is in it, and the tabs of those panes.
     let mut drawn_tabs: Vec<String> = Vec::new();
     let workspaces: Vec<Value> = held
         .iter()
-        .map(|workspace| {
+        .map(|member| {
+            let workspace = match member {
+                CodMember::Live(workspace) => workspace,
+                CodMember::Pending(id) => {
+                    // A pending member is not loaded: its name and folders come from its saved data.
+                    let worktrees: Vec<String> = multi_workspace
+                        .cod_pending_paths(*id)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    return json!({
+                        "name": workspace::cod_workspace_name_by_id(*id, cx),
+                        "worktrees": worktrees,
+                        "drawn": false,
+                    });
+                }
+            };
             let mut drawn = false;
             for pane in workspace.read(cx).panes() {
                 if is_drawn(pane, window, cx) {
