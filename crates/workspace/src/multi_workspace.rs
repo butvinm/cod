@@ -312,6 +312,16 @@ struct HeldWorkspace {
     activated_at: Option<u64>,
 }
 
+/// Cod (#24): a project group moving to a new window: the key reserved for that window, the
+/// complete group membership in window order, the member shown here, and the members that are
+/// not loaded.
+struct CodGroupMove {
+    key: String,
+    ids: Vec<WorkspaceId>,
+    active: Option<WorkspaceId>,
+    pending_ids: Vec<WorkspaceId>,
+}
+
 pub struct MultiWorkspace {
     window_id: WindowId,
     held: Vec<HeldWorkspace>,
@@ -354,6 +364,12 @@ pub struct MultiWorkspace {
     /// Cod (#24): activation requests by workspace id that arrived while another pending member
     /// loaded; each is woken once that load ends and then loads or shows its own member.
     cod_materialize_waiters: Vec<futures::channel::oneshot::Sender<()>>,
+    /// Cod (#24): a project group move waiting for consent. The first member that leaves after
+    /// consent moves the whole group in one registry edit.
+    cod_group_move: Option<CodGroupMove>,
+    /// Cod (#24): ids that left this window with a group move; this window's saves leave them
+    /// out while the move detaches its members.
+    cod_moving_ids: Vec<WorkspaceId>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -441,6 +457,8 @@ impl MultiWorkspace {
             cod_move_keys: std::collections::HashMap::new(),
             cod_queued_cycles: Vec::new(),
             cod_materialize_waiters: Vec::new(),
+            cod_group_move: None,
+            cod_moving_ids: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -1190,6 +1208,16 @@ impl MultiWorkspace {
         }
         // The destination shows the member that was shown here, when it moves.
         let shown_id = active_workspace.read(cx).database_id();
+        // Cod (#24): the whole group (loaded and pending members, in order, and the shown
+        // member) moves in one registry edit, made by the first member that leaves after the
+        // consent prompts (`cod_commit_group_move`). Pending members stay bound until the
+        // destination binds them to itself.
+        self.cod_group_move = Some(CodGroupMove {
+            key: move_key.clone(),
+            ids: moved_ids.clone(),
+            active: shown_id,
+            pending_ids,
+        });
         let remove_task =
             self.remove_project_group_with_intent(key, RemovalIntent::MoveProject, window, cx);
 
@@ -1197,42 +1225,37 @@ impl MultiWorkspace {
             futures::future::join_all(serialization_tasks).await;
 
             let removed = remove_task.await;
-            // A reserved key that no detached workspace used goes with this move.
+            let removed_any = matches!(removed, Ok(true));
+            // A reserved key that no detached workspace used goes with this move. A group move
+            // that no leaving member committed (no member had a saved id) commits now when the
+            // group left, and is dropped when the user cancelled.
             let cleanup_key = move_key.clone();
-            this.update(cx, |this, _cx| {
-                this.cod_move_keys.retain(|_, key| *key != cleanup_key);
-            })
-            .ok();
-            if !removed? {
-                return Ok(());
-            }
-
-            // Cod (#24): the pending members of the group leave this window and go to the
-            // reserved key in one registry edit, before the destination window exists and
-            // saves. They stay bound until the destination binds them to itself.
-            let pending_move = this
+            let late_commit = this
                 .update(cx, |this, cx| {
-                    if pending_ids.is_empty() {
-                        return None;
-                    }
-                    this.cod_pending.retain(|id, _| !pending_ids.contains(id));
-                    this.cod_unrestored_workspace_ids
-                        .retain(|id| !pending_ids.contains(id));
-                    this.cod_saved_order.retain(|id| !pending_ids.contains(id));
-                    let moved = crate::persistence::cod_registry_move_to_window(
-                        pending_ids.clone(),
-                        move_key.clone(),
-                        cx,
-                    );
-                    this.serialize(cx);
-                    cx.notify();
-                    Some(moved)
+                    this.cod_move_keys.retain(|_, key| *key != cleanup_key);
+                    let armed = this
+                        .cod_group_move
+                        .as_ref()
+                        .is_some_and(|plan| plan.key == cleanup_key);
+                    let late_commit = if armed && removed_any {
+                        this.cod_commit_group_move(cx)
+                    } else {
+                        if armed {
+                            this.cod_group_move = None;
+                        }
+                        None
+                    };
+                    this.cod_moving_ids.clear();
+                    late_commit
                 })
                 .ok()
                 .flatten();
-            if let Some(pending_move) = pending_move {
+            if let Some(late_commit) = late_commit {
                 // A failed write keeps the registry dirty; the next save writes it again.
-                pending_move.await.log_err();
+                late_commit.await.log_err();
+            }
+            if !removed? {
+                return Ok(());
             }
 
             let db = cx.update(|cx| crate::persistence::WorkspaceDb::global(cx));
@@ -1663,9 +1686,25 @@ impl MultiWorkspace {
             } else {
                 None
             };
-            let moved = move_key.map(|move_key| {
-                crate::persistence::cod_registry_move_to_window(vec![workspace_id], move_key, cx)
-            });
+            // The first member of a group move that leaves after consent moves the whole group
+            // in one edit; the other members of that group went with it.
+            let moved = match move_key {
+                Some(move_key)
+                    if self
+                        .cod_group_move
+                        .as_ref()
+                        .is_some_and(|plan| plan.key == move_key) =>
+                {
+                    self.cod_commit_group_move(cx)
+                }
+                Some(_) if self.cod_moving_ids.contains(&workspace_id) => None,
+                Some(move_key) => Some(crate::persistence::cod_registry_move_to_window(
+                    vec![workspace_id],
+                    move_key,
+                    cx,
+                )),
+                None => None,
+            };
             let membership = self.serialize_now(cx);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
@@ -1788,6 +1827,43 @@ impl MultiWorkspace {
         self.cod_window_key = owner.key;
         self.cod_unrestored_workspace_ids = owner.workspace_ids.clone();
         self.cod_saved_order = owner.workspace_ids;
+    }
+
+    /// Cod (#24): after consent, a project group move transfers its complete ordered
+    /// membership and shown member to the reserved key in one registry edit, taking them out
+    /// of this window in the same step (loaded and pending members alike). The destination's
+    /// restore owner is installed in the application, so the destination is built with its key
+    /// and members whatever happens to this window.
+    fn cod_commit_group_move(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::persistence::CodRegistryWriteDone> {
+        let plan = self.cod_group_move.take()?;
+        self.cod_pending
+            .retain(|id, _| !plan.pending_ids.contains(id));
+        self.cod_unrestored_workspace_ids
+            .retain(|id| !plan.ids.contains(id));
+        self.cod_saved_order.retain(|id| !plan.ids.contains(id));
+        self.cod_moving_ids.extend(plan.ids.iter().copied());
+        if let Some(active) = plan
+            .active
+            .filter(|active| plan.ids.contains(active))
+            .or_else(|| plan.ids.first().copied())
+        {
+            crate::persistence::cod_add_restore_owner(
+                crate::persistence::CodRestoreOwner {
+                    key: plan.key.clone(),
+                    workspace_ids: plan.ids.clone(),
+                    members: Vec::new(),
+                    active_workspace_id: active,
+                },
+                cx,
+            );
+        }
+        let moved =
+            crate::persistence::cod_registry_move_group(plan.ids, plan.active, plan.key, cx);
+        cx.notify();
+        Some(moved)
     }
 
     /// Cod (#24): a remote restore that was cancelled before its workspace joined the window.

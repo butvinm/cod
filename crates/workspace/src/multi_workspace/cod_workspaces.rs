@@ -665,6 +665,8 @@ impl MultiWorkspace {
                 ids.push(*id);
             }
         }
+        // Members that left with a group move belong to their new window's entry already.
+        ids.retain(|id| !self.cod_moving_ids.contains(id));
         ids
     }
 

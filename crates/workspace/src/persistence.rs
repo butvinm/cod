@@ -691,6 +691,38 @@ pub fn cod_install_restore_owners(owners: Vec<CodRestoreOwner>, cx: &mut App) {
     cx.default_global::<CodWindowRegistry>().restore_owners = owners;
 }
 
+/// Cod (#24): adds the restore owner of one more window (a project group moving to a new
+/// window), which the destination window takes at construction.
+pub fn cod_add_restore_owner(owner: CodRestoreOwner, cx: &mut App) {
+    let owners = &mut cx.default_global::<CodWindowRegistry>().restore_owners;
+    owners.retain(|existing| existing.key != owner.key);
+    owners.push(owner);
+}
+
+/// Cod (#24): a project group moves to a new window: its complete ordered membership and its
+/// shown member go to the entry with `key`, and leave every other entry, in one edit.
+pub fn cod_registry_move_group(
+    ids: Vec<WorkspaceId>,
+    active: Option<WorkspaceId>,
+    key: String,
+    cx: &mut App,
+) -> CodRegistryWriteDone {
+    if cod_registry_is_closed(&key, cx) {
+        return cod_registry_done(None);
+    }
+    cod_registry_edit(cx, move |entries| {
+        let mut changed = cod_move_ids_to_entry(entries, &ids, &key);
+        if let Some(active) = active.filter(|active| ids.contains(active))
+            && let Some(entry) = entries.iter_mut().find(|entry| entry.key == key)
+            && entry.active_workspace_id != Some(active)
+        {
+            entry.active_workspace_id = Some(active);
+            changed = true;
+        }
+        changed
+    })
+}
+
 /// Cod (#24): the window being built for the workspace `active` takes the restore owner whose
 /// shown member it is. Each owner is taken once.
 pub fn cod_take_restore_owner(active: WorkspaceId, cx: &mut App) -> Option<CodRestoreOwner> {
