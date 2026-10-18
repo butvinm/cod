@@ -1895,6 +1895,13 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            // Cod (#24): every workspace of the window listens, in the order they were made, and
+            // the last one to move the focus wins. A workspace the window does not draw must not
+            // take it: keys would go to an element outside the frame and reach no workspace
+            // action (not even the command palette) until something else moves the focus.
+            if !this.owns_window_chrome() {
+                return;
+            }
             let focus_handle = window
                 .focus_lost_restore_target(cx)
                 .unwrap_or_else(|| this.fallback_focus_handle(window, cx));
@@ -10509,7 +10516,12 @@ pub async fn restore_multiworkspace(
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 
     window_handle
-        .update(cx, |_, window, _cx| {
+        .update(cx, |multi_workspace, window, cx| {
+            // Cod (#24): the restore awaits between the steps above and a frame drawn in between
+            // can lose the focus; end with it in the workspace the window shows.
+            if multi_workspace.workspaces().count() > 1 {
+                multi_workspace.focus_active_workspace(window, cx);
+            }
             window.activate_window();
         })
         .ok();
