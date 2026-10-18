@@ -744,15 +744,17 @@ impl MultiWorkspace {
 }
 
 /// Cod (#24): the main repository folder of a linked git worktree, read from its `.git` file
-/// (`gitdir: <dir>`) and that directory's `commondir` file. None for anything else.
+/// (`gitdir: <dir>`) and that directory's `commondir` file, under the stock repository identity
+/// rules (`repo_identity_path`): `.git` and `.bare` give their parent, a named bare repository
+/// such as `project.git` is itself the identity. None for anything else.
 fn cod_linked_worktree_main_path(folder: &std::path::Path) -> Option<std::path::PathBuf> {
     let dot_git = std::fs::read_to_string(folder.join(".git")).ok()?;
     let gitdir = dot_git.trim().strip_prefix("gitdir:")?.trim();
     let gitdir = folder.join(gitdir);
     let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
     let common = std::fs::canonicalize(gitdir.join(commondir.trim())).ok()?;
-    if common.file_name()? != ".git" {
-        return None;
-    }
-    common.parent().map(|main| main.to_path_buf())
+    let identity =
+        project::repo_identity_path(&common, util::paths::PathStyle::local()).to_path_buf();
+    // A folder whose identity is the folder itself is not a linked worktree of another one.
+    (identity != folder).then_some(identity)
 }
