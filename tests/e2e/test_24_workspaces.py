@@ -10,13 +10,15 @@ test_stock_zed_asks_to_save_when_a_window_closes records the prompt stock Zed sh
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from cod_e2e import CodTestCase
+import loopback_ssh
+from cod_e2e import Cod, CodTestCase, cod_command, cod_environment
 
 NEW_WORKSPACE = "workspace: new workspace"
 RENAME_WORKSPACE = "workspace: rename workspace"
@@ -39,6 +41,8 @@ DOCS_NAME = "Docs: release notes"
 SHOW_TIMEOUT = 15.0
 # How long Cod may take to restore its last session after a restart.
 RESTORE_TIMEOUT = 45.0
+# How long an SSH connection, the remote server start and a remote restore may take on the loopback sshd.
+REMOTE_TIMEOUT = 120.0
 # How long a cancelled change must stay away before the test believes it.
 SETTLE_TIME = 1.5
 # Seconds after the launch at which the crash-safety test kills Cod: right after the launch
@@ -126,6 +130,12 @@ LEDGER_RS = (
     "\n"
     + numbered_lines("// ledger note", 12)
 )
+
+# The remote fixture, opened only over the loopback SSH service.
+LEDGER_REMOTE = {
+    "README.md": "# ledger-remote\n\nAn invented ledger kept on a remote host.\n",
+    "ledger.rs": "pub fn balance(entries: &[i64]) -> i64 {\n    entries.iter().sum()\n}\n",
+}
 
 BILLING_API = {
     "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -1444,6 +1454,180 @@ class WorkspacesTest(CodTestCase):
         with self.step("quit with ctrl-q and start again: both windows come back with their names"):
             self.restart_cod()
             self.wait_for(two_named_windows, RESTORE_TIMEOUT, f"two restored windows titled {DOCS_NAME!r} and {PAY_NAME!r}")
+
+    # Remote (SSH) workspaces on a disposable sshd on 127.0.0.1 (tests/e2e/loopback_ssh.py). Each test is skipped with the reason when the service cannot run here.
+
+    def loopback(self, name: str) -> loopback_ssh.LoopbackSsh:
+        """A started loopback sshd for this test with the remote server binary in place, or a skip with the reason."""
+        reason = loopback_ssh.missing_reason()
+        if reason is not None:
+            self.skipTest(f"loopback SSH unavailable: {reason}")
+        ssh = loopback_ssh.LoopbackSsh(self.workdir / f"ssh-{name}")
+        reason = ssh.start()
+        if reason is not None:
+            self.skipTest(f"loopback SSH unavailable: {reason}")
+        self.addCleanup(ssh.stop)
+        ssh.install_remote_server()
+        return ssh
+
+    def start_cod_on_remote(self, connections: list[loopback_ssh.LoopbackSsh], url: str) -> None:
+        """Starts a persistent Cod on the ssh:// url, as `cod ssh://user@host:port/path` does, with every service's key and known_hosts in ssh_connections."""
+        if self.cod is not None:
+            raise RuntimeError("Cod was already started in this test")
+        self.cod = Cod(self.workdir, None, persistent=True)
+        self.cod.extra_settings = {"ssh_connections": [{**ssh.connection_setting(), "projects": []} for ssh in connections]}
+        self.cod.extra_args = [url]
+        self.addCleanup(self._stop_cod)
+        self.addCleanup(self._save_final_artifacts)
+        self.cod.start()
+        self.cod.connect(REMOTE_TIMEOUT)
+
+    def open_remote_and_local(self, ssh: loopback_ssh.LoopbackSsh) -> tuple[Path, Path, list[dict[str, Any]]]:
+        """One window: workspace 1 is the remote ledger-remote with ledger.rs open, workspace 2 the local billing-api with invoice.rs open. Returns both folders and the workspace list."""
+        remote = self.make_repo("ledger-remote", LEDGER_REMOTE)
+        local = self.make_repo("billing-api", BILLING_API)
+        self.start_cod_on_remote([ssh], ssh.url(remote))
+        self.wait_for(
+            lambda state: real_paths(state["worktrees"]) == [real(remote)], REMOTE_TIMEOUT, "the remote folder ledger-remote over SSH"
+        )
+        self.open_file("ledger.rs")
+        self.new_workspace()
+        self.add_folder(local)
+        self.open_file("invoice.rs")
+        state = self.state()
+        self.expect_equal("window count", 1, state["window_count"])
+        self.expect_equal("workspace count", 2, state["workspace_count"])
+        return remote, local, workspace_list(state)
+
+    def expect_each_once(self, state: dict[str, Any], folders: list[Path]) -> None:
+        listed = [real_paths(workspace["worktrees"]) for workspace in workspace_list(state)]
+        for folder in folders:
+            self.expect_equal(f"workspaces showing {folder.name}", 1, listed.count([real(folder)]))
+
+    def show_workspace_of(self, folder: Path, tab: str) -> dict[str, Any]:
+        """Switches with "workspace: next workspace" until the folder's workspace is active, then waits for its tab."""
+        for _ in range(self.state()["workspace_count"]):
+            if real_paths(self.state()["worktrees"]) == [real(folder)]:
+                break
+            before = self.state()["active_workspace"]
+            self.run_command(NEXT_WORKSPACE)
+            self.wait_for(lambda state: state["active_workspace"] != before and state["modal"] is None, SHOW_TIMEOUT, "the next workspace")
+        return self.wait_for(
+            lambda state: real_paths(state["worktrees"]) == [real(folder)] and state["active_tab"] == tab,
+            REMOTE_TIMEOUT,
+            f"{folder.name} with {tab} in the active tab",
+        )
+
+    def test_remote_and_local_workspaces_come_back_once_after_quit_and_start(self) -> None:
+        with self.step("start a loopback sshd on 127.0.0.1 with a key made for this test"):
+            ssh = self.loopback("a")
+
+        with self.step("one window: the remote ledger-remote with ledger.rs, and a local billing-api with invoice.rs"):
+            remote, local, before = self.open_remote_and_local(ssh)
+
+        with self.step("quit with ctrl-q and start again"):
+            self.restart_cod(REMOTE_TIMEOUT)
+
+        with self.step("check that one window has both workspaces, each exactly once"):
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 2 and sorted(workspace_list(state), key=str) == sorted(before, key=str),
+                REMOTE_TIMEOUT,
+                "both workspaces to come back",
+            )
+            self.expect_equal("window count", 1, state["window_count"])
+            self.expect_each_once(state, [remote, local])
+
+        with self.step("check the remote workspace: its folder over SSH and ledger.rs open"):
+            self.show_workspace_of(remote, "ledger.rs")
+
+        with self.step("check the local workspace: billing-api and invoice.rs open"):
+            state = self.show_workspace_of(local, "invoice.rs")
+            self.expect_each_once(state, [remote, local])
+            self.expect_equal("window count", 1, state["window_count"])
+
+    def test_remote_workspace_survives_a_cancelled_reconnection(self) -> None:
+        with self.step("start a loopback sshd on 127.0.0.1 with a key made for this test"):
+            ssh = self.loopback("b")
+
+        with self.step("one window: the remote ledger-remote with ledger.rs, and a local billing-api with invoice.rs"):
+            remote, local, _ = self.open_remote_and_local(ssh)
+
+        with self.step("quit with ctrl-q, stop sshd, start Cod again so the remote reconnection fails"):
+            assert self.cod is not None
+            self.cod.quit()
+            ssh.stop()
+            self.cod.folder = None
+            self.cod.start()
+            self.cod.connect(REMOTE_TIMEOUT)
+
+        with self.step("cancel the remote connection by keys (escape) once its modal or prompt shows"):
+            self.wait_for(
+                lambda state: state["modal"] == "other" or state["prompt"]["message"] is not None,
+                REMOTE_TIMEOUT,
+                "the remote connection modal or its failure prompt",
+            )
+            for _ in range(3):
+                state = self.state()
+                if state["modal"] is None and state["prompt"]["message"] is None:
+                    break
+                self.keys("escape")
+                time.sleep(SETTLE_TIME)
+            self.wait_for(
+                lambda state: state["modal"] is None and state["prompt"]["message"] is None, SHOW_TIMEOUT, "no modal and no prompt after cancel"
+            )
+
+        with self.step("start sshd again, quit with ctrl-q and start Cod again"):
+            reason = ssh.start()
+            if reason is not None:
+                raise AssertionError(f"the loopback sshd did not start again: {reason}")
+            self.restart_cod(REMOTE_TIMEOUT)
+
+        with self.step("check that the remote workspace came back exactly once, with ledger.rs, next to the local one"):
+            state = self.wait_for(
+                lambda state: [real(remote)] in [real_paths(workspace["worktrees"]) for workspace in workspace_list(state)],
+                REMOTE_TIMEOUT,
+                "the remote workspace to come back",
+            )
+            self.expect_each_once(state, [remote, local])
+            self.expect_equal("window count", 1, state["window_count"])
+            state = self.show_workspace_of(remote, "ledger.rs")
+            self.expect_each_once(state, [remote, local])
+            self.expect_equal("window count", 1, state["window_count"])
+
+    def test_same_folder_on_another_ssh_port_does_not_take_the_first_hosts_saved_workspace(self) -> None:
+        with self.step("start two loopback sshd services on two ports"):
+            first = self.loopback("first")
+            second = self.loopback("second")
+            remote = self.make_repo("ledger-remote", LEDGER_REMOTE)
+
+        with self.step("open ledger-remote over the first port, open ledger.rs, quit and start again"):
+            self.start_cod_on_remote([first, second], first.url(remote))
+            self.wait_for(lambda state: real_paths(state["worktrees"]) == [real(remote)], REMOTE_TIMEOUT, "ledger-remote over the first port")
+            self.open_file("ledger.rs")
+            self.restart_cod(REMOTE_TIMEOUT)
+            self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] == "ledger.rs",
+                REMOTE_TIMEOUT,
+                "the first port's workspace with ledger.rs to come back",
+            )
+
+        with self.step("open the same folder over the second port from the command line (cod ssh://...)"):
+            assert self.cod is not None
+            env = cod_environment(os.environ, self.cod.preview_dir, self.cod.socket_path, self.cod.home, persistent=True)
+            second_open = subprocess.run(
+                cod_command(self.cod.run_dir, None) + [second.url(remote)], cwd=self.workdir, env=env, capture_output=True, timeout=60
+            )
+            self.expect_equal("exit status of the second open", 0, second_open.returncode)
+
+        with self.step("check that the second port's workspace is a fresh one: the folder with no tab, and the first keeps ledger.rs"):
+            state = self.wait_for(lambda state: state["window_count"] == 2, REMOTE_TIMEOUT, "a second window for the second port")
+            fresh = self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] is None,
+                REMOTE_TIMEOUT,
+                "the second port's window with ledger-remote and no tab (not the first port's saved layout)",
+            )
+            self.stays(lambda state: state["tabs"] == [], SETTLE_TIME, "the second port's window having no tab")
+            self.expect_equal("window count", 2, fresh["window_count"])
 
 
 if __name__ == "__main__":
