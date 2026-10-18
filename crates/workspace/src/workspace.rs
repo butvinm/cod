@@ -2251,6 +2251,9 @@ impl Workspace {
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
+        // Cod (#24): after a failed registry seed the saved workspaces stay bound to the
+        // previous session, so a folder opened now gets a new row instead of taking over one.
+        let reuse_saved_by_roots = !cod_registry_seed_failed(cx);
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
@@ -2263,7 +2266,8 @@ impl Workspace {
 
             let serialized_workspace = match restore_id {
                 Some(id) => db.workspace_for_id(id),
-                None => db.workspace_for_roots(paths_to_open.as_slice()),
+                None if reuse_saved_by_roots => db.workspace_for_roots(paths_to_open.as_slice()),
+                None => None,
             };
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
@@ -10921,6 +10925,22 @@ pub fn cod_finish_registry_startup(cx: &mut App) {
                 .ok();
         }
     }
+}
+
+/// Cod (#24): set when this start could not seed the Cod window registry.
+struct CodRegistrySeedFailed;
+
+impl Global for CodRegistrySeedFailed {}
+
+/// Cod (#24): records that the registry seed of this start failed. Until the next start, an
+/// opened folder never reuses a saved workspace row, so every saved row keeps its session.
+pub fn cod_mark_registry_seed_failed(cx: &mut App) {
+    cx.set_global(CodRegistrySeedFailed);
+}
+
+/// Cod (#24): whether the registry seed of this start failed.
+pub fn cod_registry_seed_failed(cx: &App) -> bool {
+    cx.has_global::<CodRegistrySeedFailed>()
 }
 
 /// Cod (#24): the number of windows in the registry copy of this start, if it has one.

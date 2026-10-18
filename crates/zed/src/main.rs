@@ -1513,6 +1513,7 @@ async fn cod_seed_registry_and_publish_session(
         workspace::cod_seed_window_registry(restorable.as_mut().unwrap_or(&mut no_windows), cx)
             .await;
     if !seeded {
+        cx.update(|cx| workspace::cod_mark_registry_seed_failed(cx));
         anyhow::bail!(
             "The Cod window registry was not seeded; keeping the previous session id and restoring no window"
         );
