@@ -1429,8 +1429,6 @@ pub(crate) async fn restore_or_create_workspace(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    // Cod (#24): whether every window came back and saved its list under this session.
-    let mut cod_restore_complete = true;
     if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
         for multi_workspace in multi_workspaces {
@@ -1485,7 +1483,6 @@ pub(crate) async fn restore_or_create_workspace(
             }
         }
 
-        cod_restore_complete = error_count == 0;
         if error_count > 0 {
             let message = if error_count == 1 {
                 "Failed to restore 1 workspace. Check logs for details.".to_string()
@@ -1583,12 +1580,6 @@ pub(crate) async fn restore_or_create_workspace(
         .await?;
     }
 
-    // Cod (#24): the restored windows saved their lists under this session (restore_multiworkspace
-    // waits for that), so a later start no longer needs the session before it.
-    if cod_restore_complete {
-        session::cod_clear_session_recovery(kvp).await;
-    }
-
     Ok(())
 }
 
@@ -1612,13 +1603,12 @@ pub(crate) async fn restorable_workspace_locations(
     });
 
     let session_handle = app_state.session.clone();
-    let (last_session_id, last_session_window_stack, recovery_session_id) = cx.update(|cx| {
+    let (last_session_id, last_session_window_stack) = cx.update(|cx| {
         let session = session_handle.read(cx);
 
         (
             session.last_session_id().map(|id| id.to_string()),
             session.last_session_window_stack(),
-            session.cod_recovery_session_id().map(|id| id.to_string()),
         )
     });
 
@@ -1661,32 +1651,6 @@ pub(crate) async fn restorable_workspace_locations(
                 // we need to open the window that was frontmost last.
                 if ordered && let Some(locations) = locations.as_mut() {
                     locations.reverse();
-                }
-
-                // Cod (#24): the previous start stopped before its restore finished, so the
-                // workspaces it had not re-bound yet are still bound to the session before it.
-                // They come back too (opened first, so behind the previous session's windows).
-                if let Some(recovery_session_id) = recovery_session_id {
-                    let recovered = workspace::last_session_workspace_locations(
-                        &db,
-                        &recovery_session_id,
-                        None,
-                        app_state.fs.as_ref(),
-                    )
-                    .await
-                    .unwrap_or_default();
-                    let mut merged: Vec<SessionWorkspace> = recovered
-                        .into_iter()
-                        .filter(|recovered| {
-                            !locations.as_ref().is_some_and(|locations| {
-                                locations.iter().any(|location| {
-                                    location.workspace_id == recovered.workspace_id
-                                })
-                            })
-                        })
-                        .collect();
-                    merged.extend(locations.unwrap_or_default());
-                    locations = Some(merged).filter(|merged| !merged.is_empty());
                 }
 
                 locations
