@@ -367,6 +367,26 @@ impl MultiWorkspace {
         members.into_iter().map(|(_, member)| member).collect()
     }
 
+    /// The pending member whose folders are exactly `path_list`, if any.
+    pub fn cod_pending_id_for_paths(
+        &self,
+        path_list: &util::path_list::PathList,
+    ) -> Option<WorkspaceId> {
+        self.cod_pending.iter().find_map(|(id, paths)| {
+            (util::path_list::PathList::new(paths) == *path_list).then_some(*id)
+        })
+    }
+
+    /// Loads and shows a pending member (see `cod_activate_pending`).
+    pub fn cod_show_pending(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.cod_activate_pending(id, window, cx)
+    }
+
     /// The folders of a pending member, None when the id is not a pending member.
     pub fn cod_pending_paths(&self, id: WorkspaceId) -> Option<&[std::path::PathBuf]> {
         self.cod_pending.get(&id).map(|paths| paths.as_slice())

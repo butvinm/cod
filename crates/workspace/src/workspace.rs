@@ -11480,6 +11480,38 @@ pub async fn find_existing_workspace(
             }
         });
 
+        // Cod (#24): a registered workspace that has exactly these folders but is still
+        // pending in its restored window is shown there, instead of a second copy elsewhere.
+        if existing.is_none() {
+            let path_list = PathList::new(abs_paths);
+            let pending = cx.update(|cx| {
+                workspace_windows_for_location(location, cx)
+                    .into_iter()
+                    .find_map(|window| {
+                        let id = window
+                            .read(cx)
+                            .ok()?
+                            .cod_pending_id_for_paths(&path_list)?;
+                        Some((window, id))
+                    })
+            });
+            if let Some((window, id)) = pending {
+                let show = window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.cod_show_pending(id, window, cx)
+                    })
+                    .ok();
+                if let Some(show) = show {
+                    if show.await.log_err().is_some() {
+                        existing = cx.update(|cx| {
+                            let workspace = window.read(cx).ok()?.workspace().clone();
+                            Some((window, workspace))
+                        });
+                    }
+                }
+            }
+        }
+
         let all_paths_are_files = existing
             .as_ref()
             .and_then(|(_, target_workspace)| {
