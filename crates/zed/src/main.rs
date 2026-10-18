@@ -1019,6 +1019,13 @@ fn main() {
             let restore_finished = restore_finished.clone();
             async move |cx| {
                 restore_finished.await;
+                // Cod (#24): a start without a registry copy (an unreadable registry, or a
+                // first-start seed that was not written) leaves every saved workspace as it is,
+                // so the next start finds them all and seeds the registry again.
+                if cx.update(|cx| workspace::cod_registry_window_count(cx).is_none()) {
+                    log::warn!("Skipping workspace cleanup: the Cod window registry is not loaded");
+                    return anyhow::Ok(());
+                }
                 // Cod (#24): workspaces in the Cod window registry are never collected.
                 // An unreadable registry hides which workspaces it protects: skip the cleanup.
                 let Some(registered) =
