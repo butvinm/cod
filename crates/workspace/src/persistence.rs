@@ -1175,8 +1175,9 @@ impl WorkspaceDb {
                 WHERE
                     paths IS ? AND
                     remote_connection_id IS ?
-                // Cod (#24): several workspaces may have these folders; take the latest one.
-                ORDER BY timestamp DESC
+                // Cod (#24): several workspaces may have these folders; take the latest one
+                // (timestamps have whole seconds, so the newer id breaks a tie).
+                ORDER BY timestamp DESC, workspace_id DESC
                 LIMIT 1
             })
             .and_then(|mut prepared_statement| {
