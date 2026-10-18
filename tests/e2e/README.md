@@ -50,7 +50,7 @@ Each Cod start has its own data folder (`--user-data-dir`) in the test's temp fo
 
 ## Failures
 
-A failed test saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `cod-output.log`, `state.json` and `failure.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`. In CI they are the `e2e-artifacts` artifact of the run.
+A failed test saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `hang_traces/` (when Zed's hang detector saved any), `cod-output.log`, `state.json` and `failure.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`. In CI they are the `e2e-artifacts` artifact of the run.
 
 ## Driver protocol
 

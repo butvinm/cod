@@ -448,6 +448,10 @@ class CodTestCase(unittest.TestCase):
             logs = self.cod.preview_dir / "logs"
             if logs.is_dir():
                 shutil.copytree(logs, target / "logs", dirs_exist_ok=True)
+            # Zed's hang detector saves its task traces into <user data dir>/hang_traces (paths::hang_traces_dir).
+            hang_traces = self.cod.preview_dir / "hang_traces"
+            if hang_traces.is_dir():
+                shutil.copytree(hang_traces, target / "hang_traces", dirs_exist_ok=True)
             if self.cod.output_path.exists():
                 shutil.copy2(self.cod.output_path, target / "cod-output.log")
             stderr_log = logs / "cod-stderr.log"
