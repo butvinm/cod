@@ -1,3 +1,4 @@
+mod cod_panel_state;
 pub mod project_panel_settings;
 mod undo;
 mod utils;
@@ -178,6 +179,7 @@ pub struct ProjectPanel {
     update_visible_entries_task: UpdateVisibleEntriesTask,
     undo_manager: UndoManager,
     state: State,
+    cod_persistence: cod_panel_state::CodPanelPersistence,
 }
 
 struct UpdateVisibleEntriesTask {
@@ -931,6 +933,7 @@ impl ProjectPanel {
                     project.read(cx).is_via_collab(),
                     &cx,
                 ),
+                cod_persistence: Default::default(),
             };
             this.update_visible_entries(None, false, false, window, cx);
 
@@ -4850,6 +4853,7 @@ impl ProjectPanel {
                         entry_id,
                     });
                 }
+                this.cod_after_entries_update(window, cx);
                 let elapsed = now.elapsed();
                 if this.last_reported_update.elapsed() > Duration::from_secs(3600) {
                     telemetry::event!(
@@ -7350,6 +7354,7 @@ impl Render for ProjectPanel {
         if !cx.has_active_drag() {
             self.clear_drag_state(cx);
         }
+        self.cod_save_if_changed(cx);
 
         let has_worktree = !self.state.visible_entries.is_empty();
         let project = self.project.read(cx);
