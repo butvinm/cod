@@ -37,6 +37,12 @@ class OpenFileTest(CodTestCase):
                 "the billing-api folder to open",
             )
 
+        with self.step("check that no file is open"):
+            start = self.state()
+            self.expect_equal("tabs", [], start["tabs"])
+            self.expect_equal("active tab", None, start["active_tab"])
+            self.expect_equal("modal", None, start["modal"])
+
         with self.step("press ctrl-p"):
             self.keys("ctrl-p")
             self.wait_for(lambda state: state["modal"] == "file_finder", 10, "the file finder to open")
