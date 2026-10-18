@@ -61,8 +61,8 @@ class OpenLedgerTest(CodTestCase):
 
         with self.step("check the active tab and the only tab"):
             end = self.state()
-            self.expect_equal("active tab", "src/ledger.rs", end["active_tab"])
-            self.expect_equal("tabs", ["src/ledger.rs"], end["tabs"])
+            self.expect_equal("active tab", "ledger.rs", end["active_tab"])
+            self.expect_equal("tabs", ["ledger.rs"], end["tabs"])
             self.expect_equal("modal", None, end["modal"])
 
 
