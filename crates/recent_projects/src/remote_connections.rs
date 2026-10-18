@@ -215,15 +215,42 @@ pub async fn open_remote_project(
     // window's restore owner, and the restoration is registered before connecting, so a
     // matching open waits for it. It is done when this function returns (`cod_restore_done`
     // drops).
+    // Joining and reserving happen in one step: when a matching restoration began after this
+    // open stopped waiting, this open waits for it too and then starts over, so two opens never
+    // both restore the same saved workspace.
     let (cod_restore_owner, cod_restore_done) = if created_new_window {
-        match cx.update(|cx| workspace::cod_begin_remote_restore(&connection_options, &paths, cx))
-        {
-            Some((owner, done)) => (Some(owner), Some(done)),
-            None => (None, None),
+        let step = cx.update(|cx| {
+            match workspace::cod_remote_restore_in_progress(&connection_options, &paths, cx) {
+                Some(in_progress) => Err(in_progress),
+                None => Ok(workspace::cod_begin_remote_restore(
+                    &connection_options,
+                    &paths,
+                    cx,
+                )),
+            }
+        });
+        match step {
+            Ok(Some((owner, done))) => (Some(owner), Some(done)),
+            Ok(None) => (None, None),
+            Err((restore_id, restore_done)) => {
+                restore_done.await.ok();
+                cx.update(|cx| workspace::cod_end_remote_restore(restore_id, cx));
+                return Box::pin(open_remote_project(
+                    connection_options,
+                    paths,
+                    app_state,
+                    open_options,
+                    cx,
+                ))
+                .await;
+            }
         }
     } else {
         (None, None)
     };
+    // A cancelled or failed restoration gives its owner back, so a later attempt restores the
+    // same saved window with its complete membership.
+    let cod_returned_owner = cod_restore_owner.clone();
 
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
@@ -337,6 +364,9 @@ pub async fn open_remote_project(
                         })
                         .ok();
                 }
+                if let Some(owner) = cod_returned_owner.clone() {
+                    cx.update(|cx| workspace::cod_add_restore_owner(owner, cx));
+                }
 
                 break;
             },
@@ -377,6 +407,18 @@ pub async fn open_remote_project(
                     continue;
                 }
 
+                // Cod (#24): a failed restoration keeps the saved window: the window gives back
+                // its saved key before it goes, and the owner goes back to the application.
+                if cod_restore_done.is_some() {
+                    window
+                        .update(cx, |multi_workspace, _, _| {
+                            multi_workspace.cod_release_restore_owner()
+                        })
+                        .ok();
+                }
+                if let Some(owner) = cod_returned_owner.clone() {
+                    cx.update(|cx| workspace::cod_add_restore_owner(owner, cx));
+                }
                 if created_new_window {
                     window
                         .update(cx, |_, window, _| window.remove_window())
@@ -437,6 +479,18 @@ pub async fn open_remote_project(
                     continue;
                 }
 
+                // Cod (#24): a failed restoration keeps the saved window: the window gives back
+                // its saved key before it goes, and the owner goes back to the application.
+                if cod_restore_done.is_some() {
+                    window
+                        .update(cx, |multi_workspace, _, _| {
+                            multi_workspace.cod_release_restore_owner()
+                        })
+                        .ok();
+                }
+                if let Some(owner) = cod_returned_owner.clone() {
+                    cx.update(|cx| workspace::cod_add_restore_owner(owner, cx));
+                }
                 if created_new_window {
                     window
                         .update(cx, |_, window, _| window.remove_window())
