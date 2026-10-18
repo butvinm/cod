@@ -2271,6 +2271,17 @@ impl Workspace {
                 None if reuse_saved_by_roots => db.workspace_for_roots(paths_to_open.as_slice()),
                 None => None,
             };
+            // Cod (#24): a restore by id opens a local project, and its first save would write
+            // the row as local. A row saved as remote is never restored here; it stays as saved.
+            if restore_id.is_some()
+                && let Some(saved) = serialized_workspace.as_ref()
+                && matches!(saved.location, SerializedWorkspaceLocation::Remote(_))
+            {
+                anyhow::bail!(
+                    "workspace {:?} is saved as remote and is not restored as local",
+                    saved.id
+                );
+            }
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();

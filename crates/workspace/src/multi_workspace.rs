@@ -1262,6 +1262,16 @@ impl MultiWorkspace {
             let mut members: Vec<crate::persistence::model::SessionWorkspace> = Vec::new();
             for id in &moved_ids {
                 match db.workspace_for_id(*id) {
+                    // Cod (#24): a remote member is not opened as a local project, which would
+                    // save its row as local. It stays in the destination's saved list as saved.
+                    Some(saved)
+                        if matches!(
+                            saved.location,
+                            crate::persistence::model::SerializedWorkspaceLocation::Remote(_)
+                        ) =>
+                    {
+                        log::info!("Moved remote workspace {id:?} keeps its saved row");
+                    }
                     Some(saved) => members.push(crate::persistence::model::SessionWorkspace {
                         workspace_id: *id,
                         location: saved.location,
