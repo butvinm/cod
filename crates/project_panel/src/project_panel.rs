@@ -935,6 +935,7 @@ impl ProjectPanel {
                 ),
                 cod_persistence: Default::default(),
             };
+            Self::cod_watch_state(cx);
             this.update_visible_entries(None, false, false, window, cx);
 
             this

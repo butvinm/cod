@@ -241,8 +241,42 @@ impl ProjectPanel {
         }));
     }
 
-    /// Called on render: when the expanded folders or the selection changed since the last save, writes them after a short debounce. The write runs on the database thread.
+    /// Saves the panel state from its logical changes, not from rendering, so a change made while the panel is hidden is kept: every notify of the panel checks for a change. A write still waiting for its debounce runs at once on quit, and is not dropped when the panel goes away.
+    pub(crate) fn cod_watch_state(cx: &mut Context<Self>) {
+        cx.observe_self(|this, cx| this.cod_save_if_changed(cx))
+            .detach();
+        cx.on_app_quit(|this, cx| this.cod_flush_save(cx)).detach();
+        cx.on_release(|this, _cx| {
+            if let Some(task) = this.cod_persistence.save_task.take() {
+                task.detach();
+            }
+        })
+        .detach();
+    }
+
+    /// Writes the current panel state now, also when a debounced write of it is still waiting. The returned task ends once it is written.
+    pub(crate) fn cod_flush_save(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let waiting = self
+            .cod_persistence
+            .save_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready());
+        if waiting {
+            self.cod_persistence.last_saved = None;
+        }
+        self.cod_save(Duration::ZERO, cx);
+        self.cod_persistence
+            .save_task
+            .take()
+            .unwrap_or_else(|| Task::ready(()))
+    }
+
+    /// Called on render and on every notify of the panel: when the expanded folders or the selection changed since the last save, writes them after a short debounce. The write runs on the database thread.
     pub(crate) fn cod_save_if_changed(&mut self, cx: &mut Context<Self>) {
+        self.cod_save(SAVE_DEBOUNCE, cx);
+    }
+
+    fn cod_save(&mut self, delay: Duration, cx: &mut Context<Self>) {
         if !matches!(self.cod_persistence.restore, CodRestore::Done) {
             return;
         }
@@ -279,7 +313,9 @@ impl ProjectPanel {
         };
         let kvp = KeyValueStore::global(cx);
         self.cod_persistence.save_task = Some(cx.spawn(async move |_, cx| {
-            cx.background_executor().timer(SAVE_DEBOUNCE).await;
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
             kvp.scoped(COD_PANEL_STATE_SCOPE)
                 .write(key, text)
                 .await
