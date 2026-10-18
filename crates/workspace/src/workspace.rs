@@ -12446,7 +12446,38 @@ pub async fn prepare_windows_to_quit(
     // session_id/window_id are up-to-date in the database.
     flush_windows_serialization(workspace_windows, cx).await;
 
+    // Cod (#24): the final registry write is on disk before quit completes. A failed write is
+    // retried a few times. When it still fails, the failure is logged and the previous committed
+    // document stays as it is: each write replaces the whole document in one statement, so no
+    // partial document is ever written.
+    if !cod_flush_registry_for_quit(cx).await {
+        log::error!(
+            "The Cod window registry could not be written before quit; the previous saved window list stays"
+        );
+    }
+
     true
+}
+
+/// Cod (#24): writes the window registry again while it is dirty, up to a few attempts. True once
+/// the registry is known to be on disk.
+async fn cod_flush_registry_for_quit(cx: &mut AsyncApp) -> bool {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let flush = cx.update(|cx| crate::persistence::cod_registry_flush(cx));
+        match flush.await {
+            Ok(()) => return true,
+            Err(err) => log::error!(
+                "Writing the Cod window registry before quit failed (attempt {attempt} of {ATTEMPTS}): {err:#}"
+            ),
+        }
+        if attempt < ATTEMPTS {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    }
+    false
 }
 
 pub(crate) async fn prepare_window_to_close(
