@@ -297,6 +297,9 @@ pub struct ProjectGroupState {
 pub enum RemovalIntent {
     KeepProject,
     CloseProject,
+    /// Cod (#24): the project moves to another window ("Open Project in New Window"). Like
+    /// `CloseProject` for this window, but its workspaces keep their names.
+    MoveProject,
 }
 
 /// One row per workspace held by this window. The displayed workspace is
@@ -967,6 +970,16 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        self.remove_project_group_with_intent(group_key, RemovalIntent::CloseProject, window, cx)
+    }
+
+    fn remove_project_group_with_intent(
+        &mut self,
+        group_key: &ProjectGroupKey,
+        intent: RemovalIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
         // The active workspace can remain unpinned while the sidebar is
         // closed. Pin it first: this puts it in the removal set below, and
         // stops `activate` from pinning it while switching to the
@@ -982,7 +995,7 @@ impl MultiWorkspace {
 
         let workspaces = self.workspaces_for_project_group(group_key, cx);
 
-        let task = self.remove(workspaces, RemovalIntent::CloseProject, window, cx);
+        let task = self.remove(workspaces, intent, window, cx);
 
         self.project_groups.retain(|group| group.key != *group_key);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
@@ -1056,7 +1069,8 @@ impl MultiWorkspace {
             }));
         }
 
-        let remove_task = self.remove_project_group(key, window, cx);
+        let remove_task =
+            self.remove_project_group_with_intent(key, RemovalIntent::MoveProject, window, cx);
 
         cx.spawn(async move |_this, cx| {
             futures::future::join_all(serialization_tasks).await;
@@ -1396,6 +1410,18 @@ impl MultiWorkspace {
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        self.detach_workspace_with_intent(workspace, RemovalIntent::CloseProject, cx);
+    }
+
+    /// Like `detach_workspace`; with `RemovalIntent::MoveProject` the workspace keeps its name
+    /// because it goes on in another window.
+    fn detach_workspace_with_intent(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        intent: RemovalIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let keep_name = intent == RemovalIntent::MoveProject;
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
                 index,
@@ -1421,7 +1447,9 @@ impl MultiWorkspace {
             // half removed workspace.
             // Until the binding is gone, any save of the list in between still lists it.
             let kvp = db::kvp::KeyValueStore::global(cx);
-            cod_workspaces::forget_workspace_name(workspace_id, cx);
+            if !keep_name {
+                cod_workspaces::forget_workspace_name(workspace_id, cx);
+            }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);
             self.cod_removing_workspace_ids.push(workspace_id);
@@ -1431,9 +1459,11 @@ impl MultiWorkspace {
                     db.set_session_binding(workspace_id, None, None)
                         .await
                         .log_err();
-                    cod_workspaces::delete_stored_workspace_name(&kvp, workspace_id)
-                        .await
-                        .log_err();
+                    if !keep_name {
+                        cod_workspaces::delete_stored_workspace_name(&kvp, workspace_id)
+                            .await
+                            .log_err();
+                    }
                     let Ok(membership) = this.update(cx, |this, cx| {
                         this.cod_removing_workspace_ids
                             .retain(|id| *id != workspace_id);
@@ -1841,7 +1871,7 @@ impl MultiWorkspace {
                         continue;
                     }
                     if this.held_index(workspace).is_some() {
-                        this.detach_workspace(workspace, cx);
+                        this.detach_workspace_with_intent(workspace, intent, cx);
                         removed_any = true;
                     }
                 }
@@ -1891,7 +1921,7 @@ impl MultiWorkspace {
                         });
 
                     this.activate(replacement, None, window, cx);
-                    this.detach_workspace(&displayed_workspace, cx);
+                    this.detach_workspace_with_intent(&displayed_workspace, intent, cx);
                     removed_any = true;
                 } else if *this.workspace() != original_active
                     && !workspaces.contains(&original_active)
