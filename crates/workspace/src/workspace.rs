@@ -4918,6 +4918,31 @@ impl Workspace {
             .unwrap_or_else(|| self.active_pane.read(cx).focus_handle(cx))
     }
 
+    /// Cod (#24): the element a restored or freshly loaded workspace focuses. GPUI sends no
+    /// focus-in events while the platform window is inactive, so a focused pane does not pass the
+    /// focus on to its editor, the editor registers no text input and typed characters are lost.
+    /// Focus the active item itself; an empty pane and a zoomed panel keep the fallback.
+    pub fn cod_restored_focus_handle(&self, window: &Window, cx: &App) -> FocusHandle {
+        let fallback = self.fallback_focus_handle(window, cx);
+        let active_pane = self.active_pane.read(cx);
+        if fallback != active_pane.focus_handle(cx) {
+            return fallback;
+        }
+        active_pane
+            .active_item()
+            .map(|item| item.item_focus_handle(cx))
+            .unwrap_or(fallback)
+    }
+
+    /// Cod (#24): focuses what `cod_restored_focus_handle` names, unless a modal is open.
+    pub fn cod_focus_restored(&self, window: &mut Window, cx: &mut App) {
+        if self.modal_layer.read(cx).has_active_modal() {
+            return;
+        }
+        let focus_handle = self.cod_restored_focus_handle(window, cx);
+        window.focus(&focus_handle, cx);
+    }
+
     fn dismiss_zoomed_items_to_reveal(
         &mut self,
         dock_to_reveal: Option<DockPosition>,
@@ -8040,7 +8065,7 @@ impl Workspace {
                         // Cod (#24): a workspace restored behind the active one does not take
                         // the focus; it focuses its active pane when it is shown.
                         if workspace.cod_restore_may_focus(cx) {
-                            cx.focus_self(window);
+                            workspace.cod_focus_restored(window, cx);
                         }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
@@ -10457,7 +10482,11 @@ pub async fn restore_multiworkspace(
         Ok(handle) => {
             restore_native_window_state(handle, active_workspace.workspace_id, cx);
             handle
-                .update(cx, |_, window, _cx| {
+                .update(cx, |multi_workspace, window, cx| {
+                    // Cod (#24): the shown workspace's active item takes the keys even when the
+                    // platform window is not active yet.
+                    let shown = multi_workspace.workspace().clone();
+                    shown.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                     window.activate_window();
                 })
                 .ok();

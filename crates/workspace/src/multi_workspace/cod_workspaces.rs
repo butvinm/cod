@@ -442,17 +442,11 @@ impl MultiWorkspace {
                         if *this.workspace() != workspace {
                             this.activate(workspace, None, window, cx);
                         }
-                        // The items are loaded now: the shown workspace takes the keys, unless
-                        // the user opened a modal in it meanwhile.
-                        let has_modal = this
-                            .workspace()
-                            .read(cx)
-                            .modal_layer()
-                            .read(cx)
-                            .has_active_modal();
-                        if !has_modal {
-                            this.focus_active_workspace(window, cx);
-                        }
+                        // The items are loaded now: the shown workspace's active item takes the
+                        // keys, unless the user opened a modal in it meanwhile. Focusing only the
+                        // pane is not enough while the platform window is inactive.
+                        let shown = this.workspace().clone();
+                        shown.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                     }
                     (Ok(()), None) => {
                         log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
