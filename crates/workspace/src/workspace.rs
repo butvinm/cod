@@ -4974,7 +4974,11 @@ impl Workspace {
             .detach();
         self.panes.push(pane.clone());
 
-        window.focus(&pane.focus_handle(cx), cx);
+        // Cod (#24): a pane added to a workspace the window does not show stays unfocused; a
+        // focused pane that is not drawn would take the keys away from the shown workspace.
+        if self.owns_window_chrome() {
+            window.focus(&pane.focus_handle(cx), cx);
+        }
 
         cx.emit(Event::PaneAdded(pane.clone()));
         pane
@@ -6733,10 +6737,14 @@ impl Workspace {
         }
     }
 
-    /// Cod (#24): whether restoring this workspace's panes and items may move the window
-    /// focus. A workspace that is not shown never takes the focus, and the shown one leaves it
-    /// in a modal the user has opened meanwhile.
+    /// Cod (#24): whether opening panes and items may move the window focus. Only a restore
+    /// is held back: a workspace that restores while it is not shown never takes the focus,
+    /// and a shown one that restores leaves it in a modal the user has opened meanwhile. Opens
+    /// made by the user (the file finder, the project panel, a split) focus like in Zed.
     pub(crate) fn cod_restore_may_focus(&self, cx: &App) -> bool {
+        if !self.cod_restore_in_progress {
+            return true;
+        }
         self.owns_window_chrome() && !self.modal_layer.read(cx).has_active_modal()
     }
 
@@ -11350,7 +11358,10 @@ pub fn open_workspace_by_id(
                     workspace.centered_layout = centered_layout;
                     workspace
                 });
-                multi_workspace.add(workspace.clone(), &*window, cx);
+                // Cod (#24): the only caller with a window shows a pending member that loads
+                // on its first show, so the workspace is shown before its items restore and
+                // never restores hidden.
+                multi_workspace.activate(workspace.clone(), None, window, cx);
                 workspace
             })?;
             (window, workspace)
