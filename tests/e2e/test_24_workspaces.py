@@ -890,6 +890,84 @@ class WorkspacesTest(CodTestCase):
             self.expect_equal("workspace name", PAY_NAME, active(state)["name"])
             self.expect_equal("workspaces", before, workspace_list(state))
 
+    def test_ac5_two_workspaces_on_the_same_folder_come_back_apart(self) -> None:
+        """Two workspaces with exactly the same folder keep their own name, tab and cursor across a restart (Zed keyed saved workspaces by their folders)."""
+        ledger_name = "[PAY-1300] (billing-api) Ledger export"
+
+        with self.step("create the fixture repo billing-api"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for_worktrees([billing_api])
+
+        with self.step(f"workspace A: open invoice.rs at line 20 and rename it to {PAY_NAME!r}"):
+            self.open_file("invoice.rs")
+            self.go_to_line(20)
+            self.rename_workspace(PAY_NAME)
+            a_index = self.state()["active_workspace"]
+
+        with self.step(f"workspace B: run {NEW_WORKSPACE!r}, add billing-api too, open ledger.rs at line 12 and rename it to {ledger_name!r}"):
+            self.new_workspace()
+            self.add_folder(billing_api)
+            self.open_file("ledger.rs")
+            self.go_to_line(12)
+            self.rename_workspace(ledger_name)
+            b_index = self.state()["active_workspace"]
+            if b_index == a_index:
+                raise AssertionError(f"expected workspace B at another index than A ({a_index}), actual {b_index}")
+
+        a_expected = {
+            "name": PAY_NAME,
+            "worktrees": [real(billing_api)],
+            "panes": [{"tabs": ["invoice.rs"], "active_tab": "invoice.rs"}],
+            "split": None,
+            "active_tab": "invoice.rs",
+            "cursor": {"row": 20, "column": 1},
+            "drawn_tabs": ["invoice.rs"],
+        }
+        b_expected = {
+            "name": ledger_name,
+            "worktrees": [real(billing_api)],
+            "panes": [{"tabs": ["ledger.rs"], "active_tab": "ledger.rs"}],
+            "split": None,
+            "active_tab": "ledger.rs",
+            "cursor": {"row": 12, "column": 1},
+            "drawn_tabs": ["ledger.rs"],
+        }
+
+        with self.step(f"check workspace A with {PREVIOUS_WORKSPACE!r}, then leave workspace B active with {NEXT_WORKSPACE!r}"):
+            self.switch_workspace(PREVIOUS_WORKSPACE, a_index, "workspace A", a_expected)
+            self.wait_for_title(PAY_NAME)
+            state = self.switch_workspace(NEXT_WORKSPACE, b_index, "workspace B", b_expected)
+            self.wait_for_title(ledger_name)
+            before = workspace_list(state)
+            self.expect_equal(
+                "workspaces",
+                sorted([{"name": PAY_NAME, "worktrees": [real(billing_api)]}, {"name": ledger_name, "worktrees": [real(billing_api)]}], key=str),
+                sorted(before, key=str),
+            )
+
+        with self.step("quit Cod with ctrl-q and start it again"):
+            self.restart_cod()
+
+        with self.step("check that both workspaces came back and B, the active one, is active again with its tab and cursor"):
+            state = self.wait_for_values(
+                "the restored window",
+                {"workspace_count": 2, "active_workspace": b_index, "modal": None, **b_expected},
+                layout,
+                RESTORE_TIMEOUT,
+            )
+            self.wait_for_values("the restored workspaces", {"workspaces": before}, lambda state: {"workspaces": workspace_list(state)}, SHOW_TIMEOUT)
+            self.expect_equal("window count", 1, state["window_count"])
+            self.wait_for_title(ledger_name)
+
+        with self.step(f"switch to workspace A with {PREVIOUS_WORKSPACE!r} and check its tab, cursor and name in the window title"):
+            state = self.switch_workspace(PREVIOUS_WORKSPACE, a_index, "workspace A", a_expected)
+            self.expect_layout("workspace A", a_expected, state)
+            state = self.wait_for_title(PAY_NAME)
+            self.expect_equal("workspaces", before, workspace_list(state))
+
     # AC6
 
     def test_ac6_close_workspace_asks_to_save_and_it_stays_closed(self) -> None:
