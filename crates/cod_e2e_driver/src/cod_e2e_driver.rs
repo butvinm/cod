@@ -745,6 +745,7 @@ fn read_state(
         .map(|palette| palette.read(cx).focus_handle(cx).contains_focused(window, cx));
     // Whether the platform reports Cod's window as the active (keyboard) window.
     let window_active = window.is_window_active();
+    let focus = focus_state(workspace, window, cx);
     let modal = if workspace
         .active_modal::<file_finder::FileFinder>(cx)
         .is_some()
@@ -783,8 +784,46 @@ fn read_state(
         "file_finder_ready": file_finder_ready,
         "palette_focused": palette_focused,
         "window_active": window_active,
+        "focus": focus,
         "prompt": prompt,
     }))
+}
+
+/// What holds the window's focus, read only: null when nothing is focused, else `kind` is
+/// "item" (an item of the active workspace is focused itself, so an editor takes typed text),
+/// "in_item" (an element inside such an item), "pane" (a pane of the active workspace),
+/// "modal" (anything while a modal is open) or "other"; `tab` names the item for the first two.
+fn focus_state(workspace: &Workspace, window: &Window, cx: &App) -> Value {
+    if window.focused(cx).is_none() {
+        return Value::Null;
+    }
+    let mut inside: Option<String> = None;
+    for pane in workspace.panes() {
+        let pane = pane.read(cx);
+        for item in pane.items() {
+            let handle = item.item_focus_handle(cx);
+            if handle.is_focused(window) {
+                return json!({ "kind": "item", "tab": tab_title(&**item, cx) });
+            }
+            if inside.is_none() && handle.contains_focused(window, cx) {
+                inside = Some(tab_title(&**item, cx));
+            }
+        }
+    }
+    if let Some(tab) = inside {
+        return json!({ "kind": "in_item", "tab": tab });
+    }
+    if workspace
+        .panes()
+        .iter()
+        .any(|pane| pane.read(cx).focus_handle(cx).is_focused(window))
+    {
+        return json!({ "kind": "pane", "tab": Value::Null });
+    }
+    if workspace.modal_layer().read(cx).has_active_modal() {
+        return json!({ "kind": "modal", "tab": Value::Null });
+    }
+    json!({ "kind": "other", "tab": Value::Null })
 }
 
 /// The socket side: runs on background threads only.
