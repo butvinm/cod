@@ -1659,6 +1659,10 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    /// Cod (#24): true while `load_workspace` restores this workspace. No layout is saved then
+    /// (scheduled, internal or flush), so a crash keeps the previous complete snapshot; the
+    /// restore publishes the layout itself once the items are written.
+    cod_restore_in_progress: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2168,6 +2172,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            cod_restore_in_progress: false,
         }
     }
 
@@ -7756,6 +7761,9 @@ impl Workspace {
         let Some(database_id) = self.database_id() else {
             return Task::ready(());
         };
+        if self.cod_restore_in_progress {
+            return Task::ready(());
+        }
 
         fn build_serialized_pane_group(
             pane_group: &Member,
@@ -7961,6 +7969,7 @@ impl Workspace {
             workspace.update(cx, |workspace, _| {
                 workspace.persisted_recent_navigation_history = recent_navigation_history;
                 workspace.restoring_workspace = true;
+                workspace.cod_restore_in_progress = true;
             })?;
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
 
@@ -8082,11 +8091,27 @@ impl Workspace {
                     })
                     .collect::<Vec<_>>()
             })?;
+            let mut items_saved = true;
             for item_save_task in item_save_tasks {
-                item_save_task.await.log_err();
+                if item_save_task.await.log_err().is_none() {
+                    items_saved = false;
+                }
+            }
+            if !items_saved {
+                // Keep the previous snapshot: its layout points at the old item records, which
+                // stay. The next change of the workspace saves it again.
+                log::error!("Restored items were not saved; the previous layout is kept");
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.cod_restore_in_progress = false;
+                        workspace.update_window_edited(window, cx);
+                    })
+                    .ok();
+                return Ok(opened_items);
             }
             workspace
                 .update_in(cx, |workspace, window, cx| {
+                    workspace.cod_restore_in_progress = false;
                     workspace.serialize_workspace_internal(window, cx)
                 })?
                 .await;
