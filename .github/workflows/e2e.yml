@@ -152,25 +152,6 @@ jobs:
           path: ${{ env.CEF_PATH }}
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
-      # TEMPORARY (AC4, reverted next): the binaries for the e2e-guide job.
-      - name: Pack the binaries for e2e-guide
-        if: steps.changes.outputs.code == 'true'
-        run: |
-          mkdir -p "$RUNNER_TEMP/e2e-bin"
-          strip -o "$RUNNER_TEMP/e2e-bin/zed" target/release-fast/zed
-          strip -o "$RUNNER_TEMP/e2e-bin/cod-browser" target/release-fast/cod-browser
-          tar -C "$RUNNER_TEMP/e2e-bin" -cf - zed cod-browser | xz -T0 -6 > "$RUNNER_TEMP/e2e-binaries.tar.xz"
-          ls -l "$RUNNER_TEMP/e2e-bin" "$RUNNER_TEMP/e2e-binaries.tar.xz"
-
-      - name: Upload the binaries for e2e-guide
-        if: steps.changes.outputs.code == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-binaries
-          path: ${{ runner.temp }}/e2e-binaries.tar.xz
-          retention-days: 3
-          compression-level: 0
-
       # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. Nothing here changes what the tests do.
       - name: Run end-to-end tests
         if: steps.changes.outputs.code == 'true'
@@ -187,52 +168,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
-          path: target/e2e-artifacts
-          retention-days: 14
-          if-no-files-found: warn
-
-  # TEMPORARY (AC4, reverted next): a fresh runner with no Rust toolchain and no build packages follows tests/e2e/README.md, "Run with a prebuilt binary", and runs the guide's command.
-  e2e-guide:
-    name: e2e-guide
-    needs: e2e
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Check out
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      # Steps 1 and 2 are run from the guide's own text: the first two code blocks of the section.
-      - name: Follow the guide, steps 1 and 2 (packages and CEF)
-        run: |
-          awk '/^### Run with a prebuilt binary/{s=1;next} /^## /{s=0} s && /^   ```/{f=!f; if(!f) n++; next} s && f && n<2 {sub(/^   /,""); print}' tests/e2e/README.md > "$RUNNER_TEMP/guide.sh"
-          echo "The guide's commands:"
-          cat "$RUNNER_TEMP/guide.sh"
-          bash -euxo pipefail "$RUNNER_TEMP/guide.sh"
-          ls -l ~/.local/share/cod-preview
-          echo "Rust toolchain of the runner image: $(command -v cargo || echo none). script/e2e does not call cargo when COD_E2E_BIN is set."
-
-      - name: Download the binaries built by the e2e job
-        uses: actions/download-artifact@v4
-        with:
-          name: e2e-binaries
-          path: ${{ runner.temp }}/download
-
-      - name: Unpack the binaries
-        run: |
-          mkdir -p "$HOME/cod-bin"
-          xz -dc "$RUNNER_TEMP/download/e2e-binaries.tar.xz" | tar -C "$HOME/cod-bin" -xf -
-          ls -l "$HOME/cod-bin"
-
-      - name: Follow the guide, step 3 (the command)
-        run: COD_E2E_BIN="$HOME/cod-bin/zed" script/e2e
-
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-guide-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
           path: target/e2e-artifacts
           retention-days: 14
           if-no-files-found: warn
