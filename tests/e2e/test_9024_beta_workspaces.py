@@ -275,8 +275,12 @@ class BetaWorkspacesTest(CodTestCase):
             self.snap("07-after-restart")
 
         with self.step(f"after the restart, switch to the second ticket with {w24.NEXT_WORKSPACE!r}: refund.rs at line 9"):
+            started = time.monotonic()
             state = self.switch_workspace(w24.NEXT_WORKSPACE, b_index, "the restored second ticket", b_expected)
+            log(f"OBSERVE [first switch after restart]: the second ticket showed its layout {time.monotonic() - started:.2f} s after the palette command started")
             self.wait_for_title(REFUND_NAME)
+            self.observe("second ticket after restart")
+            self.snap("07b-second-after-restart")
 
         with self.step("second ticket: type an unsaved edit in refund.rs"):
             self.type(REFUND_DRAFT)
