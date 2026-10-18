@@ -347,6 +347,10 @@ pub struct MultiWorkspace {
     /// Cod (#24): the window's workspace list as it was saved, so a pending member keeps its
     /// place among the others.
     cod_saved_order: Vec<WorkspaceId>,
+    /// Cod (#24): the saved id of the shown member of a remote window built from its restore
+    /// owner. The remote open of that window loads this exact row, not the latest row with the
+    /// same folders.
+    cod_remote_restore_id: Option<WorkspaceId>,
     /// Cod (#24): members of this window that are not loaded yet (lazy restore), with the
     /// folders of each. A pending member loads in the foreground the first time it is shown.
     cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
@@ -448,6 +452,7 @@ impl MultiWorkspace {
             cod_unrestored_workspace_ids: cod_saved_order.clone(),
             cod_removing_workspace_ids: Vec::new(),
             cod_saved_order,
+            cod_remote_restore_id: None,
             cod_pending: std::collections::HashMap::new(),
             cod_materializing: false,
             // Cod (#24): a restored window has its saved key from its restore owner; a window
@@ -1837,6 +1842,13 @@ impl MultiWorkspace {
         self.cod_window_key = owner.key;
         self.cod_unrestored_workspace_ids = owner.workspace_ids.clone();
         self.cod_saved_order = owner.workspace_ids;
+        self.cod_remote_restore_id = Some(owner.active_workspace_id);
+    }
+
+    /// Cod (#24): the saved id of the shown member this window was restored for, if it was
+    /// built from a restore owner.
+    pub fn cod_remote_restore_id(&self) -> Option<WorkspaceId> {
+        self.cod_remote_restore_id
     }
 
     /// Cod (#24): after consent, a project group move transfers its complete ordered

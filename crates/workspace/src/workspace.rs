@@ -12171,9 +12171,20 @@ pub fn open_remote_project_with_new_connection(
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
-        let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(remote_connection.connection_options(), paths.clone(), cx)
-                .await?;
+        // Cod (#24): a window built from its restore owner loads the owner's saved row.
+        let restore_id = window
+            .update(cx, |multi_workspace, _window, _cx| {
+                multi_workspace.cod_remote_restore_id()
+            })
+            .ok()
+            .flatten();
+        let (workspace_id, serialized_workspace) = deserialize_remote_project(
+            remote_connection.connection_options(),
+            paths.clone(),
+            restore_id,
+            cx,
+        )
+        .await?;
 
         let session = match cx
             .update(|cx| {
@@ -12232,7 +12243,8 @@ pub fn open_remote_project_with_existing_connection(
 ) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
         let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
+            deserialize_remote_project(connection_options.clone(), paths.clone(), None, cx)
+                .await?;
 
         open_remote_project_inner(
             project,
@@ -12367,6 +12379,7 @@ async fn open_remote_project_inner(
 fn deserialize_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
+    restore_id: Option<WorkspaceId>,
     cx: &AsyncApp,
 ) -> Task<Result<(WorkspaceId, Option<SerializedWorkspace>)>> {
     let db = cx.update(|cx| WorkspaceDb::global(cx));
@@ -12378,7 +12391,15 @@ fn deserialize_remote_project(
             .get_or_create_remote_connection(connection_options)
             .await?;
 
-        let serialized_workspace = if reuse_saved_by_roots {
+        // Cod (#24): a restore names its saved row by id. It is used only when that row is
+        // remote and has these folders; root-based selection is for ordinary opens.
+        let restored = restore_id.and_then(|id| db.workspace_for_id(id)).filter(|saved| {
+            matches!(saved.location, SerializedWorkspaceLocation::Remote(_))
+                && saved.paths == PathList::new(&paths)
+        });
+        let serialized_workspace = if restored.is_some() {
+            restored
+        } else if reuse_saved_by_roots {
             db.remote_workspace_for_roots(&paths, remote_connection_id)
         } else {
             None
