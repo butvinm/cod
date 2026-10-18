@@ -351,6 +351,9 @@ pub struct MultiWorkspace {
     /// Cod (#24): next (true) and previous (false) switches asked for while a pending member
     /// loads; they run in order once it is shown.
     cod_queued_cycles: Vec<bool>,
+    /// Cod (#24): activation requests by workspace id that arrived while another pending member
+    /// loaded; each is woken once that load ends and then loads or shows its own member.
+    cod_materialize_waiters: Vec<futures::channel::oneshot::Sender<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -425,6 +428,7 @@ impl MultiWorkspace {
             cod_window_key: crate::persistence::cod_new_window_key(),
             cod_move_keys: std::collections::HashMap::new(),
             cod_queued_cycles: Vec::new(),
+            cod_materialize_waiters: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,

@@ -11549,8 +11549,14 @@ pub async fn find_existing_workspace(
                     .ok();
                 if let Some(show) = show {
                     if show.await.log_err().is_some() {
+                        // The workspace with the requested id, never whichever one is active.
                         existing = cx.update(|cx| {
-                            let workspace = window.read(cx).ok()?.workspace().clone();
+                            let workspace = window
+                                .read(cx)
+                                .ok()?
+                                .workspaces()
+                                .find(|workspace| workspace.read(cx).database_id() == Some(id))
+                                .cloned()?;
                             Some((window, workspace))
                         });
                     }

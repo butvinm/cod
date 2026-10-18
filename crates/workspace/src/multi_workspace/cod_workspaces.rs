@@ -412,7 +412,35 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         if self.cod_materializing {
-            return Task::ready(Ok(()));
+            // Another member is loading: wait for it, then load or show this one by its id.
+            // Success is never reported for a member that was not shown.
+            let (done_tx, done_rx) = futures::channel::oneshot::channel();
+            self.cod_materialize_waiters.push(done_tx);
+            return cx.spawn_in(window, async move |this, cx| {
+                done_rx.await.ok();
+                this.update_in(cx, |this, window, cx| {
+                    if this.cod_pending.contains_key(&id) {
+                        return this.cod_activate_pending(id, window, cx);
+                    }
+                    let loaded = this
+                        .held
+                        .iter()
+                        .map(|held| held.workspace.clone())
+                        .find(|workspace| workspace.read(cx).database_id() == Some(id));
+                    match loaded {
+                        Some(workspace) => {
+                            if *this.workspace() != workspace {
+                                this.activate(workspace, None, window, cx);
+                            }
+                            Task::ready(Ok(()))
+                        }
+                        None => Task::ready(Err(anyhow::anyhow!(
+                            "workspace {id:?} is not in this window"
+                        ))),
+                    }
+                })?
+                .await
+            });
         }
         let Some(paths) = self.cod_pending.get(&id).cloned() else {
             return Task::ready(Err(anyhow::anyhow!("workspace {id:?} is not pending")));
@@ -480,6 +508,10 @@ impl MultiWorkspace {
                 // Run the switches asked for while the member loaded.
                 for forward in std::mem::take(&mut this.cod_queued_cycles) {
                     this.cycle_workspace(forward, window, cx);
+                }
+                // Then the activations by id asked for meanwhile, in the order they came.
+                for waiter in std::mem::take(&mut this.cod_materialize_waiters) {
+                    waiter.send(()).ok();
                 }
             })?;
             result
