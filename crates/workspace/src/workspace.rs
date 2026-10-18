@@ -1663,6 +1663,9 @@ pub struct Workspace {
     /// (scheduled, internal or flush), so a crash keeps the previous complete snapshot; the
     /// restore publishes the layout itself once the items are written.
     cod_restore_in_progress: bool,
+    /// Cod (#24): true after the restored items could not be written. The previous complete
+    /// snapshot stays on disk and no layout that points at missing item records is saved.
+    cod_layout_save_blocked: bool,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2173,6 +2176,7 @@ impl Workspace {
             last_active_project_path: None,
             restoring_workspace: false,
             cod_restore_in_progress: false,
+            cod_layout_save_blocked: false,
         }
     }
 
@@ -7769,7 +7773,7 @@ impl Workspace {
         let Some(database_id) = self.database_id() else {
             return Task::ready(());
         };
-        if self.cod_restore_in_progress {
+        if self.cod_restore_in_progress || self.cod_layout_save_blocked {
             return Task::ready(());
         }
 
@@ -8107,10 +8111,12 @@ impl Workspace {
             }
             if !items_saved {
                 // Keep the previous snapshot: its layout points at the old item records, which
-                // stay. The next change of the workspace saves it again.
+                // stay. No later layout is saved over it in this session, so a partial layout
+                // is never published.
                 log::error!("Restored items were not saved; the previous layout is kept");
                 workspace
                     .update_in(cx, |workspace, window, cx| {
+                        workspace.cod_layout_save_blocked = true;
                         workspace.cod_restore_in_progress = false;
                         workspace.update_window_edited(window, cx);
                     })
