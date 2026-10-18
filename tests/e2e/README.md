@@ -92,6 +92,7 @@ By default Cod runs with `ZED_STATELESS=1`: Zed keeps its database in memory and
 6. Read the app with `self.state()` (fields below) and `self.wait_for(predicate, timeout, description)`. Check with `self.expect_equal("active tab", "invoice.rs", actual)`, which fails with `expected active tab 'invoice.rs', actual '...'`. To wait for a complete outcome, use `self.wait_for_values(what, expected, read, timeout)`: it waits until `read(state)` has every value of `expected` and otherwise fails with one `expected <what> <key> ..., actual ...` per value that still differs.
 7. Check the starting state in its own step before the first key, as the sample does in "check that no file is open". Without it, a test can pass because the expected result was already on the screen.
 8. To check what survives a restart, start Cod with `persistent=True` and call `self.restart_cod()`: it quits Cod with ctrl-q, waits until Cod and every process it started have exited (and fails when Cod exits with an error or does not exit in time), then starts Cod again with the same data folder and home and no folder, so Zed restores its last session.
+9. To check what survives a crash, call `self.kill_cod()`: it kills Cod's process group with SIGKILL, with no clean quit, and every process it started. `self.start_cod_again()` then starts Cod on the same data folder and home with no folder; `connect=False` only launches it, so a test can kill it again while it starts.
 
 ### State fields
 

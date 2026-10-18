@@ -453,6 +453,35 @@ class Cod:
             self.socket_path.unlink()
         log("  Cod quit; no process of it is left")
 
+    def kill(self, timeout: float = QUIT_TIMEOUT) -> None:
+        """Kills Cod as a crash or a power loss would: SIGKILL to its process group, no clean quit, then SIGKILL to every process it started that left the group. The data folder and home stay for the next start."""
+        if self.process is None:
+            raise RuntimeError("Cod is not running")
+        if self.driver is not None:
+            self.driver.close()
+            self.driver = None
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(f"Cod did not exit within {timeout:g} s after SIGKILL") from error
+        self.process = None
+        deadline = time.monotonic() + timeout
+        left = processes_with_marker(self.marker)
+        while left and time.monotonic() < deadline:
+            for pid in left:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+            time.sleep(POLL_INTERVAL)
+            left = processes_with_marker(self.marker)
+        if left:
+            raise AssertionError(f"processes of this Cod were still running {timeout:g} s after SIGKILL: {left}")
+        # The killed Cod leaves its socket file behind; connect() must not see it before the next Cod listens.
+        with contextlib.suppress(FileNotFoundError):
+            self.socket_path.unlink()
+        log("  Cod killed with SIGKILL; no process of it is left")
+
     def stop(self) -> None:
         """Stops Cod and every process it started (the session bus, cod-browser, the browser's helpers)."""
         if self.driver is not None:
@@ -530,6 +559,25 @@ class CodTestCase(unittest.TestCase):
         self.cod.folder = None
         self.cod.start()
         self.cod.connect(timeout)
+
+    def kill_cod(self) -> None:
+        """Kills Cod with SIGKILL (its process group and every process it started), with no clean quit, as a crash would. start_cod_again() starts it on the same data folder."""
+        if self.cod is None or self.cod.process is None:
+            raise RuntimeError("Cod is not running: call start_cod first")
+        self.cod.kill()
+
+    def start_cod_again(self, connect: bool = True, timeout: float = DRIVER_START_TIMEOUT) -> None:
+        """Starts Cod again after kill_cod(), with the same data folder and home and no folder, so Zed restores its last session. connect=False only launches it (to kill it again while it starts)."""
+        if self.cod is None:
+            raise RuntimeError("Cod was never started in this test: call start_cod first")
+        if self.cod.process is not None:
+            raise RuntimeError("Cod is still running: use restart_cod() or kill_cod() first")
+        if not self.cod.persistent:
+            raise RuntimeError("a stateless Cod forgets its session: start it with start_cod(folder, persistent=True)")
+        self.cod.folder = None
+        self.cod.start()
+        if connect:
+            self.cod.connect(timeout)
 
     def run_command(self, command: str, timeout: float = PALETTE_TIMEOUT) -> None:
         """Runs a command from the command palette with keys only: ctrl-shift-p, type the command, wait until the palette highlights exactly that command, enter.
