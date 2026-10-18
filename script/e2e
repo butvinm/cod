@@ -7,8 +7,8 @@
 # Optional environment:
 #   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
-#   COD_E2E_ARTIFACTS  where failed tests save a screenshot and logs; default target/e2e-artifacts
-# Exits with the status of the tests: 0 when all passed.
+#   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
+# Exits with the status of the tests: 0 when all passed. It fails when a process of this run is still running after the tests.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -107,19 +107,31 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/cod-e2e-sway.XXXXXX")
 runtime="$work/runtime"
 mkdir -m 700 "$runtime"
 sway_pid=
-cleanup() {
+stop_sway() {
     if [ -n "$sway_pid" ]; then
         kill "$sway_pid" 2> /dev/null || true
         wait "$sway_pid" 2> /dev/null || true
+        sway_pid=
     fi
-    # Last resort: every process a test started inherited this private XDG_RUNTIME_DIR, so none outlives the run.
+}
+# Prints the ids of the processes of this run: every process started after XDG_RUNTIME_DIR was set below inherited this private folder.
+run_processes() {
     for environ in /proc/[0-9]*/environ; do
         pid=${environ#/proc/}
         pid=${pid%/environ}
         [ "$pid" = "$$" ] && continue
         if grep -qzxF "XDG_RUNTIME_DIR=$runtime" "$environ" 2> /dev/null; then
-            kill -9 "$pid" 2> /dev/null || true
+            echo "$pid"
         fi
+    done
+}
+cleanup() {
+    stop_sway
+    # The commands below do not belong to the run, so they must not inherit its marker.
+    unset XDG_RUNTIME_DIR
+    # Last resort, so that no process outlives the run.
+    for pid in $(run_processes); do
+        kill -9 "$pid" 2> /dev/null || true
     done
     rm -rf "$work"
 }
@@ -150,6 +162,12 @@ say "headless sway runs on $WAYLAND_DISPLAY; artifacts go to $COD_E2E_ARTIFACTS"
 # 7. The tests. Names select tests; without names unittest discovers every test_*.py in tests/e2e (and tests/e2e/unit).
 export PYTHONPATH="$root/tests/e2e${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+{
+    echo "commit: $(git -C "$root" rev-parse HEAD 2> /dev/null || echo unknown)"
+    echo "started: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+    echo "command: script/e2e $*"
+} > "$COD_E2E_ARTIFACTS/run.txt"
 names=0
 skip_next=0
 for arg in "$@"; do
@@ -161,14 +179,38 @@ for arg in "$@"; do
         names=1
     fi
 done
+run_tests() {
+    if [ "$names" = 1 ]; then
+        python3 -m unittest -v "$@"
+    else
+        python3 -m unittest discover -v -s tests/e2e -t tests/e2e "$@"
+    fi
+}
+test_log="$work/unittest.log"
 say "tests started at $(date '+%H:%M:%S')"
 set +e
-if [ "$names" = 1 ]; then
-    python3 -m unittest -v "$@"
-else
-    python3 -m unittest discover -v -s tests/e2e -t tests/e2e "$@"
-fi
-status=$?
+run_tests "$@" 2>&1 | tee "$test_log"
+status=${PIPESTATUS[0]}
 set -e
 say "tests finished at $(date '+%H:%M:%S') with status $status"
+
+# 8. No process of this run may outlive the tests.
+stop_sway
+unset XDG_RUNTIME_DIR WAYLAND_DISPLAY
+leftovers=
+for _ in $(seq 1 50); do
+    leftovers=$(run_processes)
+    [ -z "$leftovers" ] && break
+    sleep 0.1
+done
+if [ -n "$leftovers" ]; then
+    say "processes of this run are still running after the tests:"
+    for pid in $leftovers; do
+        echo "  $pid $(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)" >&2
+    done
+    [ "$status" = 0 ] && status=1
+else
+    say "no process of this run is left"
+fi
+echo "status: $status" >> "$COD_E2E_ARTIFACTS/run.txt"
 exit "$status"

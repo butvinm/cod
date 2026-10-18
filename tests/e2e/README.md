@@ -48,9 +48,11 @@ Each Cod start has its own data folder (`--user-data-dir`) in the test's temp fo
 5. Read the app with `self.state()` (`active_tab`, `tabs`, `worktrees`, `modal`) and `self.wait_for(predicate, timeout, description)`. Check with `self.expect_equal("active tab", "invoice.rs", actual)`, which fails with `expected active tab 'invoice.rs', actual '...'`.
 6. Check the starting state in its own step before the first key, as the sample does in "check that no file is open". Without it, a test can pass because the expected result was already on the screen.
 
-## Failures
+## Artifacts and failures
 
-A failed test saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `hang_traces/` (when Zed's hang detector saved any), `cod-output.log`, `state.json` and `failure.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`. In CI they are the `e2e-artifacts` artifact of the run.
+Every test that starts Cod saves into `$COD_E2E_ARTIFACTS/<test id>/`: `screenshot.png` (grim), `logs/` (Cod's log folder with `Zed.log` and `cod-stderr.log`), `hang_traces/` (when Zed's hang detector saved any), `cod-output.log` and `state.json`. A failed test saves them at its first failed step, with `failure.txt` naming the step; a passing test saves them at its end, with `final.txt`. The sway log is `$COD_E2E_ARTIFACTS/sway.log`, and `run.txt` holds the commit, the command and the status. In CI they are the `e2e-artifacts-<commit>` artifact of every run.
+
+When Cod stops at the end of a test, the test fails if a process carrying its driver socket is still running. After all tests, `script/e2e` lists any process of the run that is still running and fails if there is one.
 
 ## Driver protocol
 
