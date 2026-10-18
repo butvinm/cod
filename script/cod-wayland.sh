@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 # Starts Cod as a native Wayland client with the off-screen web view (issue #16).
 # Usage: cod-wayland.sh [url] [folder]
+# The url is the start page, opened in a split next to the editor. Without arguments it is a Wikipedia article; an empty url ("") means no start page.
 # Unlike cod-xwayland.sh this keeps WAYLAND_DISPLAY: the browser draws into memory and GPUI paints its frames as images, so no X11 window is involved.
 # Needs the cod-browser helper next to the cod executable (or COD_BROWSER_BIN) and the CEF runtime folder in COD_CEF_DIR (libcef.so, the .pak files, icudtl.dat, locales/).
 # COD_CEF_DIR defaults to the cef/ folder next to this script when there is one.
@@ -178,12 +179,18 @@ COD_WEBVIEW_BACKEND=offscreen
 export COD_WEBVIEW_BACKEND
 
 if [ "$#" -gt 0 ]; then
-    COD_SPIKE_URL=$1
+    start_url=$1
     shift
 else
-    COD_SPIKE_URL=https://en.wikipedia.org/wiki/Levenshtein_distance
+    start_url=https://en.wikipedia.org/wiki/Levenshtein_distance
 fi
-export COD_SPIKE_URL
+# An empty url means no start page, so COD_SPIKE_URL is not passed on at all.
+if [ -n "$start_url" ]; then
+    COD_SPIKE_URL=$start_url
+    export COD_SPIKE_URL
+else
+    unset COD_SPIKE_URL
+fi
 
 logs="$data/logs"
 mkdir -p "$logs"
