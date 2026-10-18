@@ -11,7 +11,10 @@
 //!
 //! Keys enter the window the way the Linux platform layer delivers them: `Window::dispatch_event` with `PlatformInput::KeyDown` and `KeyUp`, and when the key down is not handled and carries text, the window's text input receives that text (`Window::dispatch_keystroke` does both).
 //! So the keymap, the focus and the text input behave as they do for a user. The driver never dispatches actions and never calls into views; `state` only reads what the window shows.
+//! Keys go to the window the platform names active. Without a keyboard (the headless sway of the tests has none) the platform names none; then keys go to the newest open workspace window, the one the compositor focuses.
 //! The socket is served on background threads. Every request is handed to one foreground task through a channel, so the GPUI thread never waits for a client.
+//!
+//! Some views keep what they show private. Read-only getters added for this driver (test hooks, no behavior change): `CommandPaletteDelegate::highlighted_command_name` and `listed_query` (command_palette), `ZedPromptRenderer::message`, `detail`, `answers` and `highlighted_answer` (ui_prompt), `ProjectPanel::listed_entries` (project_panel).
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
@@ -20,17 +23,20 @@ use std::{cell::RefCell, rc::Rc, time::Duration};
 use anyhow::{Context as _, Result, anyhow, bail};
 use command_palette::CommandPaletteDelegate;
 use editor::{Editor, ToPoint as _};
-use fuzzy_nucleo::{Case, LengthPenalty, StringMatchCandidate};
 use gpui::{
-    App, AppContext as _, AsyncApp, Entity, Keystroke, Modifiers, SharedString, WeakEntity, Window,
-    WindowHandle,
+    AnyWindowHandle, App, AppContext as _, AsyncApp, Entity, Focusable as _, Keystroke, Modifiers,
+    WeakEntity, Window, WindowHandle,
 };
 use open_path_prompt::OpenPathDelegate;
 use picker::{Picker, PickerDelegate as _};
+use project_panel::{ListedEntry, ProjectPanel};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use settings::{Settings as _, SettingsStore};
-use workspace::{ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings};
+use settings::Settings as _;
+use ui_prompt::ZedPromptRenderer;
+use workspace::{
+    ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
+};
 
 /// The environment variable that names the driver socket.
 pub const SOCKET_ENV: &str = "COD_E2E_SOCKET";
@@ -49,11 +55,31 @@ pub fn init(cx: &mut App) {
     };
     let path = std::path::PathBuf::from(path);
     let memory = Rc::new(RefCell::new(Memory::default()));
-    // The command palette keeps its picker private; the driver remembers each new palette picker to read its query and its matches.
+    // The command palette keeps its picker private; the driver remembers each new palette picker to read its query and its rows.
     cx.observe_new({
         let memory = memory.clone();
         move |_: &mut Picker<CommandPaletteDelegate>, _, cx| {
             memory.borrow_mut().palette = Some(cx.weak_entity());
+        }
+    })
+    .detach();
+    // The window keeps its prompt private; the driver remembers each new prompt drawn in a window (Zed's ui_prompt) and the window it is in.
+    cx.observe_new({
+        let memory = memory.clone();
+        move |_: &mut ZedPromptRenderer, window: Option<&mut Window>, cx| {
+            if let Some(window) = window {
+                memory.borrow_mut().prompt = Some((window.window_handle(), cx.weak_entity()));
+            }
+        }
+    })
+    .detach();
+    // The workspace windows in the order they opened, so keys can go to the newest one when the platform names no active window.
+    cx.observe_new({
+        let memory = memory.clone();
+        move |_: &mut MultiWorkspace, window: Option<&mut Window>, _| {
+            if let Some(window) = window {
+                memory.borrow_mut().windows.push(window.window_handle());
+            }
         }
     })
     .detach();
@@ -65,9 +91,10 @@ pub fn init(cx: &mut App) {
 struct Memory {
     /// The picker of the newest command palette.
     palette: Option<WeakEntity<Picker<CommandPaletteDelegate>>>,
-    /// The command names the palette would list if it opened now, taken before every key press while no palette is open.
-    /// The palette builds its list from the same call (`Window::available_actions` with the palette filter) when the key that opens it is handled, so the list taken before that key is the palette's list.
-    palette_candidates: Vec<SharedString>,
+    /// The newest prompt drawn in a window, with that window.
+    prompt: Option<(AnyWindowHandle, WeakEntity<ZedPromptRenderer>)>,
+    /// Every workspace window that opened, oldest first (closed ones included).
+    windows: Vec<AnyWindowHandle>,
 }
 
 /// The driver uses Unix sockets, so other platforms never start it.
@@ -266,36 +293,26 @@ fn cut(rects: &[Rect], group: &[usize], split: Split) -> Option<Vec<Vec<usize>>>
     (parts.len() > 1).then_some(parts)
 }
 
-/// The command the palette highlights, worked out the way the palette ranks its matches (`CommandPaletteDelegate::update_matches`): the candidates sorted by name, the query normalized, nucleo with smart case and the length penalty.
-/// That ranking holds only without command history, so the tests turn `command_palette.use_command_history` off; with history the caller passes no candidates.
-/// `candidates` must be the palette's own list. The answer is None unless the ranking gives exactly as many matches as the palette shows (`match_count`), which also rules out a palette that is still updating its matches.
+/// The name of the command the palette highlights, or None while that row does not belong to the typed query.
+/// `listed_query` is the query the palette's rows were matched against (None while it is still matching); `resolved_query` is the typed query after command aliases.
 pub fn palette_selection(
-    candidates: &[SharedString],
-    query: &str,
-    match_count: usize,
-    selected_index: usize,
+    listed_query: Option<&str>,
+    resolved_query: &str,
+    highlighted: Option<&str>,
 ) -> Option<String> {
-    let mut names = candidates.to_vec();
-    names.sort();
-    let candidates: Vec<StringMatchCandidate> = names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| StringMatchCandidate::new(index, name.clone()))
-        .collect();
-    let query = command_palette::normalize_action_query(query);
-    let matches = fuzzy_nucleo::match_strings(
-        &candidates,
-        &query,
-        Case::Smart,
-        LengthPenalty::On,
-        10000,
-    );
-    if matches.is_empty() || matches.len() != match_count {
+    if listed_query != Some(resolved_query) {
         return None;
     }
-    matches
-        .get(selected_index)
-        .map(|found| found.string.to_string())
+    highlighted.map(str::to_owned)
+}
+
+/// The name a project panel row has in the driver state: the root name, then the path below the root, joined by `/`.
+pub fn panel_row_name(row: &ListedEntry) -> String {
+    if row.path.is_empty() {
+        row.root_name.clone()
+    } else {
+        format!("{}/{}", row.root_name, row.path)
+    }
 }
 
 /// The reply line, without the final newline.
@@ -320,7 +337,10 @@ struct Job {
 async fn serve(path: std::path::PathBuf, memory: Rc<RefCell<Memory>>, cx: &mut AsyncApp) {
     use futures::StreamExt as _;
 
-    while cx.update(|cx| workspace_window(cx)).is_none() {
+    while cx
+        .update(|cx| workspace_window(cx, &memory.borrow()))
+        .is_none()
+    {
         cx.background_executor().timer(WINDOW_POLL).await;
     }
     let (jobs, mut incoming) = futures::channel::mpsc::unbounded::<Job>();
@@ -362,7 +382,7 @@ async fn run(
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
             let window_count = cx.update(|cx| cx.windows().len());
             let window = cx
-                .update(|cx| workspace_window(cx))
+                .update(|cx| workspace_window(cx, &memory.borrow()))
                 .context("Cod has no workspace window")?;
             cx.update_window(window.into(), |root, window, cx| {
                 let multi_workspace = root
@@ -376,15 +396,26 @@ async fn run(
     }
 }
 
-/// The window the driver works on: the active window when it shows a workspace, otherwise the first workspace window.
-fn workspace_window(cx: &App) -> Option<WindowHandle<MultiWorkspace>> {
-    cx.active_window()
+/// The window the driver works on: the active window when it shows a workspace, otherwise the newest open workspace window, otherwise the first one.
+fn workspace_window(cx: &App, memory: &Memory) -> Option<WindowHandle<MultiWorkspace>> {
+    if let Some(active) = cx
+        .active_window()
         .and_then(|window| window.downcast::<MultiWorkspace>())
-        .or_else(|| {
-            cx.windows()
-                .into_iter()
-                .find_map(|window| window.downcast::<MultiWorkspace>())
-        })
+    {
+        return Some(active);
+    }
+    let open: Vec<AnyWindowHandle> = cx
+        .windows()
+        .into_iter()
+        .filter(|window| window.downcast::<MultiWorkspace>().is_some())
+        .collect();
+    memory
+        .windows
+        .iter()
+        .rev()
+        .find(|window| open.contains(*window))
+        .or_else(|| open.first())
+        .and_then(|window| window.downcast::<MultiWorkspace>())
 }
 
 /// Presses one key: key down, then key up, as the platform layer delivers them.
@@ -393,20 +424,9 @@ fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) 
     use gpui::{KeyDownEvent, KeyUpEvent, PlatformInput};
 
     let window = cx
-        .update(|cx| workspace_window(cx))
+        .update(|cx| workspace_window(cx, &memory.borrow()))
         .context("Cod has no workspace window")?;
-    cx.update_window(window.into(), |root, window, cx| {
-        if let Ok(multi_workspace) = root.downcast::<MultiWorkspace>() {
-            let palette_open = multi_workspace
-                .read(cx)
-                .workspace()
-                .read(cx)
-                .active_modal::<command_palette::CommandPalette>(cx)
-                .is_some();
-            if !palette_open {
-                memory.borrow_mut().palette_candidates = palette_candidates(window, cx);
-            }
-        }
+    cx.update_window(window.into(), |_, window, cx| {
         // The Linux platform layer gives unhandled text keys without modifiers other than shift to the text input.
         let types_text = keystroke.key_char.is_some()
             && keystroke.modifiers.is_subset_of(&Modifiers::shift());
@@ -427,27 +447,86 @@ fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) 
     .context("the workspace window closed")
 }
 
-/// The command names the palette lists when it opens now: `CommandPalette::new` takes `Window::available_actions`, drops the actions the palette filter hides and humanizes the names.
-fn palette_candidates(window: &Window, cx: &App) -> Vec<SharedString> {
-    let filter = command_palette_hooks::CommandPaletteFilter::try_global(cx);
-    window
-        .available_actions(cx)
-        .into_iter()
-        .filter_map(|action| {
-            if filter.is_some_and(|filter| filter.is_hidden(&*action)) {
-                return None;
-            }
-            Some(SharedString::from(command_palette::humanize_action_name(
-                action.name(),
-            )))
-        })
-        .collect()
-}
-
 /// The name of a workspace as the user gave it, or None while it has none.
 /// Cod has no workspace names yet (story #24 adds them); this is the one place that reads them once they exist.
 fn workspace_name(_workspace: &Entity<Workspace>, _cx: &App) -> Option<String> {
     None
+}
+
+/// The text field of "workspace: rename workspace" while it is shown in the window: `{"text": <its current text>}`, else None.
+/// Cod has no rename field yet (story #24 adds it); this is the one place that reads it once it exists.
+fn rename_input(_multi_workspace: &MultiWorkspace, _window: &Window, _cx: &App) -> Option<Value> {
+    None
+}
+
+/// Whether the pane is part of the frame the window drew last, read from that frame: the pane's own element (the one that tracks its focus) is in the frame's dispatch tree, with the listener of a pane-only action.
+/// A workspace the window does not draw has none of its panes in the frame.
+fn is_drawn(pane: &Entity<Pane>, window: &Window, cx: &App) -> bool {
+    window.is_action_available_in(
+        &workspace::pane::JoinIntoNext,
+        &pane.read(cx).focus_handle(cx),
+    )
+}
+
+/// The project panel of the workspace as the panel lists it: whether it is open in its dock, whether it has the focus, its root rows, its expanded folders below the roots, its selected row and all its rows. Null when the workspace has no project panel.
+fn project_panel_state(workspace: &Workspace, window: &Window, cx: &App) -> Value {
+    let Some(panel) = workspace.panel::<ProjectPanel>(cx) else {
+        return Value::Null;
+    };
+    let open = workspace.all_docks().iter().any(|dock| {
+        let dock = dock.read(cx);
+        dock.is_open()
+            && dock
+                .visible_panel()
+                .is_some_and(|visible| visible.panel_id() == panel.entity_id())
+    });
+    let focused = panel.read(cx).focus_handle(cx).contains_focused(window, cx);
+    let rows = panel.read(cx).listed_entries(cx);
+    let roots: Vec<String> = rows
+        .iter()
+        .filter(|row| row.path.is_empty())
+        .map(|row| row.root_name.clone())
+        .collect();
+    let expanded: Vec<String> = rows
+        .iter()
+        .filter(|row| row.is_dir && row.is_expanded && !row.path.is_empty())
+        .map(panel_row_name)
+        .collect();
+    let selected = rows.iter().find(|row| row.is_selected).map(panel_row_name);
+    let names: Vec<String> = rows.iter().map(panel_row_name).collect();
+    json!({
+        "open": open,
+        "focused": focused,
+        "roots": roots,
+        "expanded": expanded,
+        "selected": selected,
+        "rows": names,
+    })
+}
+
+/// The prompt drawn in the window: its message and detail (Markdown source, as Zed passes them), its answers and the highlighted answer. Null without a prompt.
+fn prompt_state(window: &Window, memory: &Memory, cx: &App) -> Value {
+    if !window.has_active_prompt() {
+        return Value::Null;
+    }
+    let renderer = memory
+        .prompt
+        .as_ref()
+        .filter(|(prompt_window, _)| *prompt_window == window.window_handle())
+        .and_then(|(_, renderer)| renderer.upgrade());
+    match renderer {
+        Some(renderer) => {
+            let renderer = renderer.read(cx);
+            json!({
+                "message": renderer.message(cx),
+                "detail": renderer.detail(cx),
+                "answers": renderer.answers(),
+                "highlighted": renderer.highlighted_answer(),
+            })
+        }
+        // A prompt of another kind: shown, but its text cannot be read.
+        None => json!({ "message": null, "detail": null, "answers": null, "highlighted": null }),
+    }
 }
 
 fn worktrees_of(workspace: &Workspace, cx: &App) -> Vec<String> {
@@ -473,12 +552,22 @@ fn read_state(
     let active = multi_workspace.workspace().clone();
     let held: Vec<Entity<Workspace>> = multi_workspace.workspaces().cloned().collect();
     let active_workspace = held.iter().position(|workspace| *workspace == active);
+    // What the last drawn frame holds of each workspace: whether any of its center panes is in it, and the tabs of those panes.
+    let mut drawn_tabs: Vec<String> = Vec::new();
     let workspaces: Vec<Value> = held
         .iter()
         .map(|workspace| {
+            let mut drawn = false;
+            for pane in workspace.read(cx).panes() {
+                if is_drawn(pane, window, cx) {
+                    drawn = true;
+                    drawn_tabs.extend(pane.read(cx).items().map(|item| tab_title(&**item, cx)));
+                }
+            }
             json!({
                 "name": workspace_name(workspace, cx),
                 "worktrees": worktrees_of(workspace.read(cx), cx),
+                "drawn": drawn,
             })
         })
         .collect();
@@ -534,6 +623,18 @@ fn read_state(
         .filter(|item| item.is_dirty(cx))
         .map(|item| tab_title(&**item, cx))
         .collect();
+    // The text each unsaved editor tab holds now, so a test can tell that an edit survived exactly.
+    let unsaved_texts: Vec<Value> = ordered_panes
+        .iter()
+        .flat_map(|pane| pane.read(cx).items())
+        .filter(|item| item.is_dirty(cx))
+        .map(|item| {
+            json!({
+                "tab": tab_title(&**item, cx),
+                "text": (**item).act_as::<Editor>(cx).map(|editor| editor.read(cx).text(cx)),
+            })
+        })
+        .collect();
 
     // The cursor of the active editor as the status bar shows it: 1-based line, 1-based column (in bytes).
     let cursor = workspace.active_item_as::<Editor>(cx).map(|editor| {
@@ -543,7 +644,7 @@ fn read_state(
         json!({ "row": point.row + 1, "column": point.column + 1 })
     });
 
-    // The command palette: its query, how many matches it shows, which one is highlighted, and the name of that command.
+    // The command palette: its query, how many rows it lists, which row is highlighted, the query those rows belong to, and the command on the highlighted row.
     let palette_open = workspace
         .active_modal::<command_palette::CommandPalette>(cx)
         .is_some();
@@ -555,34 +656,27 @@ fn read_state(
     let (palette, selection) = match palette_picker {
         Some(picker) => {
             let picker = picker.read(cx);
+            let delegate = &picker.delegate;
             let query = picker.query(cx);
-            let match_count = picker.delegate.match_count();
-            let selected_index = picker.delegate.selected_index();
-            let history = cx
-                .global::<SettingsStore>()
-                .merged_settings()
-                .command_palette
-                .as_ref()
-                .and_then(|settings| settings.use_command_history)
-                .unwrap_or(true);
-            let aliased = WorkspaceSettings::get_global(cx)
+            // The palette matches an aliased query as its alias (CommandPaletteDelegate::update_matches).
+            let resolved_query: String = WorkspaceSettings::get_global(cx)
                 .command_aliases
-                .contains_key(&query);
-            let selection = if history || aliased {
-                None
-            } else {
-                palette_selection(
-                    &memory.palette_candidates,
-                    &query,
-                    match_count,
-                    selected_index,
-                )
-            };
+                .get(&query)
+                .map(|alias| AsRef::<str>::as_ref(alias).to_owned())
+                .unwrap_or_else(|| query.clone());
+            let listed_query = delegate.listed_query();
+            let highlighted = delegate
+                .highlighted_command_name()
+                .map(|name| name.to_string());
+            let selection =
+                palette_selection(listed_query, &resolved_query, highlighted.as_deref());
             (
                 json!({
                     "query": query,
-                    "match_count": match_count,
-                    "selected_index": selected_index,
+                    "match_count": delegate.match_count(),
+                    "selected_index": delegate.selected_index(),
+                    "listed_query": listed_query,
+                    "highlighted": highlighted,
                 }),
                 json!(selection),
             )
@@ -601,10 +695,10 @@ fn read_state(
             })
         });
 
-    // A prompt drawn in the window (Zed's ui_prompt, always used on Linux). It does not expose its text, so message and answers stay null.
-    let prompt = window
-        .has_active_prompt()
-        .then(|| json!({ "message": null, "answers": null }));
+    // A prompt drawn in the window (Zed's ui_prompt, always used on Linux).
+    let prompt = prompt_state(window, memory, cx);
+    let project_panel = project_panel_state(workspace, window, cx);
+    let rename = rename_input(multi_workspace, window, cx);
     let modal = if workspace
         .active_modal::<file_finder::FileFinder>(cx)
         .is_some()
@@ -633,6 +727,10 @@ fn read_state(
         "split": split,
         "cursor": cursor,
         "dirty_tabs": dirty_tabs,
+        "unsaved_texts": unsaved_texts,
+        "drawn_tabs": drawn_tabs,
+        "project_panel": project_panel,
+        "rename_input": rename,
         "palette": palette,
         "palette_selection": selection,
         "path_prompt": path_prompt,
@@ -1028,39 +1126,65 @@ mod tests {
         );
     }
 
-    fn names(names: &[&str]) -> Vec<SharedString> {
-        names.iter().map(|name| SharedString::from(*name)).collect()
-    }
-
     #[test]
-    fn the_exact_command_name_is_the_selection() {
-        let candidates = names(&[
-            "workspace: close window",
-            "multi workspace: close workspace sidebar",
-            "workspace: close workspace",
-        ]);
+    fn the_highlighted_row_of_the_typed_query_is_the_selection() {
         assert_eq!(
-            palette_selection(&candidates, "workspace: close workspace", 2, 0).as_deref(),
+            palette_selection(
+                Some("workspace: close workspace"),
+                "workspace: close workspace",
+                Some("workspace: close workspace"),
+            )
+            .as_deref(),
             Some("workspace: close workspace")
         );
+        // The highlighted row is whatever the palette highlights, even a near match.
         assert_eq!(
-            palette_selection(&candidates, "workspace: close workspace", 2, 1).as_deref(),
-            Some("multi workspace: close workspace sidebar")
+            palette_selection(
+                Some("workspace: new workspace"),
+                "workspace: new workspace",
+                Some("workspace: new window"),
+            )
+            .as_deref(),
+            Some("workspace: new window")
         );
     }
 
     #[test]
-    fn no_selection_when_the_palette_shows_other_matches() {
-        let candidates = names(&["workspace: close window", "workspace: new window"]);
-        // The palette shows a different number of matches: it is still updating or lists other commands.
+    fn no_selection_while_the_rows_belong_to_another_query() {
+        // Still matching the typed query.
         assert_eq!(
-            palette_selection(&candidates, "workspace: new window", 2, 0),
+            palette_selection(None, "workspace: new workspace", Some("workspace: new window")),
             None
         );
-        // Nothing matches: no selection, whatever the palette shows.
+        // The rows are those of an earlier, shorter query.
         assert_eq!(
-            palette_selection(&candidates, "workspace: new workspace", 0, 0),
+            palette_selection(
+                Some("workspace: new"),
+                "workspace: new workspace",
+                Some("workspace: new window"),
+            ),
             None
+        );
+        // Nothing listed.
+        assert_eq!(
+            palette_selection(Some("workspace: new workspace"), "workspace: new workspace", None),
+            None
+        );
+    }
+
+    #[test]
+    fn panel_rows_are_named_by_root_and_path() {
+        let row = |root_name: &str, path: &str| ListedEntry {
+            root_name: root_name.to_owned(),
+            path: path.to_owned(),
+            is_dir: false,
+            is_expanded: false,
+            is_selected: false,
+        };
+        assert_eq!(panel_row_name(&row("billing-api", "")), "billing-api");
+        assert_eq!(
+            panel_row_name(&row("billing-api", "src/invoice.rs")),
+            "billing-api/src/invoice.rs"
         );
     }
 
