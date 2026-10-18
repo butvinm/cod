@@ -3425,6 +3425,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cod_e2e_driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "command_palette",
+ "file_finder",
+ "futures 0.3.34",
+ "gpui",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "workspace",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23705,6 +23721,7 @@ dependencies = [
  "cli",
  "client",
  "clock",
+ "cod_e2e_driver",
  "codestral",
  "collab_ui",
  "collections",

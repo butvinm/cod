@@ -34,6 +34,7 @@ members = [
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
     "crates/cod_browser",
+    "crates/cod_e2e_driver",
     "crates/codestral",
     "crates/collab",
     "crates/collab_ui",
@@ -311,6 +312,7 @@ clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
+cod_e2e_driver = { path = "crates/cod_e2e_driver" }
 codestral = { path = "crates/codestral" }
 collab = { path = "crates/collab" }
 collab_ui = { path = "crates/collab_ui" }
