@@ -27,8 +27,8 @@ const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
 mod cod_workspaces;
 pub use cod_workspaces::{
-    CloseWorkspace, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_workspace_name,
+    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
 pub(crate) use cod_workspaces::init_workspace_names;
 
@@ -334,6 +334,14 @@ pub struct MultiWorkspace {
     /// Cod (#24): ids of workspaces removed from this window whose session binding is not
     /// cleared yet. They stay in the saved list until it is.
     cod_removing_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): the window's workspace list as it was saved, so a pending member keeps its
+    /// place among the others.
+    cod_saved_order: Vec<WorkspaceId>,
+    /// Cod (#24): members of this window that are not loaded yet (lazy restore), with the
+    /// folders of each. A pending member loads in the foreground the first time it is shown.
+    cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
+    /// Cod (#24): true while a pending member loads; other activation requests wait for it.
+    cod_materializing: bool,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -400,6 +408,9 @@ impl MultiWorkspace {
             pending_removal_tasks: Vec::new(),
             cod_unrestored_workspace_ids: Vec::new(),
             cod_removing_workspace_ids: Vec::new(),
+            cod_saved_order: Vec::new(),
+            cod_pending: std::collections::HashMap::new(),
+            cod_materializing: false,
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -1545,18 +1556,6 @@ impl MultiWorkspace {
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
         let focus_handle = self.workspace().read(cx).fallback_focus_handle(window, cx);
         window.focus(&focus_handle, cx);
-    }
-
-    /// Cod (#24): the restore of a window's workspaces ends after the window already takes keys.
-    /// When the user has opened a modal (the command palette, the file finder) in the shown
-    /// workspace meanwhile, the modal keeps the focus: moving it to the active pane would take
-    /// the typed query away from the modal.
-    pub fn cod_focus_active_workspace_after_restore(&self, window: &mut Window, cx: &mut App) {
-        let workspace = self.workspace().read(cx);
-        if workspace.modal_layer().read(cx).has_active_modal() {
-            return;
-        }
-        self.focus_active_workspace(window, cx);
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {

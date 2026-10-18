@@ -31,8 +31,8 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
-    CloseWorkspace, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_workspace_name,
+    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
@@ -2330,12 +2330,6 @@ impl Workspace {
                         .unwrap_or(false);
 
                     let workspace = window.update(cx, |multi_workspace, window, cx| {
-                        // Cod (#24): a workspace added behind the shown one (a restored hidden
-                        // workspace) gives the focus back once it is built: Workspace::new
-                        // focused its pane, and a focused pane that is not drawn loses keys.
-                        let focus_before_add = (open_mode == OpenMode::Add)
-                            .then(|| window.focused(cx))
-                            .flatten();
                         let workspace = cx.new(|cx| {
                             let mut workspace = Workspace::new(
                                 Some(workspace_id),
@@ -2360,12 +2354,6 @@ impl Workspace {
                             }
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
-                                if multi_workspace.workspace() != &workspace {
-                                    match focus_before_add {
-                                        Some(focus) => window.focus(&focus, cx),
-                                        None => multi_workspace.focus_active_workspace(window, cx),
-                                    }
-                                }
                             }
                             OpenMode::NewWindow => {
                                 unreachable!()
@@ -10471,10 +10459,10 @@ pub async fn restore_multiworkspace(
         }
     };
 
-    // Cod (#24): bring back the window's other workspaces without activating them, then put
-    // all of them in the order the window held them. The saved id list is the window's
-    // manifest: a member the last session never re-bound (an interrupted restore) is found by
-    // its id, and a member that fails to come back stays in the list for the next start.
+    // Cod (#24): find the window's other workspaces, in the order the window held them. The
+    // saved id list is the window's manifest: a member the last session never re-bound (an
+    // interrupted restore) is found by its id, and a member that is not found stays in the list
+    // for the next start.
     window_handle
         .update(cx, |multi_workspace, _window, _cx| {
             multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
@@ -10534,13 +10522,18 @@ pub async fn restore_multiworkspace(
             .ok();
         other_workspaces.extend(recovered);
     }
+    // Cod (#24): lazy restore. Only the shown workspace is loaded; every other member of the
+    // window becomes a pending member (id, folders, place in the order) that loads in the
+    // foreground the first time it is shown. A pending member has no live entities, so it
+    // cannot take the focus or save a layout.
+    let mut pending: Vec<(WorkspaceId, Vec<PathBuf>)> = Vec::new();
     for other in other_workspaces {
         if !matches!(other.location, SerializedWorkspaceLocation::Local) {
             continue;
         }
-        // Cod (#24): when the window saved its workspace list, a folderless workspace bound to
-        // the window but not in that list is a placeholder left by an interrupted start, not a
-        // workspace the user made (those are in the list), so it does not come back.
+        // When the window saved its workspace list, a folderless workspace bound to the window
+        // but not in that list is a placeholder left by an interrupted start, not a workspace
+        // the user made (those are in the list), so it does not come back.
         if other.paths.is_empty()
             && !state.cod_workspace_ids.is_empty()
             && !state.cod_workspace_ids.contains(&other.workspace_id)
@@ -10551,39 +10544,36 @@ pub async fn restore_multiworkspace(
             );
             continue;
         }
-        let result = if other.paths.is_empty() {
-            cx.update(|cx| {
-                open_workspace_by_id(other.workspace_id, app_state.clone(), Some(window_handle), cx)
-            })
-            .await
-            .map(|_| ())
-        } else {
-            cx.update(|cx| {
-                Workspace::restore_local_by_id(
-                    other.workspace_id,
-                    other.paths.paths().to_vec(),
-                    app_state.clone(),
-                    Some(window_handle),
-                    OpenMode::Add,
-                    cx,
-                )
-            })
-            .await
-            .map(|_| ())
-        };
-        if let Err(err) = result {
-            log::error!(
-                "Failed to restore workspace {:?}: {err:#}",
-                other.workspace_id
-            );
+        if pending.iter().any(|(id, _)| *id == other.workspace_id) {
+            continue;
+        }
+        pending.push((other.workspace_id, other.paths.paths().to_vec()));
+    }
+    let binding = window_handle
+        .update(cx, |multi_workspace, window, cx| {
+            for (id, paths) in &pending {
+                multi_workspace.cod_add_pending_workspace(*id, paths.clone());
+            }
+            multi_workspace.cod_finish_restore(cx);
+            cx.notify();
+            (
+                multi_workspace.workspace().read(cx).session_id(),
+                window.window_handle().window_id().as_u64(),
+            )
+        })
+        .ok();
+    // Bind the pending members to this session and window (their rows only, no layout), so
+    // the next start finds them and the database cleanup keeps them.
+    if let Some((session_id, window_id)) = binding {
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        for (id, _) in &pending {
+            db.set_session_binding(*id, session_id.clone(), Some(window_id))
+                .await
+                .log_err();
         }
     }
-    // Opening a hidden workspace can move the focus into it; give it back to the active one.
     let saved_list = window_handle
-        .update(cx, |multi_workspace, window, cx| {
-            multi_workspace.cod_finish_restore(cx);
-            multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
-            multi_workspace.cod_focus_active_workspace_after_restore(window, cx);
+        .update(cx, |multi_workspace, _window, cx| {
             multi_workspace.cod_save_workspace_list_now(cx)
         })
         .ok();
@@ -10600,13 +10590,7 @@ pub async fn restore_multiworkspace(
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 
     window_handle
-        .update(cx, |multi_workspace, window, cx| {
-            // Cod (#24): the restore awaits between the steps above and a frame drawn in between
-            // can lose the focus; end with it in the workspace the window shows, unless the user
-            // opened a modal there meanwhile (the window takes keys before the restore ends).
-            if multi_workspace.workspaces().count() > 1 {
-                multi_workspace.cod_focus_active_workspace_after_restore(window, cx);
-            }
+        .update(cx, |_, window, _cx| {
             window.activate_window();
         })
         .ok();

@@ -11,7 +11,7 @@ use std::{
 use db::kvp::KeyValueStore;
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Global, TaskExt as _, WeakEntity, Window, actions,
+    Global, Task, TaskExt as _, WeakEntity, Window, actions,
 };
 use ui::prelude::*;
 use ui_input::InputField;
@@ -35,6 +35,14 @@ actions!(
         CloseWorkspace,
     ]
 );
+
+/// One member of a window's workspace list: loaded, or pending (saved but not loaded yet since
+/// the start, see lazy restore in `restore_multiworkspace`).
+#[derive(Clone)]
+pub enum CodMember {
+    Live(Entity<Workspace>),
+    Pending(WorkspaceId),
+}
 
 /// The key-value scope that holds the workspace names, keyed by workspace id.
 const NAMES_SCOPE: &str = "cod_workspace_names";
@@ -86,6 +94,11 @@ pub(crate) fn init_workspace_names(cx: &mut App) {
 /// The name the user gave the workspace, or None while it has none.
 pub fn cod_workspace_name(workspace: &Workspace, cx: &App) -> Option<String> {
     let id = workspace.database_id()?;
+    cod_workspace_name_by_id(id, cx)
+}
+
+/// The name the user gave the workspace with this id (loaded or pending), or None.
+pub fn cod_workspace_name_by_id(id: WorkspaceId, cx: &App) -> Option<String> {
     let names = cx.try_global::<WorkspaceNames>();
     if let Some(names) = names {
         if let Some(name) = names.0.borrow().get(&id) {
@@ -272,18 +285,172 @@ impl MultiWorkspace {
 
     /// Shows the workspace after (or before) the active one in window order, wrapping around.
     fn cycle_workspace(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.held.len();
+        // A pending member is still loading: the next switch waits until it is shown.
+        if self.cod_materializing {
+            return;
+        }
+        let members = self.cod_members(cx);
+        let count = members.len();
         if count < 2 {
             return;
         }
-        let index = self.displayed_index();
-        let next = if forward {
-            (index + 1) % count
-        } else {
-            (index + count - 1) % count
+        let active = self.workspace().clone();
+        let Some(index) = members
+            .iter()
+            .position(|member| matches!(member, CodMember::Live(workspace) if *workspace == active))
+        else {
+            return;
         };
-        let workspace = self.held[next].workspace.clone();
-        self.activate(workspace, None, window, cx);
+        for step in 1..count {
+            let next = if forward {
+                (index + step) % count
+            } else {
+                (index + count - step) % count
+            };
+            match &members[next] {
+                CodMember::Live(workspace) => {
+                    self.activate(workspace.clone(), None, window, cx);
+                    return;
+                }
+                CodMember::Pending(id) if self.cod_pending.contains_key(id) => {
+                    self.cod_activate_pending(*id, window, cx)
+                        .detach_and_log_err(cx);
+                    return;
+                }
+                // A listed member whose saved data was not found cannot be shown.
+                CodMember::Pending(_) => {}
+            }
+        }
+    }
+
+    /// The members of this window in window order: the loaded workspaces, and the pending ones
+    /// at the places they had in the saved list.
+    pub fn cod_members(&self, cx: &App) -> Vec<CodMember> {
+        let mut members: Vec<(Option<WorkspaceId>, CodMember)> = self
+            .held
+            .iter()
+            .map(|held| {
+                (
+                    held.workspace.read(cx).database_id(),
+                    CodMember::Live(held.workspace.clone()),
+                )
+            })
+            .collect();
+        for id in &self.cod_unrestored_workspace_ids {
+            if members.iter().any(|(member_id, _)| *member_id == Some(*id)) {
+                continue;
+            }
+            // Put it right after the nearest member that came before it in the saved list.
+            let saved_index = self
+                .cod_saved_order
+                .iter()
+                .position(|saved| saved == id)
+                .unwrap_or(self.cod_saved_order.len());
+            let insert_at = self.cod_saved_order[..saved_index]
+                .iter()
+                .rev()
+                .find_map(|before| {
+                    members
+                        .iter()
+                        .position(|(member_id, _)| *member_id == Some(*before))
+                })
+                .map(|position| position + 1)
+                .unwrap_or(if saved_index == self.cod_saved_order.len() {
+                    members.len()
+                } else {
+                    0
+                });
+            members.insert(insert_at, (Some(*id), CodMember::Pending(*id)));
+        }
+        members.into_iter().map(|(_, member)| member).collect()
+    }
+
+    /// The folders of a pending member, None when the id is not a pending member.
+    pub fn cod_pending_paths(&self, id: WorkspaceId) -> Option<&[std::path::PathBuf]> {
+        self.cod_pending.get(&id).map(|paths| paths.as_slice())
+    }
+
+    /// Adds a member that is saved but not loaded: it loads the first time it is shown.
+    pub fn cod_add_pending_workspace(&mut self, id: WorkspaceId, paths: Vec<std::path::PathBuf>) {
+        if !self.cod_unrestored_workspace_ids.contains(&id) {
+            self.cod_unrestored_workspace_ids.push(id);
+        }
+        if !self.cod_saved_order.contains(&id) {
+            self.cod_saved_order.push(id);
+        }
+        self.cod_pending.insert(id, paths);
+    }
+
+    /// Loads a pending member in the foreground and shows it, at its place in the window
+    /// order and with its id. On failure it stays pending, so a later switch tries again.
+    pub(super) fn cod_activate_pending(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        if self.cod_materializing {
+            return Task::ready(Ok(()));
+        }
+        let Some(paths) = self.cod_pending.get(&id).cloned() else {
+            return Task::ready(Err(anyhow::anyhow!("workspace {id:?} is not pending")));
+        };
+        let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            return Task::ready(Ok(()));
+        };
+        let order: Vec<WorkspaceId> = self.cod_saved_workspace_ids(cx);
+        let app_state = self.workspace().read(cx).app_state().clone();
+        self.cod_materializing = true;
+        cx.spawn_in(window, async move |this, cx| {
+            let result: anyhow::Result<()> = if paths.is_empty() {
+                match cx.update(|_window, cx| {
+                    crate::open_workspace_by_id(id, app_state.clone(), Some(window_handle), cx)
+                }) {
+                    Ok(task) => task.await.map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            } else {
+                match cx.update(|_window, cx| {
+                    Workspace::restore_local_by_id(
+                        id,
+                        paths.clone(),
+                        app_state.clone(),
+                        Some(window_handle),
+                        OpenMode::Activate,
+                        cx,
+                    )
+                }) {
+                    Ok(task) => task.await.map(|_| ()),
+                    Err(err) => Err(err),
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                this.cod_materializing = false;
+                let loaded = this
+                    .held
+                    .iter()
+                    .map(|held| held.workspace.clone())
+                    .find(|workspace| workspace.read(cx).database_id() == Some(id));
+                match (&result, loaded) {
+                    (Ok(()), Some(workspace)) => {
+                        this.cod_pending.remove(&id);
+                        this.cod_unrestored_workspace_ids
+                            .retain(|other| *other != id);
+                        this.cod_order_workspaces(&order, cx);
+                        if *this.workspace() != workspace {
+                            this.activate(workspace, None, window, cx);
+                        }
+                    }
+                    (Ok(()), None) => {
+                        log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
+                    }
+                    (Err(err), _) => {
+                        log::error!("Failed to load workspace {id:?}; it stays pending: {err:#}");
+                    }
+                }
+            })?;
+            result
+        })
     }
 
     /// Asks to save the unsaved files of the active workspace like Zed does when a window closes,
@@ -317,21 +484,43 @@ impl MultiWorkspace {
                 })?
                 .await;
 
-            let replacement = this.update(cx, |this, _cx| {
-                let index = this.held_index(&doomed)?;
-                let others: Vec<Entity<Workspace>> = this
-                    .held
-                    .iter()
-                    .map(|held| held.workspace.clone())
-                    .filter(|workspace| *workspace != doomed)
+            // The replacement is the member before the closed one (else the one after it), loaded
+            // or pending; a listed member whose saved data was not found is skipped.
+            let replacement = this.update(cx, |this, cx| {
+                let members = this.cod_members(cx);
+                let index = members.iter().position(|member| match member {
+                    CodMember::Live(workspace) => *workspace == doomed,
+                    CodMember::Pending(_) => false,
+                })?;
+                let candidates: Vec<(usize, CodMember)> = members
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(position, member)| {
+                        *position != index
+                            && match member {
+                                CodMember::Live(_) => true,
+                                CodMember::Pending(id) => this.cod_pending.contains_key(id),
+                            }
+                    })
                     .collect();
-                others.get(index.saturating_sub(1)).cloned()
+                candidates
+                    .iter()
+                    .rev()
+                    .find(|(position, _)| *position < index)
+                    .or_else(|| candidates.iter().find(|(position, _)| *position > index))
+                    .map(|(_, member)| member.clone())
             })?;
             match replacement {
-                Some(replacement) => {
+                Some(CodMember::Live(replacement)) => {
                     this.update_in(cx, |this, window, cx| {
                         this.activate(replacement, None, window, cx);
                     })?;
+                }
+                Some(CodMember::Pending(id)) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.cod_activate_pending(id, window, cx)
+                    })?
+                    .await?;
                 }
                 None => {
                     cx.update(|_window, cx| {
@@ -366,16 +555,16 @@ impl MultiWorkspace {
     /// the ones from the last saved list that are not back yet, so a failed or interrupted
     /// restore never drops them.
     pub(super) fn cod_saved_workspace_ids(&self, cx: &App) -> Vec<WorkspaceId> {
+        // Pending members keep their places among the loaded ones.
         let mut ids: Vec<WorkspaceId> = self
-            .held
-            .iter()
-            .filter_map(|held| held.workspace.read(cx).database_id())
+            .cod_members(cx)
+            .into_iter()
+            .filter_map(|member| match member {
+                CodMember::Live(workspace) => workspace.read(cx).database_id(),
+                CodMember::Pending(id) => Some(id),
+            })
             .collect();
-        for id in self
-            .cod_unrestored_workspace_ids
-            .iter()
-            .chain(&self.cod_removing_workspace_ids)
-        {
+        for id in &self.cod_removing_workspace_ids {
             if !ids.contains(id) {
                 ids.push(*id);
             }
@@ -387,6 +576,7 @@ impl MultiWorkspace {
     /// held by this window.
     pub fn cod_begin_restore(&mut self, saved: &[WorkspaceId]) {
         self.cod_unrestored_workspace_ids = saved.to_vec();
+        self.cod_saved_order = saved.to_vec();
     }
 
     /// Saves the window's state with its workspace list now; the future ends once it is written.
@@ -414,10 +604,16 @@ impl MultiWorkspace {
             .collect();
         self.cod_unrestored_workspace_ids
             .retain(|id| !held.contains(id));
-        if !self.cod_unrestored_workspace_ids.is_empty() {
+        let lost: Vec<WorkspaceId> = self
+            .cod_unrestored_workspace_ids
+            .iter()
+            .copied()
+            .filter(|id| !self.cod_pending.contains_key(id))
+            .collect();
+        if !lost.is_empty() {
             log::error!(
-                "Workspaces {:?} did not come back; they stay in the window's list for the next start",
-                self.cod_unrestored_workspace_ids
+                "Workspaces {:?} were not found; they stay in the window's list for the next start",
+                lost
             );
         }
     }
