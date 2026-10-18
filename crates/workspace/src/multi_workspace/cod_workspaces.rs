@@ -355,6 +355,47 @@ impl MultiWorkspace {
         .detach_and_log_err(cx);
     }
 
+    /// The ids to save as the window's workspace list: the held workspaces in window order, then
+    /// the ones from the last saved list that are not back yet, so a failed or interrupted
+    /// restore never drops them.
+    pub(super) fn cod_saved_workspace_ids(&self, cx: &App) -> Vec<WorkspaceId> {
+        let mut ids: Vec<WorkspaceId> = self
+            .held
+            .iter()
+            .filter_map(|held| held.workspace.read(cx).database_id())
+            .collect();
+        for id in &self.cod_unrestored_workspace_ids {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids
+    }
+
+    /// Starts a restore: every id of the saved list counts as not back until its workspace is
+    /// held by this window.
+    pub fn cod_begin_restore(&mut self, saved: &[WorkspaceId]) {
+        self.cod_unrestored_workspace_ids = saved.to_vec();
+    }
+
+    /// Ends a restore. The ids that are still not held failed to come back; they stay in the
+    /// saved list so the next start tries them again.
+    pub fn cod_finish_restore(&mut self, cx: &mut Context<Self>) {
+        let held: Vec<WorkspaceId> = self
+            .held
+            .iter()
+            .filter_map(|held| held.workspace.read(cx).database_id())
+            .collect();
+        self.cod_unrestored_workspace_ids
+            .retain(|id| !held.contains(id));
+        if !self.cod_unrestored_workspace_ids.is_empty() {
+            log::error!(
+                "Workspaces {:?} did not come back; they stay in the window's list for the next start",
+                self.cod_unrestored_workspace_ids
+            );
+        }
+    }
+
     /// Puts the held workspaces in the given order of database ids (the order the window had
     /// when it was saved). Workspaces not in the list keep their order after the listed ones.
     pub fn cod_order_workspaces(&mut self, order: &[WorkspaceId], cx: &mut Context<Self>) {

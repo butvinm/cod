@@ -10404,7 +10404,50 @@ pub async fn restore_multiworkspace(
     };
 
     // Cod (#24): bring back the window's other workspaces without activating them, then put
-    // all of them in the order the window held them.
+    // all of them in the order the window held them. The saved id list is the window's
+    // manifest: a member the last session never re-bound (an interrupted restore) is found by
+    // its id, and a member that fails to come back stays in the list for the next start.
+    window_handle
+        .update(cx, |multi_workspace, _window, _cx| {
+            multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
+        })
+        .ok();
+    let mut other_workspaces = other_workspaces;
+    let missing_ids: Vec<WorkspaceId> = state
+        .cod_workspace_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            *id != active_workspace.workspace_id
+                && !other_workspaces
+                    .iter()
+                    .any(|other| other.workspace_id == *id)
+        })
+        .collect();
+    if !missing_ids.is_empty() {
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let recovered: Vec<SessionWorkspace> = cx
+            .background_executor()
+            .spawn(async move {
+                missing_ids
+                    .into_iter()
+                    .filter_map(|id| {
+                        let saved = db.workspace_for_id(id);
+                        if saved.is_none() {
+                            log::error!("Saved workspace {id:?} of a window was not found");
+                        }
+                        saved.map(|saved| SessionWorkspace {
+                            workspace_id: id,
+                            location: saved.location,
+                            paths: saved.paths,
+                            window_id: None,
+                        })
+                    })
+                    .collect()
+            })
+            .await;
+        other_workspaces.extend(recovered);
+    }
     for other in other_workspaces {
         if !matches!(other.location, SerializedWorkspaceLocation::Local) {
             continue;
@@ -10439,6 +10482,7 @@ pub async fn restore_multiworkspace(
     // Opening a hidden workspace can move the focus into it; give it back to the active one.
     window_handle
         .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.cod_finish_restore(cx);
             multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
             multi_workspace.focus_active_workspace(window, cx);
         })

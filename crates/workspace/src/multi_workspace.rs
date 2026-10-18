@@ -324,6 +324,10 @@ pub struct MultiWorkspace {
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
+    /// Cod (#24): ids from the saved workspace list that this window has not brought back yet
+    /// (still restoring, or failed to restore). They stay in the saved list so the next start
+    /// retries them.
+    cod_unrestored_workspace_ids: Vec<WorkspaceId>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -388,6 +392,7 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
+            cod_unrestored_workspace_ids: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -1439,6 +1444,8 @@ impl MultiWorkspace {
             // crash in between never restores a workspace without its name.
             let kvp = db::kvp::KeyValueStore::global(cx);
             cod_workspaces::forget_workspace_name(workspace_id, cx);
+            self.cod_unrestored_workspace_ids
+                .retain(|id| *id != workspace_id);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
                 .push(cx.background_spawn(async move {
@@ -1485,11 +1492,7 @@ impl MultiWorkspace {
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
             sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
-            cod_workspace_ids: self
-                .held
-                .iter()
-                .filter_map(|held| held.workspace.read(cx).database_id())
-                .collect(),
+            cod_workspace_ids: self.cod_saved_workspace_ids(cx),
         };
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
