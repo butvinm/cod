@@ -98,7 +98,9 @@ jobs:
             libnss3 libnspr4 libasound2t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers \
             libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
             libwebkit2gtk-4.1-0 libfontconfig1 xz-utils util-linux \
-            sway grim dbus
+            sway grim dbus openssh-client openssh-server
+          # The remote workspace tests run their own sshd as the runner user on 127.0.0.1 (tests/e2e/loopback_ssh.py); sshd wants this folder to exist.
+          sudo mkdir -p /run/sshd
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.code == 'true'
@@ -145,6 +147,21 @@ jobs:
           sccache --show-stats
           echo "build finished at $(date -u '+%H:%M:%S')"
 
+      # The remote server for the loopback SSH tests, so Cod never downloads one. A separate cargo command, so the zed build above keeps its own feature set and cache hits.
+      # A failure here does not stop the job: the remote tests then report skipped with the reason.
+      - name: Build the remote server for the loopback SSH tests
+        if: steps.changes.outputs.code == 'true'
+        continue-on-error: true
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+        run: |
+          echo "remote server build started at $(date -u '+%H:%M:%S')"
+          cargo build --profile release-fast -p remote_server
+          echo "remote server build finished at $(date -u '+%H:%M:%S')"
+
       - name: Save the CEF download
         if: steps.changes.outputs.code == 'true' && github.ref == 'refs/heads/master' && steps.cef-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -152,7 +169,7 @@ jobs:
           path: ${{ env.CEF_PATH }}
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
-      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. Nothing here changes what the tests do.
+      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. COD_E2E_REMOTE_SERVER names the remote server built above for the loopback SSH tests; when it is missing they report skipped.
       - name: Run end-to-end tests
         if: steps.changes.outputs.code == 'true'
         env:
@@ -160,6 +177,7 @@ jobs:
           SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
+          COD_E2E_REMOTE_SERVER: ${{ github.workspace }}/target/release-fast/remote_server
         run: script/e2e
 
       # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.

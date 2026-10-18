@@ -367,6 +367,9 @@ class Cod:
         self.output_path = workdir / "cod-output.log"
         self.process: subprocess.Popen[bytes] | None = None
         self.driver: Driver | None = None
+        # Settings added to cod_settings() at every start, and arguments (for example an ssh:// url) added to the next start only.
+        self.extra_settings: dict[str, Any] = {}
+        self.extra_args: list[str] = []
 
     @property
     def marker(self) -> str:
@@ -379,11 +382,12 @@ class Cod:
         # Cod is started with --user-data-dir <COD_PREVIEW_DIR> by cod-wayland.sh, so its settings live in <COD_PREVIEW_DIR>/config.
         config = self.preview_dir / "config"
         config.mkdir(parents=True, exist_ok=True)
-        (config / "settings.json").write_text(json.dumps(cod_settings(), indent=2) + "\n")
+        (config / "settings.json").write_text(json.dumps({**cod_settings(), **self.extra_settings}, indent=2) + "\n")
         for folder in (".config", ".local/share", ".cache", ".local/state"):
             (self.home / folder).mkdir(parents=True, exist_ok=True)
         env = cod_environment(os.environ, self.preview_dir, self.socket_path, self.home, persistent=self.persistent)
-        command = cod_command(self.run_dir, self.folder)
+        command = cod_command(self.run_dir, self.folder) + self.extra_args
+        self.extra_args = []
         log(f"  starting: {' '.join(repr(part) if part == '' else part for part in command)}")
         # Appended, so the output of every start of this test is kept.
         with open(self.output_path, "ab") as output:

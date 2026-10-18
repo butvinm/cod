@@ -8,6 +8,8 @@
 #   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
+#   COD_E2E_REMOTE_SERVER  the remote_server binary for the loopback SSH tests (cargo build --profile release-fast -p remote_server); default the one next to the zed binary when it exists.
+#                      Those tests run their own sshd on 127.0.0.1 as you, and copy the binary to ~/.zed_server/ in your passwd home. Without sshd or the binary they report skipped with the reason.
 # Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
 set -euo pipefail
 
@@ -58,6 +60,15 @@ browser_bin="$(dirname "$zed_bin")/cod-browser"
 for binary in "$zed_bin" "$browser_bin"; do
     [ -x "$binary" ] || { say "$binary is missing or not executable"; exit 2; }
 done
+if [ -z "${COD_E2E_REMOTE_SERVER:-}" ] && [ -x "$(dirname "$zed_bin")/remote_server" ]; then
+    COD_E2E_REMOTE_SERVER="$(dirname "$zed_bin")/remote_server"
+fi
+if [ -n "${COD_E2E_REMOTE_SERVER:-}" ]; then
+    export COD_E2E_REMOTE_SERVER
+    say "remote server for the loopback SSH tests: $COD_E2E_REMOTE_SERVER"
+else
+    say "no remote server binary: the loopback SSH tests will report skipped"
+fi
 
 # 3. The CEF runtime. The version has one source of truth: CEF_VERSION in the release workflow.
 cef_version=${CEF_VERSION:-$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)}
