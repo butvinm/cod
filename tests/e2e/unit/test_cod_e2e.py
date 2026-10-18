@@ -168,8 +168,26 @@ class StartCommandTest(unittest.TestCase):
         )
 
     def test_environment(self) -> None:
-        base = {"DISPLAY": ":0", "COD_SPIKE_URL": "https://example.invalid", "WAYLAND_DISPLAY": "wayland-1", "PATH": "/usr/bin"}
-        env = cod_e2e.cod_environment(base, Path("/tmp/data"), Path("/tmp/driver/cod.sock"))
+        base = {
+            "DISPLAY": ":0",
+            "COD_SPIKE_URL": "https://example.invalid",
+            "WAYLAND_DISPLAY": "wayland-1",
+            "PATH": "/usr/bin",
+            "HOME": "/home/someone",
+            "XDG_CONFIG_HOME": "/home/someone/.config",
+            "XDG_RUNTIME_DIR": "/tmp/runtime",
+            "COD_CEF_DIR": "/opt/cef",
+        }
+        env = cod_e2e.cod_environment(base, Path("/tmp/data"), Path("/tmp/driver/cod.sock"), Path("/tmp/home"))
+        self.assertEqual(env["HOME"], "/tmp/home")
+        self.assertEqual(env["XDG_CONFIG_HOME"], "/tmp/home/.config")
+        self.assertEqual(env["XDG_DATA_HOME"], "/tmp/home/.local/share")
+        self.assertEqual(env["XDG_CACHE_HOME"], "/tmp/home/.cache")
+        self.assertEqual(env["XDG_STATE_HOME"], "/tmp/home/.local/state")
+        self.assertEqual(env["XDG_RUNTIME_DIR"], "/tmp/runtime")
+        self.assertEqual(env["COD_CEF_DIR"], "/opt/cef")
+        self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertEqual(base["HOME"], "/home/someone")
         self.assertNotIn("DISPLAY", env)
         self.assertNotIn("COD_SPIKE_URL", env)
         self.assertEqual(env["WAYLAND_DISPLAY"], "wayland-1")

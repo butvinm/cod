@@ -208,12 +208,21 @@ def cod_command(run_dir: Path, folder: Path) -> list[str]:
     return ["dbus-run-session", "--", str(run_dir / "cod-wayland.sh"), "", str(folder)]
 
 
-def cod_environment(base: Mapping[str, str], preview_dir: Path, socket_path: Path) -> dict[str, str]:
-    """Environment for one Cod start: a private data folder, the driver socket, no X11, no spike settings."""
+def cod_environment(base: Mapping[str, str], preview_dir: Path, socket_path: Path, home: Path) -> dict[str, str]:
+    """Environment for one Cod start: a private data folder, a private home, the driver socket, no X11, no spike settings.
+
+    The home and the XDG base folders point into the test's temp folder, so nothing from the user's home (shell rc files, git config, ~/.agents) reaches Cod.
+    XDG_RUNTIME_DIR (the private sway's socket) and COD_CEF_DIR (an absolute path set by script/e2e) are kept.
+    """
     env = dict(base)
     for name in ("DISPLAY", "COD_SPIKE_URL", "COD_SPIKE_DRIVE", "COD_SPIKE_PROBE", "COD_SPIKE_SHOTS"):
         env.pop(name, None)
     env.update(
+        HOME=str(home),
+        XDG_CONFIG_HOME=str(home / ".config"),
+        XDG_DATA_HOME=str(home / ".local" / "share"),
+        XDG_CACHE_HOME=str(home / ".cache"),
+        XDG_STATE_HOME=str(home / ".local" / "state"),
         COD_PREVIEW_DIR=str(preview_dir),
         COD_E2E_SOCKET=str(socket_path),
         ZED_STATELESS="1",
@@ -277,6 +286,7 @@ class Cod:
         self.run_dir = Path(run_dir)
         self.folder = folder
         self.preview_dir = workdir / "cod-data"
+        self.home = workdir / "home"
         socket_dir = workdir / "driver"
         socket_dir.mkdir(mode=0o700)
         socket_dir.chmod(0o700)
@@ -292,7 +302,9 @@ class Cod:
         config = self.preview_dir / "config"
         config.mkdir(parents=True)
         (config / "settings.json").write_text(json.dumps(cod_settings(), indent=2) + "\n")
-        env = cod_environment(os.environ, self.preview_dir, self.socket_path)
+        for folder in (".config", ".local/share", ".cache", ".local/state"):
+            (self.home / folder).mkdir(parents=True, exist_ok=True)
+        env = cod_environment(os.environ, self.preview_dir, self.socket_path, self.home)
         command = cod_command(self.run_dir, self.folder)
         log(f"  starting: {' '.join(repr(part) if part == '' else part for part in command)}")
         with open(self.output_path, "wb") as output:
