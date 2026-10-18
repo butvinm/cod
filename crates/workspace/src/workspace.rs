@@ -4939,9 +4939,14 @@ impl Workspace {
             .unwrap_or(fallback)
     }
 
-    /// Cod (#24): focuses what `cod_restored_focus_handle` names, unless a modal is open.
+    /// Cod (#24): focuses what `cod_restored_focus_handle` names. When a modal is open, the
+    /// modal gets the focus instead, unless focus is already inside it.
     pub fn cod_focus_restored(&self, window: &mut Window, cx: &mut App) {
-        if self.modal_layer.read(cx).has_active_modal() {
+        let modal_focus_handle = self.modal_layer.read(cx).cod_active_modal_focus_handle(cx);
+        if let Some(modal_focus_handle) = modal_focus_handle {
+            if !modal_focus_handle.contains_focused(window, cx) {
+                window.focus(&modal_focus_handle, cx);
+            }
             return;
         }
         let focus_handle = self.cod_restored_focus_handle(window, cx);

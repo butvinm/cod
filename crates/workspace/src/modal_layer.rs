@@ -283,6 +283,14 @@ impl ModalLayer {
     pub fn has_active_modal(&self) -> bool {
         self.active_modal.is_some()
     }
+
+    /// Cod (#24): the focus handle of the active modal, so that switching back to a workspace
+    /// can return focus to the modal it left open.
+    pub fn cod_active_modal_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        self.active_modal
+            .as_ref()
+            .map(|active_modal| active_modal.modal.focus_handle(cx))
+    }
 }
 
 impl Render for ModalLayer {
