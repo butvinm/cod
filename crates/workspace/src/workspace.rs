@@ -10370,9 +10370,11 @@ pub async fn restore_multiworkspace(
             );
         }
     }
+    // Opening a hidden workspace can move the focus into it; give it back to the active one.
     window_handle
-        .update(cx, |multi_workspace, _window, cx| {
+        .update(cx, |multi_workspace, window, cx| {
             multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
+            multi_workspace.focus_active_workspace(window, cx);
         })
         .ok();
 
