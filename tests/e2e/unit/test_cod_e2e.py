@@ -179,6 +179,16 @@ class StartCommandTest(unittest.TestCase):
         self.assertEqual(env["ZED_ALLOW_EMULATED_GPU"], "1")
         self.assertEqual(base["DISPLAY"], ":0")
 
+    def test_settings_turn_off_unsolicited_network_work(self) -> None:
+        settings = cod_e2e.cod_settings()
+        self.assertEqual(settings["session"], {"trust_all_worktrees": True})
+        # Zed installs the html extension on the first start unless this says false (assets/settings/default.json).
+        self.assertEqual(settings["auto_install_extensions"], {"html": False})
+        self.assertEqual(settings["auto_update_extensions"], {"html": False})
+        self.assertIs(settings["auto_update"], False)
+        self.assertEqual(settings["telemetry"], {"diagnostics": False, "metrics": False})
+        self.assertEqual(json.loads(json.dumps(settings)), settings)
+
 
 if __name__ == "__main__":
     unittest.main()

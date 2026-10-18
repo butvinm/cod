@@ -224,6 +224,21 @@ def cod_environment(base: Mapping[str, str], preview_dir: Path, socket_path: Pat
     return env
 
 
+def cod_settings() -> dict[str, Any]:
+    """The settings.json of every test start. The keys are Zed's (assets/settings/default.json).
+
+    Trusted worktrees, so no trust prompt covers the window.
+    No unsolicited network work: no automatic install of the html extension, no extension or app updates, no telemetry.
+    """
+    return {
+        "session": {"trust_all_worktrees": True},
+        "auto_install_extensions": {"html": False},
+        "auto_update_extensions": {"html": False},
+        "auto_update": False,
+        "telemetry": {"diagnostics": False, "metrics": False},
+    }
+
+
 def artifact_name(test_id: str) -> str:
     """A folder name for a test id: letters, digits, dots, dashes and underscores only."""
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", test_id).strip("_") or "test"
@@ -276,7 +291,7 @@ class Cod:
         # Cod is started with --user-data-dir <COD_PREVIEW_DIR> by cod-wayland.sh, so its settings live in <COD_PREVIEW_DIR>/config.
         config = self.preview_dir / "config"
         config.mkdir(parents=True)
-        (config / "settings.json").write_text(json.dumps({"session": {"trust_all_worktrees": True}}, indent=2) + "\n")
+        (config / "settings.json").write_text(json.dumps(cod_settings(), indent=2) + "\n")
         env = cod_environment(os.environ, self.preview_dir, self.socket_path)
         command = cod_command(self.run_dir, self.folder)
         log(f"  starting: {' '.join(repr(part) if part == '' else part for part in command)}")

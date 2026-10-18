@@ -35,6 +35,10 @@ The build dependencies of Cod (`script/linux`), plus:
 
 `script/e2e` checks these first and prints what is missing.
 
+## What every test start gets
+
+Each Cod start has its own data folder (`--user-data-dir`) in the test's temp folder, with a `settings.json` from `cod_settings()` in `cod_e2e.py`: trusted worktrees, no automatic install of the html extension, no extension or app updates and no telemetry. A test that needs more settings adds them there.
+
 ## Add a story test
 
 1. Copy `test_22_open_file.py` to `test_<issue>_<slug>.py`. One file per story.
