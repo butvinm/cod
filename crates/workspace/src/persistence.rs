@@ -1070,6 +1070,12 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        // Cod (#24): a workspace is identified by its id, so two workspaces may have the same
+        // folders. The index stays for the lookups by folders, without uniqueness.
+        sql!(
+            DROP INDEX IF EXISTS ix_workspaces_location;
+            CREATE INDEX IF NOT EXISTS ix_workspaces_paths ON workspaces(remote_connection_id, paths);
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1169,6 +1175,8 @@ impl WorkspaceDb {
                 WHERE
                     paths IS ? AND
                     remote_connection_id IS ?
+                // Cod (#24): several workspaces may have these folders; take the latest one.
+                ORDER BY timestamp DESC
                 LIMIT 1
             })
             .and_then(|mut prepared_statement| {
@@ -1592,24 +1600,9 @@ impl WorkspaceDb {
                     }
                 }
 
-                // Clear out old workspaces with the same paths.
-                // Skip this for empty workspaces - they are identified by workspace_id, not paths.
-                // Multiple empty workspaces with different content should coexist.
-                if !paths.paths.is_empty() {
-                    conn.exec_bound(sql!(
-                        DELETE
-                        FROM workspaces
-                        WHERE
-                            workspace_id != ?1 AND
-                            paths IS ?2 AND
-                            remote_connection_id IS ?3
-                    ))?((
-                        workspace.id,
-                        paths.paths.clone(),
-                        remote_connection_id,
-                    ))
-                    .context("clearing out old locations")?;
-                }
+                // Cod (#24): workspaces are identified by their id, so a workspace with the same
+                // folders as this one keeps its row (stock Zed deleted it here). Recent projects
+                // still list such folders once (dedupe_recent_workspaces).
 
                 // Upsert
                 let query = sql!(

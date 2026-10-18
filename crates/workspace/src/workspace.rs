@@ -2172,6 +2172,50 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_internal(
+            abs_paths,
+            None,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            cx,
+        )
+    }
+
+    /// Cod (#24): opens the saved workspace with this id on its folders. Several workspaces may
+    /// have the same folders, so a restore names the workspace by id, not by folders.
+    pub fn restore_local_by_id(
+        workspace_id: WorkspaceId,
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_internal(
+            abs_paths,
+            Some(workspace_id),
+            app_state,
+            requesting_window,
+            None,
+            None,
+            open_mode,
+            cx,
+        )
+    }
+
+    fn new_local_internal(
+        abs_paths: Vec<PathBuf>,
+        restore_id: Option<WorkspaceId>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -2195,7 +2239,10 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            let serialized_workspace = match restore_id {
+                Some(id) => db.workspace_for_id(id),
+                None => db.workspace_for_roots(paths_to_open.as_slice()),
+            };
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -10297,11 +10344,10 @@ pub async fn restore_multiworkspace(
         .await
     } else {
         cx.update(|cx| {
-            Workspace::new_local(
+            Workspace::restore_local_by_id(
+                active_workspace.workspace_id,
                 active_workspace.paths.paths().to_vec(),
                 app_state.clone(),
-                None,
-                None,
                 None,
                 OpenMode::Add,
                 cx,
@@ -10370,12 +10416,11 @@ pub async fn restore_multiworkspace(
             .map(|_| ())
         } else {
             cx.update(|cx| {
-                Workspace::new_local(
+                Workspace::restore_local_by_id(
+                    other.workspace_id,
                     other.paths.paths().to_vec(),
                     app_state.clone(),
                     Some(window_handle),
-                    None,
-                    None,
                     OpenMode::Add,
                     cx,
                 )
