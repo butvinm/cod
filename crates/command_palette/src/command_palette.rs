@@ -520,7 +520,7 @@ impl CommandPaletteDelegate {
         if self.updating_matches.is_some() {
             return None;
         }
-        Some(&self.latest_query)
+        Some(self.latest_query.as_str())
     }
 
     #[cfg(any(test, feature = "test-support"))]
