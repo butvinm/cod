@@ -1123,18 +1123,52 @@ impl MultiWorkspace {
         if active_workspace.read(cx).project_group_key(cx) == *key
             && !moving.iter().any(|workspace| workspace == &active_workspace)
         {
-            moving.insert(0, active_workspace);
+            moving.insert(0, active_workspace.clone());
         }
-        let mut moved_ids: Vec<WorkspaceId> = Vec::new();
         for workspace in &moving {
             self.cod_move_keys
                 .insert(workspace.entity_id(), move_key.clone());
+        }
+        // The complete group membership in window order: the loaded members that move and the
+        // pending (not loaded) members of the group. Pending members are local only.
+        let mut moved_ids: Vec<WorkspaceId> = Vec::new();
+        let mut pending_ids: Vec<WorkspaceId> = Vec::new();
+        let group_is_local = key.host().is_none();
+        for member in self.cod_members(cx) {
+            match member {
+                CodMember::Live(workspace) => {
+                    if !moving.iter().any(|moving| *moving == workspace) {
+                        continue;
+                    }
+                    if let Some(id) = workspace.read(cx).database_id()
+                        && !moved_ids.contains(&id)
+                    {
+                        moved_ids.push(id);
+                    }
+                }
+                CodMember::Pending(id) => {
+                    let in_group = group_is_local
+                        && self
+                            .cod_pending
+                            .get(&id)
+                            .is_some_and(|paths| PathList::new(paths) == *key.path_list());
+                    if in_group && !moved_ids.contains(&id) {
+                        moved_ids.push(id);
+                        pending_ids.push(id);
+                    }
+                }
+            }
+        }
+        // A loaded member that is not in the window order yet still moves.
+        for workspace in &moving {
             if let Some(id) = workspace.read(cx).database_id()
                 && !moved_ids.contains(&id)
             {
                 moved_ids.push(id);
             }
         }
+        // The destination shows the member that was shown here, when it moves.
+        let shown_id = active_workspace.read(cx).database_id();
         let remove_task =
             self.remove_project_group_with_intent(key, RemovalIntent::MoveProject, window, cx);
 
@@ -1150,6 +1184,34 @@ impl MultiWorkspace {
             .ok();
             if !removed? {
                 return Ok(());
+            }
+
+            // Cod (#24): the pending members of the group leave this window and go to the
+            // reserved key in one registry edit, before the destination window exists and
+            // saves. They stay bound until the destination binds them to itself.
+            let pending_move = this
+                .update(cx, |this, cx| {
+                    if pending_ids.is_empty() {
+                        return None;
+                    }
+                    this.cod_pending.retain(|id, _| !pending_ids.contains(id));
+                    this.cod_unrestored_workspace_ids
+                        .retain(|id| !pending_ids.contains(id));
+                    this.cod_saved_order.retain(|id| !pending_ids.contains(id));
+                    let moved = crate::persistence::cod_registry_move_to_window(
+                        pending_ids.clone(),
+                        move_key.clone(),
+                        cx,
+                    );
+                    this.serialize(cx);
+                    cx.notify();
+                    Some(moved)
+                })
+                .ok()
+                .flatten();
+            if let Some(pending_move) = pending_move {
+                // A failed write keeps the registry dirty; the next save writes it again.
+                pending_move.await.log_err();
             }
 
             let db = cx.update(|cx| crate::persistence::WorkspaceDb::global(cx));
@@ -1190,7 +1252,10 @@ impl MultiWorkspace {
                     .ok();
                 return Ok(());
             }
-            let active_workspace = members.remove(0);
+            let shown_index = shown_id
+                .and_then(|shown| members.iter().position(|member| member.workspace_id == shown))
+                .unwrap_or(0);
+            let active_workspace = members.remove(shown_index);
             let serialized = crate::persistence::model::SerializedMultiWorkspace {
                 state: crate::persistence::model::MultiWorkspaceState {
                     active_workspace_id: Some(active_workspace.workspace_id),
