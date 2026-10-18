@@ -12278,12 +12278,19 @@ fn deserialize_remote_project(
     cx: &AsyncApp,
 ) -> Task<Result<(WorkspaceId, Option<SerializedWorkspace>)>> {
     let db = cx.update(|cx| WorkspaceDb::global(cx));
+    // Cod (#24): after a failed registry seed the saved remote workspaces stay bound to the
+    // previous session, so a remote project opened now gets a new row instead of taking over one.
+    let reuse_saved_by_roots = cx.update(|cx| !cod_registry_seed_failed(cx));
     cx.background_spawn(async move {
         let remote_connection_id = db
             .get_or_create_remote_connection(connection_options)
             .await?;
 
-        let serialized_workspace = db.remote_workspace_for_roots(&paths, remote_connection_id);
+        let serialized_workspace = if reuse_saved_by_roots {
+            db.remote_workspace_for_roots(&paths, remote_connection_id)
+        } else {
+            None
+        };
 
         let workspace_id = if let Some(workspace_id) =
             serialized_workspace.as_ref().map(|workspace| workspace.id)
