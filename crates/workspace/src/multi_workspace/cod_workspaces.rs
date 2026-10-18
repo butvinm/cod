@@ -3,7 +3,10 @@
 //! close them, the rename field, and the names, which are stored per workspace id in a key-value
 //! scope.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+};
 
 use db::kvp::KeyValueStore;
 use gpui::{
@@ -36,9 +39,11 @@ actions!(
 /// The key-value scope that holds the workspace names, keyed by workspace id.
 const NAMES_SCOPE: &str = "cod_workspace_names";
 
-/// The names read or written in this run, so the window title does not read the database each time.
+/// The names read or written in this run, so the window title does not read the database each
+/// time. Absent names are cached as None. `loaded` turns true once every stored name is in the
+/// map; from then on a missing id means the workspace has no name.
 #[derive(Default)]
-struct WorkspaceNames(RefCell<HashMap<WorkspaceId, Option<String>>>);
+struct WorkspaceNames(RefCell<HashMap<WorkspaceId, Option<String>>>, Cell<bool>);
 
 impl Global for WorkspaceNames {}
 
@@ -46,15 +51,51 @@ fn name_key(id: WorkspaceId) -> String {
     i64::from(id).to_string()
 }
 
+/// Sets up the name cache at startup and loads the stored names off the foreground thread.
+pub(crate) fn init_workspace_names(cx: &mut App) {
+    cx.set_global(WorkspaceNames::default());
+    let kvp = KeyValueStore::global(cx);
+    cx.spawn(async move |cx| {
+        let stored: Vec<(String, String)> = cx
+            .background_executor()
+            .spawn(async move {
+                kvp.select_bound::<&str, (String, String)>(
+                    "SELECT key, value FROM scoped_kv_store WHERE namespace = (?)",
+                )
+                .and_then(|mut select| select(NAMES_SCOPE))
+            })
+            .await
+            .log_err()
+            .unwrap_or_default();
+        cx.update(|cx| {
+            if let Some(names) = cx.try_global::<WorkspaceNames>() {
+                let mut map = names.0.borrow_mut();
+                for (key, name) in stored {
+                    if let Ok(id) = key.parse::<i64>() {
+                        // A name set or read in this run is newer than the stored list.
+                        map.entry(WorkspaceId::from_i64(id)).or_insert(Some(name));
+                    }
+                }
+                names.1.set(true);
+            }
+        });
+    })
+    .detach();
+}
+
 /// The name the user gave the workspace, or None while it has none.
 pub fn cod_workspace_name(workspace: &Workspace, cx: &App) -> Option<String> {
     let id = workspace.database_id()?;
     let names = cx.try_global::<WorkspaceNames>();
-    if let Some(names) = names
-        && let Some(name) = names.0.borrow().get(&id)
-    {
-        return name.clone();
+    if let Some(names) = names {
+        if let Some(name) = names.0.borrow().get(&id) {
+            return name.clone();
+        }
+        if names.1.get() {
+            return None;
+        }
     }
+    // Only before the startup load finished: read this one name and cache it, absent or not.
     let name = KeyValueStore::global(cx)
         .scoped(NAMES_SCOPE)
         .read(&name_key(id))

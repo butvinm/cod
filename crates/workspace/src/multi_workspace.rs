@@ -30,6 +30,7 @@ pub use cod_workspaces::{
     CloseWorkspace, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name,
 };
+pub(crate) use cod_workspaces::init_workspace_names;
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
