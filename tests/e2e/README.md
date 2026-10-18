@@ -19,7 +19,7 @@ Optional environment:
 
 - `COD_E2E_BIN`: a prebuilt `zed` binary with `cod-browser` next to it. Skips the build.
 - `COD_CEF_DIR`: the folder with `libcef.so`. By default `script/e2e` looks in `$CEF_PATH/<CEF_VERSION>/cef_linux_x86_64` (the version is read from `.github/workflows/linux-release.yml`), then in the cargo build folder, then in the preview data folder `~/.local/share/cod-preview/cef-<CEF_VERSION>`.
-- `COD_E2E_ARTIFACTS`: where failures are saved. Default `target/e2e-artifacts`.
+- `COD_E2E_ARTIFACTS`: where the tests save screenshots and logs. Default `target/e2e-artifacts`.
 
 ## Prerequisites
 
@@ -36,6 +36,43 @@ The build dependencies of Cod (`script/linux`), plus:
 | xz                                             | `xz-utils`            | `xz`            |
 
 `script/e2e` checks these first and prints what is missing.
+
+### Run with a prebuilt binary
+
+A machine without the Rust toolchain can run the tests against a `zed` binary with `cod-browser` next to it, for example the `target/release-fast/` folder of a build made elsewhere with `cargo build --profile release-fast -p zed -p cod_browser`. These steps start from a clean Ubuntu 24.04 with this repo checked out, and run from the repo root.
+
+1. Install the runtime libraries and the tools:
+
+   ```
+   sudo apt-get update
+   sudo apt-get install -y --no-install-recommends \
+     libnss3 libnspr4 libasound2t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers \
+     libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
+     libwebkit2gtk-4.1-0 libfontconfig1 libvulkan1 xz-utils curl util-linux \
+     sway grim dbus python3 git
+   ```
+
+2. Install the CEF runtime once into the preview data folder, where `script/e2e` finds it. It is the asset of the `cef-<CEF_VERSION>` release of this repo, checked against its `.sha256` asset:
+
+   ```
+   version=$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)
+   asset=cod-cef-$version-linux-x86_64.tar.xz
+   curl -fLO "https://github.com/butvinm/cod/releases/download/cef-$version/$asset"
+   curl -fLO "https://github.com/butvinm/cod/releases/download/cef-$version/$asset.sha256"
+   echo "$(cat "$asset.sha256")  $asset" | sha256sum -c
+   mkdir -p ~/.local/share/cod-preview
+   tar -C ~/.local/share/cod-preview -xJf "$asset"
+   mv ~/.local/share/cod-preview/cef ~/.local/share/cod-preview/cef-$version
+   rm "$asset" "$asset.sha256"
+   ```
+
+   Starting a Cod preview once with its `cod-wayland.sh` installs the same folder.
+
+3. Run the tests:
+
+   ```
+   COD_E2E_BIN=<folder>/zed script/e2e
+   ```
 
 ## What every test start gets
 
