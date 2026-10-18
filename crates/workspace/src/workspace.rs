@@ -10626,9 +10626,9 @@ pub async fn restore_multiworkspace(
     // interrupted restore) is found by its id, and a member that is not found stays in the list
     // for the next start.
     window_handle
-        .update(cx, |multi_workspace, _window, _cx| {
+        .update(cx, |multi_workspace, _window, cx| {
             if let Some(key) = state.cod_window_key.clone() {
-                multi_workspace.cod_set_window_key(key);
+                multi_workspace.cod_set_window_key(key, cx);
             }
             multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
         })

@@ -1569,9 +1569,15 @@ impl MultiWorkspace {
         &self.cod_window_key
     }
 
-    /// Cod (#24): a restored window takes the registry key it was saved under.
-    pub fn cod_set_window_key(&mut self, key: String) {
-        self.cod_window_key = key;
+    /// Cod (#24): a restored window takes the registry key it was saved under. An entry the
+    /// window may have saved under its first key goes (the removal is queued at once, so the
+    /// returned acknowledgement need not be awaited).
+    pub fn cod_set_window_key(&mut self, key: String, cx: &mut App) {
+        if self.cod_window_key == key {
+            return;
+        }
+        let first_key = std::mem::replace(&mut self.cod_window_key, key);
+        drop(crate::persistence::cod_registry_remove(first_key, cx));
     }
 
     /// Used by the quit handler to ensure pending DB writes
