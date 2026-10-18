@@ -947,8 +947,23 @@ fn main() {
                 async move |cx| {
                     // Cod (#24): a launch with folders brings the registered Cod windows back
                     // as a plain launch does, then opens the folders as stock does.
+                    // The first start after the update builds the registry from the previous
+                    // session first, as a plain launch does, so those windows are not lost.
                     let registry_windows =
-                        cx.update(|cx| workspace::cod_registry_multi_workspaces(cx));
+                        match cx.update(|cx| workspace::cod_registry_multi_workspaces(cx)) {
+                            Some(windows) => Some(windows),
+                            None => {
+                                let mut restorable =
+                                    restorable_workspaces(cx, &app_state).await;
+                                let seeded = cod_seed_registry_and_publish_session(
+                                    &mut restorable,
+                                    &app_state,
+                                    cx,
+                                )
+                                .await;
+                                if seeded { restorable } else { None }
+                            }
+                        };
                     for window in registry_windows.unwrap_or_default() {
                         if matches!(
                             window.active_workspace.location,
@@ -1452,6 +1467,37 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Cod (#24): on the first start after the update (no Cod window registry yet) the registry is
+/// built from the windows the stock session path found, before any of them is restored, and
+/// only then is this start's session id published (`Session::new` held it back). A seed that
+/// is not written keeps the previous session id published, so the next start finds the same
+/// windows again. Returns whether this start seeded the registry.
+async fn cod_seed_registry_and_publish_session(
+    restorable: &mut Option<Vec<workspace::SerializedMultiWorkspace>>,
+    app_state: &Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> bool {
+    if !cx.update(|cx| workspace::cod_window_registry_absent(cx)) {
+        return false;
+    }
+    let mut no_windows: Vec<workspace::SerializedMultiWorkspace> = Vec::new();
+    let seeded =
+        workspace::cod_seed_window_registry(restorable.as_mut().unwrap_or(&mut no_windows), cx)
+            .await;
+    if !seeded {
+        log::error!("The Cod window registry was not seeded; keeping the previous session id");
+        return false;
+    }
+    let (kvp, session_id) = cx.update(|cx| {
+        (
+            KeyValueStore::global(cx),
+            app_state.session.read(cx).id().to_owned(),
+        )
+    });
+    session::cod_publish_session_id(kvp, session_id).await;
+    true
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1466,14 +1512,7 @@ pub(crate) async fn restore_or_create_workspace(
         Some(windows) => Some(windows),
         None => {
             let mut restorable = restorable_workspaces(cx, &app_state).await;
-            if cx.update(|cx| workspace::cod_window_registry_absent(cx)) {
-                let mut no_windows: Vec<workspace::SerializedMultiWorkspace> = Vec::new();
-                workspace::cod_seed_window_registry(
-                    restorable.as_mut().unwrap_or(&mut no_windows),
-                    cx,
-                )
-                .await;
-            }
+            cod_seed_registry_and_publish_session(&mut restorable, &app_state, cx).await;
             restorable
         }
     };

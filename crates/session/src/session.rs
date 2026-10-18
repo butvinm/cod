@@ -11,13 +11,24 @@ pub struct Session {
 const SESSION_ID_KEY: &str = "session_id";
 const SESSION_WINDOW_STACK_KEY: &str = "session_window_stack";
 
+/// Cod (#24): the key of the Cod window registry (`COD_WINDOW_REGISTRY_KEY` in the workspace
+/// crate). While it is absent, the first start after the update still has to build it from the
+/// windows of the previous session.
+const COD_WINDOW_REGISTRY_KEY: &str = "cod_windows";
+
 impl Session {
     pub async fn new(session_id: String, db: KeyValueStore) -> Self {
         let old_session_id = db.read_kvp(SESSION_ID_KEY).ok().flatten();
 
-        db.write_kvp(SESSION_ID_KEY.to_string(), session_id.clone())
-            .await
-            .log_err();
+        // Cod (#24): without a Cod window registry the new session id is published only once
+        // the registry is built from the previous session (`cod_publish_session_id`), so a
+        // start that stops before that still finds the previous session's windows next time.
+        let registry_absent = matches!(db.read_kvp(COD_WINDOW_REGISTRY_KEY), Ok(None));
+        if !registry_absent {
+            db.write_kvp(SESSION_ID_KEY.to_string(), session_id.clone())
+                .await
+                .log_err();
+        }
 
         let old_window_ids = db
             .read_kvp(SESSION_WINDOW_STACK_KEY)
@@ -58,6 +69,15 @@ impl Session {
     pub fn id(&self) -> &str {
         &self.session_id
     }
+}
+
+/// Cod (#24): publishes this start's session id, after the Cod window registry was built from
+/// the previous session on the first start after the update. Returns whether it was written.
+pub async fn cod_publish_session_id(db: KeyValueStore, session_id: String) -> bool {
+    db.write_kvp(SESSION_ID_KEY.to_string(), session_id)
+        .await
+        .log_err()
+        .is_some()
 }
 
 pub struct AppSession {

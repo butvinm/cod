@@ -10838,11 +10838,12 @@ pub fn cod_registry_multi_workspaces(cx: &mut App) -> Option<Vec<SerializedMulti
 
 /// Cod (#24): the first start after the update builds the registry from the windows the stock
 /// session path found, before any of them is restored (restoring re-binds their workspaces),
-/// and waits until it is written. Each window keeps its saved key or gets a new one.
+/// and waits until it is written. Each window keeps its saved key or gets a new one. Returns
+/// whether the registry was written.
 pub async fn cod_seed_window_registry(
     windows: &mut [SerializedMultiWorkspace],
     cx: &mut AsyncApp,
-) {
+) -> bool {
     let mut entries = Vec::new();
     for window in windows.iter_mut() {
         let key = window
@@ -10869,13 +10870,19 @@ pub async fn cod_seed_window_registry(
             active_workspace_id: Some(window.active_workspace.workspace_id),
         });
     }
-    let write = cx.update(|cx| {
-        persistence::cod_registry_start(entries, cx);
-        persistence::cod_registry_write_now(cx)
-    });
-    if let Err(err) = write.await {
-        log::error!("Failed to seed the Cod window registry: {err:#}");
+    cx.update(|cx| persistence::cod_registry_start(entries, cx));
+    // A failed write is tried again; the caller publishes the new session only once the seed
+    // is written, so a seed that never lands leaves the previous session to be found again.
+    for attempt in 1..=3 {
+        let write = cx.update(|cx| persistence::cod_registry_write_now(cx));
+        match write.await {
+            Ok(()) => return true,
+            Err(err) => {
+                log::error!("Failed to seed the Cod window registry (attempt {attempt}): {err:#}")
+            }
+        }
     }
+    false
 }
 
 /// Cod (#24): the start restored its windows. From now on every window change updates the
