@@ -317,10 +317,35 @@ impl SerializedPaneGroup {
                     .context("Could not deserialize pane)")
                     .log_err()?;
 
-                if pane
+                let pane_kept = pane
                     .read_with(cx, |pane, _| pane.items_len() != 0)
-                    .log_err()?
-                {
+                    .log_err()?;
+
+                // Cod (#24): the saved items that failed to load keep their records and their
+                // place in the saved layout, so a later restore can still bring them back.
+                let unrestored = serialized_pane
+                    .children
+                    .iter()
+                    .zip(new_items.iter())
+                    .filter(|(_, item)| item.is_none())
+                    .map(|(serialized_item, _)| SerializedItem {
+                        active: false,
+                        preview: false,
+                        ..serialized_item.clone()
+                    })
+                    .collect::<Vec<_>>();
+                if !unrestored.is_empty() {
+                    let owner = pane_kept.then(|| pane.entity_id());
+                    workspace
+                        .update(cx, |workspace, _| {
+                            workspace.cod_unrestored_items.extend(
+                                unrestored.into_iter().map(|item| (owner, item)),
+                            );
+                        })
+                        .log_err();
+                }
+
+                if pane_kept {
                     let pane = pane.upgrade()?;
                     Some((
                         Member::Pane(pane.clone()),

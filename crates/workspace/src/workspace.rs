@@ -1666,6 +1666,10 @@ pub struct Workspace {
     /// Cod (#24): true after the restored items could not be written. The previous complete
     /// snapshot stays on disk and no layout that points at missing item records is saved.
     cod_layout_save_blocked: bool,
+    /// Cod (#24): saved items that failed to load in the restore, with the pane they belong to
+    /// (`None` when their whole pane failed). Every later layout keeps them and their records
+    /// are not cleaned up, so a later restore can still bring them back.
+    cod_unrestored_items: Vec<(Option<EntityId>, SerializedItem)>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2177,6 +2181,7 @@ impl Workspace {
             restoring_workspace: false,
             cod_restore_in_progress: false,
             cod_layout_save_blocked: false,
+            cod_unrestored_items: Vec::new(),
         }
     }
 
@@ -7843,6 +7848,8 @@ impl Workspace {
         fn build_serialized_pane_group(
             pane_group: &Member,
             hidden_active_pane: Option<&Entity<Pane>>,
+            unrestored_items: &[(Option<EntityId>, SerializedItem)],
+            active_pane: &Entity<Pane>,
             window: &mut Window,
             cx: &mut App,
         ) -> SerializedPaneGroup {
@@ -7857,7 +7864,14 @@ impl Workspace {
                     children: members
                         .iter()
                         .map(|member| {
-                            build_serialized_pane_group(member, hidden_active_pane, window, cx)
+                            build_serialized_pane_group(
+                                member,
+                                hidden_active_pane,
+                                unrestored_items,
+                                active_pane,
+                                window,
+                                cx,
+                            )
                         })
                         .collect::<Vec<_>>(),
                     flexes: Some(flexes.lock().clone()),
@@ -7868,6 +7882,17 @@ impl Workspace {
                     // so its active pane is the one it would focus when shown again.
                     if let Some(active_pane) = hidden_active_pane {
                         pane.active = pane_handle == active_pane;
+                    }
+                    // Cod (#24): items that failed to load stay in the layout of their pane (or
+                    // of the active pane when their whole pane failed), after the loaded ones.
+                    for (owner, item) in unrestored_items {
+                        let belongs_here = match owner {
+                            Some(owner) => *owner == pane_handle.entity_id(),
+                            None => pane_handle == active_pane,
+                        };
+                        if belongs_here {
+                            pane.children.push(item.clone());
+                        }
                     }
                     SerializedPaneGroup::Pane(pane)
                 }
@@ -7908,6 +7933,8 @@ impl Workspace {
                 let center_group = build_serialized_pane_group(
                     &self.center.root,
                     hidden_active_pane.as_ref(),
+                    &self.cod_unrestored_items,
+                    &self.active_pane,
                     window,
                     cx,
                 );
@@ -8208,7 +8235,18 @@ impl Workspace {
                 return Ok(opened_items);
             }
 
-            let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
+            let clean_up_tasks = workspace.update_in(cx, |workspace, window, cx| {
+                // Cod (#24): the records of items that failed to load stay; the committed
+                // layout still points at them.
+                for (item_kind, alive_items) in item_ids_by_kind.iter_mut() {
+                    alive_items.extend(
+                        workspace
+                            .cod_unrestored_items
+                            .iter()
+                            .filter(|(_, item)| &*item.kind == *item_kind)
+                            .map(|(_, item)| item.item_id),
+                    );
+                }
                 item_ids_by_kind
                     .into_iter()
                     .map(|(item_kind, loaded_items)| {
