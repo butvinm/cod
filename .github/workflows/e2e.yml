@@ -1,0 +1,173 @@
+# Runs the end-to-end tests (tests/e2e) against the real Cod app on Linux under a headless sway (issue #22).
+# The build uses the same environment as the Linux release workflow, so it reuses that workflow's compiled crates (sccache) and CEF download.
+# The tests run through script/e2e, the same command a developer runs locally; its own cargo build finds nothing to do.
+# A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
+# Pushes to master run it too, which keeps the caches warm: only master writes them.
+name: E2E
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    name: e2e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # The same values as the build job of linux-release.yml. A difference makes sccache miss and rebuild everything.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
+      CEF_PATH: /home/runner/cef
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # A pull request checks out its merge commit; its first parent is the base, which is enough to list the changed files.
+          fetch-depth: 2
+
+      - name: Detect code changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "Decision: $EVENT_NAME event, building and running the end-to-end tests"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(git diff --name-only HEAD^1 HEAD); then
+            echo "Decision: cannot list the changed files, building and running the end-to-end tests"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files:"
+          printf '  %s\n' $files
+          code=false
+          first=
+          for file in $files; do
+            case $file in
+              *.md | docs/* | LICENSE*) ;;
+              *) code=true; first=$file; break ;;
+            esac
+          done
+          if [ -z "$files" ]; then
+            code=true
+            first="(no changed files listed)"
+          fi
+          if [ "$code" = true ]; then
+            echo "Decision: code change found ($first), building and running the end-to-end tests"
+          else
+            echo "Decision: docs-only change (*.md, docs/**, LICENSE*), skipping the build and the tests"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      # One source of truth for the CEF version: the release workflow.
+      - name: Read the CEF version
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          version=$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)
+          test -n "$version"
+          echo "CEF_VERSION=$version" >> "$GITHUB_ENV"
+          echo "CEF $version"
+
+      # The build packages of linux-release.yml, then what the tests need at run time: the browser runtime libraries (as in check-preview.yml), sway as the headless compositor, grim for screenshots, mesa-vulkan-drivers for software Vulkan, dbus for dbus-run-session.
+      - name: Install Linux dependencies
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang lld llvm libstdc++-14-dev \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev libva-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev mold \
+            libnss3 libnspr4 libasound2t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers \
+            libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
+            libwebkit2gtk-4.1-0 libfontconfig1 xz-utils util-linux \
+            sway grim dbus
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      - name: Set up sccache
+        if: steps.changes.outputs.code == 'true'
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      - name: Restore the cargo registry cache
+        if: steps.changes.outputs.code == 'true'
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-targets: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Restore the CEF download
+        if: steps.changes.outputs.code == 'true'
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # The same command as in script/e2e, with the same environment as the release build.
+      - name: Build
+        if: steps.changes.outputs.code == 'true'
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+        run: |
+          echo "build started at $(date -u '+%H:%M:%S')"
+          sccache --zero-stats
+          cargo build --profile release-fast -p zed -p cod_browser
+          sccache --show-stats
+          echo "build finished at $(date -u '+%H:%M:%S')"
+
+      - name: Save the CEF download
+        if: steps.changes.outputs.code == 'true' && github.ref == 'refs/heads/master' && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. Nothing here changes what the tests do.
+      - name: Run end-to-end tests
+        if: steps.changes.outputs.code == 'true'
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+        run: script/e2e
+
+      # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.
+      - name: Upload artifacts
+        if: always() && steps.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: warn

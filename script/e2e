@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Runs Cod's end-to-end tests (tests/e2e) against the real app under a private headless sway, the same way CI does.
+# Usage: script/e2e [unittest arguments]
+#   script/e2e                                  all tests
+#   script/e2e test_22_open_file                one story file (more names or Class.method names work too)
+#   script/e2e -k file_finder                   tests whose name contains "file_finder"
+# Optional environment:
+#   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
+#   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
+#   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
+# Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+cd "$root"
+
+say() {
+    echo "e2e: $*" >&2
+}
+
+# 1. Prerequisites.
+missing=()
+need() { # need <command> <Ubuntu package> <Arch package>
+    command -v "$1" > /dev/null 2>&1 || missing+=("$1 (Ubuntu: $2, Arch: $3)")
+}
+need sway sway sway
+need grim grim grim
+need dbus-run-session dbus dbus
+need python3 python3 python
+need git git git
+need xz xz-utils xz
+if [ -z "${COD_E2E_BIN:-}" ]; then
+    need cargo "rustup, see https://rustup.rs" rustup
+fi
+if [ "${#missing[@]}" -gt 0 ]; then
+    say "missing prerequisites:"
+    for item in "${missing[@]}"; do
+        echo "  $item" >&2
+    done
+    exit 2
+fi
+if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
+    say "python3 3.10 or newer is needed, found $(python3 --version 2>&1)"
+    exit 2
+fi
+
+# 2. The Cod binaries.
+if [ -n "${COD_E2E_BIN:-}" ]; then
+    zed_bin=$(realpath "$COD_E2E_BIN")
+    say "using the prebuilt binary $zed_bin"
+else
+    say "build started at $(date '+%H:%M:%S'): cargo build --profile release-fast -p zed -p cod_browser"
+    cargo build --profile release-fast -p zed -p cod_browser
+    say "build finished at $(date '+%H:%M:%S')"
+    zed_bin="$root/target/release-fast/zed"
+fi
+browser_bin="$(dirname "$zed_bin")/cod-browser"
+for binary in "$zed_bin" "$browser_bin"; do
+    [ -x "$binary" ] || { say "$binary is missing or not executable"; exit 2; }
+done
+
+# 3. The CEF runtime. The version has one source of truth: CEF_VERSION in the release workflow.
+cef_version=${CEF_VERSION:-$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)}
+if [ -z "${COD_CEF_DIR:-}" ]; then
+    candidates=()
+    [ -n "${CEF_PATH:-}" ] && candidates+=("$CEF_PATH/$cef_version/cef_linux_x86_64")
+    while IFS= read -r found; do
+        candidates+=("$(dirname "$found")")
+    done < <(find "$root/target/release-fast/build" -maxdepth 4 -name libcef.so 2> /dev/null | sort)
+    candidates+=("${COD_PREVIEW_DIR:-$HOME/.local/share/cod-preview}/cef-$cef_version")
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate/libcef.so" ]; then
+            COD_CEF_DIR=$candidate
+            break
+        fi
+    done
+fi
+if [ -z "${COD_CEF_DIR:-}" ] || [ ! -f "$COD_CEF_DIR/libcef.so" ]; then
+    say "no CEF $cef_version runtime found: set COD_CEF_DIR to the folder with libcef.so, or CEF_PATH to the folder the cef crate downloads into"
+    exit 2
+fi
+export COD_CEF_DIR
+say "CEF runtime: $COD_CEF_DIR"
+
+# 4. A run folder like the release tarball, so the tests start Cod the way users do.
+run="$root/target/e2e-run/cod"
+rm -rf "$root/target/e2e-run"
+mkdir -p "$run"
+ln -f "$zed_bin" "$run/cod" 2> /dev/null || cp -f "$zed_bin" "$run/cod"
+ln -f "$browser_bin" "$run/cod-browser" 2> /dev/null || cp -f "$browser_bin" "$run/cod-browser"
+cp -f script/cod-wayland.sh "$run/cod-wayland.sh"
+chmod +x "$run/cod" "$run/cod-browser" "$run/cod-wayland.sh"
+export COD_E2E_RUN_DIR="$run"
+
+# 5. The artifacts folder. Only the default folder is emptied first.
+default_artifacts="$root/target/e2e-artifacts"
+artifacts=${COD_E2E_ARTIFACTS:-$default_artifacts}
+if [ "$artifacts" = "$default_artifacts" ]; then
+    rm -rf "$artifacts"
+fi
+mkdir -p "$artifacts"
+COD_E2E_ARTIFACTS=$(cd "$artifacts" && pwd)
+export COD_E2E_ARTIFACTS
+
+# 6. A private headless sway: its own runtime folder, no input devices, software rendering, never a window on the desktop.
+work=$(mktemp -d "${TMPDIR:-/tmp}/cod-e2e-sway.XXXXXX")
+runtime="$work/runtime"
+mkdir -m 700 "$runtime"
+sway_pid=
+stop_sway() {
+    if [ -n "$sway_pid" ]; then
+        kill "$sway_pid" 2> /dev/null || true
+        wait "$sway_pid" 2> /dev/null || true
+        sway_pid=
+    fi
+}
+# Prints the ids of the processes of this run: every process started after XDG_RUNTIME_DIR was set below inherited this private folder.
+run_processes() {
+    for environ in /proc/[0-9]*/environ; do
+        pid=${environ#/proc/}
+        pid=${pid%/environ}
+        [ "$pid" = "$$" ] && continue
+        if grep -qzxF "XDG_RUNTIME_DIR=$runtime" "$environ" 2> /dev/null; then
+            echo "$pid"
+        fi
+    done
+}
+cleanup() {
+    stop_sway
+    # The commands below do not belong to the run, so they must not inherit its marker.
+    unset XDG_RUNTIME_DIR
+    # Last resort, so that no process outlives the run.
+    for pid in $(run_processes); do
+        kill -9 "$pid" 2> /dev/null || true
+    done
+    rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK I3SOCK
+export XDG_RUNTIME_DIR="$runtime"
+WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
+    sway --unsupported-gpu -c "$root/tests/e2e/sway.conf" > "$COD_E2E_ARTIFACTS/sway.log" 2>&1 &
+sway_pid=$!
+socket=
+for _ in $(seq 1 100); do
+    socket=$(find "$runtime" -maxdepth 1 -type s -name 'wayland-[0-9]*' ! -name '*.lock' -printf '%f\n' 2> /dev/null | sort | head -n 1)
+    [ -n "$socket" ] && break
+    kill -0 "$sway_pid" 2> /dev/null || break
+    sleep 0.1
+done
+if [ -z "$socket" ]; then
+    say "the headless sway did not start; its log:"
+    cat "$COD_E2E_ARTIFACTS/sway.log" >&2
+    exit 2
+fi
+export WAYLAND_DISPLAY="$socket"
+export XDG_SESSION_TYPE=wayland
+say "headless sway runs on $WAYLAND_DISPLAY; artifacts go to $COD_E2E_ARTIFACTS"
+
+# 7. The tests. Names select tests; without names unittest discovers every test_*.py in tests/e2e (and tests/e2e/unit).
+export PYTHONPATH="$root/tests/e2e${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+{
+    echo "commit: $(git -C "$root" rev-parse HEAD 2> /dev/null || echo unknown)"
+    echo "started: $(date -u '+%Y-%m-%d %H:%M:%S') UTC"
+    echo "command: script/e2e $*"
+} > "$COD_E2E_ARTIFACTS/run.txt"
+names=0
+skip_next=0
+for arg in "$@"; do
+    if [ "$skip_next" = 1 ]; then
+        skip_next=0
+    elif [ "$arg" = -k ] || [ "$arg" = -p ]; then
+        skip_next=1
+    elif [ "${arg#-}" = "$arg" ]; then
+        names=1
+    fi
+done
+run_tests() {
+    if [ "$names" = 1 ]; then
+        python3 -m unittest -v "$@"
+    else
+        python3 -m unittest discover -v -s tests/e2e -t tests/e2e "$@"
+    fi
+}
+test_log="$work/unittest.log"
+say "tests started at $(date '+%H:%M:%S')"
+set +e
+run_tests "$@" 2>&1 | tee "$test_log"
+status=${PIPESTATUS[0]}
+set -e
+say "tests finished at $(date '+%H:%M:%S') with status $status"
+# A selection that matches nothing must not look like a green run.
+if grep -q '^Ran 0 tests' "$test_log"; then
+    say "the selection ran no test: check the test names or the -k pattern in: script/e2e $*"
+    status=5
+fi
+
+# 8. No process of this run may outlive the tests.
+stop_sway
+unset XDG_RUNTIME_DIR WAYLAND_DISPLAY
+leftovers=
+for _ in $(seq 1 50); do
+    leftovers=$(run_processes)
+    [ -z "$leftovers" ] && break
+    sleep 0.1
+done
+if [ -n "$leftovers" ]; then
+    say "processes of this run are still running after the tests:"
+    for pid in $leftovers; do
+        echo "  $pid $(tr '\0' ' ' < "/proc/$pid/cmdline" 2> /dev/null)" >&2
+    done
+    [ "$status" = 0 ] && status=1
+else
+    say "no process of this run is left"
+fi
+echo "status: $status" >> "$COD_E2E_ARTIFACTS/run.txt"
+exit "$status"
