@@ -1562,9 +1562,11 @@ impl MultiWorkspace {
         tasks
     }
 
+    /// Cod (#24): focuses the active item itself (or a zoomed panel), not the pane around it, so
+    /// typing works after a switch even while the platform window is inactive. An open modal
+    /// keeps its focus.
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
-        let focus_handle = self.workspace().read(cx).fallback_focus_handle(window, cx);
-        window.focus(&focus_handle, cx);
+        self.workspace().read(cx).cod_focus_restored(window, cx);
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {
