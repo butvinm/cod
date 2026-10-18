@@ -1083,6 +1083,127 @@ class WorkspacesTest(CodTestCase):
             if state["project_panel"] is not None:
                 self.expect_equal("project panel roots", [], state["project_panel"]["roots"])
 
+    def test_regression_palette_after_restoring_an_unsaved_edit_in_one_of_two_workspaces(self) -> None:
+        """Beta run 39128519357: two workspaces on the same folder, the active one with an unsaved edit; after quit and start the command palette did not open. Then close with Cancel (the workspace stays) and with Save, restart: the closed workspace stays gone."""
+        b_name = "[PAY-1240] (billing-api) Ledger export"
+        ledger_draft = "// draft "
+        invoice_draft = "Draft "
+        with self.step("create billing-api"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            ledger_path = repo / "src" / "ledger.rs"
+            invoice_path = repo / "src" / "invoice.rs"
+            ledger_edited = insert_at_line(LEDGER_RS, 18, ledger_draft)
+            invoice_edited = insert_at_line(INVOICE_RS, 9, invoice_draft)
+            folder = [real(repo)]
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(repo, persistent=True)
+            self.wait_for_worktrees([repo])
+
+        with self.step("workspace A: open invoice.rs and ledger.rs, type an unsaved edit at line 18 of ledger.rs"):
+            self.open_file("invoice.rs")
+            self.open_file("ledger.rs")
+            self.go_to_line(18)
+            self.type(ledger_draft)
+            self.wait_for_values(
+                "the edited ledger.rs",
+                {"dirty_tabs": ["ledger.rs"], "unsaved_texts": [{"tab": "ledger.rs", "text": ledger_edited}]},
+                layout,
+                SHOW_TIMEOUT,
+            )
+
+        with self.step(f"workspace A: rename it to {PAY_NAME!r}"):
+            self.rename_workspace(PAY_NAME)
+            a_index = self.state()["active_workspace"]
+
+        with self.step("workspace B: new workspace on the SAME folder, open invoice.rs at line 9, rename it"):
+            self.new_workspace()
+            self.add_folder(repo)
+            self.open_file("invoice.rs")
+            self.go_to_line(9)
+            self.rename_workspace(b_name)
+            b_index = self.state()["active_workspace"]
+
+        a_expected = {
+            "name": PAY_NAME,
+            "worktrees": folder,
+            "panes": [{"tabs": ["invoice.rs", "ledger.rs"], "active_tab": "ledger.rs"}],
+            "active_tab": "ledger.rs",
+            "cursor": {"row": 18, "column": 1 + len(ledger_draft)},
+            "dirty_tabs": ["ledger.rs"],
+            "unsaved_texts": [{"tab": "ledger.rs", "text": ledger_edited}],
+            "window_count": 1,
+        }
+        b_expected = {
+            "name": b_name,
+            "worktrees": folder,
+            "panes": [{"tabs": ["invoice.rs"], "active_tab": "invoice.rs"}],
+            "active_tab": "invoice.rs",
+            "cursor": {"row": 9, "column": 1},
+            "dirty_tabs": [],
+            "unsaved_texts": [],
+            "window_count": 1,
+        }
+
+        with self.step(f"make workspace A active with {PREVIOUS_WORKSPACE!r}, then quit with ctrl-q and start again"):
+            self.switch_workspace(PREVIOUS_WORKSPACE, a_index, "workspace A", a_expected)
+            self.expect_equal("ledger.rs on disk", LEDGER_RS, ledger_path.read_text())
+            self.restart_cod()
+
+        with self.step("both workspaces come back, A active with its unsaved edit"):
+            self.wait_for_values(
+                "the restored workspace A",
+                {"workspace_count": 2, "active_workspace": a_index, "modal": None, **a_expected},
+                layout,
+                RESTORE_TIMEOUT,
+            )
+            self.wait_for_title(PAY_NAME)
+
+        with self.step(f"after the restart, the command palette runs {NEXT_WORKSPACE!r}: workspace B"):
+            self.switch_workspace(NEXT_WORKSPACE, b_index, "the restored workspace B", b_expected)
+
+        with self.step("workspace B: type an unsaved edit in invoice.rs"):
+            self.type(invoice_draft)
+            self.wait_for_values(
+                "the edited invoice.rs",
+                {"dirty_tabs": ["invoice.rs"], "unsaved_texts": [{"tab": "invoice.rs", "text": invoice_edited}]},
+                layout,
+                SHOW_TIMEOUT,
+            )
+
+        with self.step(f"close workspace B with {CLOSE_WORKSPACE!r} and answer escape (Cancel): B stays with its edit"):
+            self.run_command(CLOSE_WORKSPACE)
+            state = self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "a prompt to save invoice.rs")
+            self.expect_equal("prompt answers", SAVE_ANSWERS, state["prompt"]["answers"])
+            self.keys("escape")
+            self.wait_for_values(
+                "workspace B after Cancel",
+                {"prompt": None, "workspace_count": 2, "active_workspace": b_index, "name": b_name, "dirty_tabs": ["invoice.rs"]},
+                layout,
+                SHOW_TIMEOUT,
+            )
+            self.stays(lambda state: state["workspace_count"] == 2 and state["prompt"] is None, SETTLE_TIME, "two workspaces after Cancel")
+            self.expect_equal("invoice.rs on disk", INVOICE_RS, invoice_path.read_text())
+
+        with self.step(f"close workspace B again with {CLOSE_WORKSPACE!r} and answer enter (Save)"):
+            self.run_command(CLOSE_WORKSPACE)
+            state = self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "the save prompt again")
+            self.expect_equal("highlighted answer", 0, state["prompt"]["highlighted"])
+            self.keys("enter")
+            self.wait_for_values(
+                "workspace A after the close", {"prompt": None, "workspace_count": 1, "modal": None, **a_expected}, layout, SHOW_TIMEOUT
+            )
+            deadline = time.monotonic() + 10
+            while invoice_path.read_text() != invoice_edited and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.expect_equal("invoice.rs on disk", invoice_edited, invoice_path.read_text())
+
+        with self.step("quit and start again: only workspace A comes back, B stays gone"):
+            self.restart_cod()
+            self.wait_for_values("the restored workspace A", {"modal": None, **a_expected}, layout, RESTORE_TIMEOUT)
+            state = self.stays(lambda state: state["workspace_count"] == 1, SETTLE_TIME, "exactly workspace A")
+            self.expect_equal("workspaces", [{"name": PAY_NAME, "worktrees": folder}], workspace_list(state))
+
 
 if __name__ == "__main__":
     unittest.main()
