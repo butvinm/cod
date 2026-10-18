@@ -81,7 +81,7 @@ Each Cod start has its own data folder (`--user-data-dir`) in the test's temp fo
 ## Add a story test
 
 1. Copy `test_22_open_file.py` to `test_<issue>_<slug>.py`. One file per story.
-2. Make the fixture repos in the test with `self.make_repo(name, files)`. They live in a temp folder of that test and are deleted after it. Use invented content only.
+2. Make the fixture repos in the test with `self.make_repo(name, files)`. They live in a temp folder of that test and are deleted after it. Use invented content only, and give each story its own repo name.
 3. Put every action in its own `with self.step("..."):`. A failure then logs `FAILED STEP: <step>` and saves the artifacts.
 4. Drive the app only with `self.keys("ctrl-p")` (Zed keystroke syntax, space-separated) and `self.type("text")`. Never call into the app in a way a user cannot.
 5. Read the app with `self.state()` (`active_tab`, `tabs`, `worktrees`, `modal`) and `self.wait_for(predicate, timeout, description)`. Check with `self.expect_equal("active tab", "invoice.rs", actual)`, which fails with `expected active tab 'invoice.rs', actual '...'`.
