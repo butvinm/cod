@@ -6,14 +6,49 @@ pub struct Session {
     session_id: String,
     old_session_id: Option<String>,
     old_window_ids: Option<Vec<WindowId>>,
+    cod_recovery_session_id: Option<String>,
 }
 
 const SESSION_ID_KEY: &str = "session_id";
 const SESSION_WINDOW_STACK_KEY: &str = "session_window_stack";
+/// Cod (#24): `[root, published]`, written before a new session id is published. `root` is the
+/// session whose workspaces this start restores, `published` the new session id. A start that
+/// stops before its restore finished (see `cod_clear_session_recovery`) leaves it, and the next
+/// start, whose previous session is `published`, restores `root` too, so the workspaces still
+/// bound to it come back instead of an empty window.
+const COD_SESSION_RECOVERY_KEY: &str = "cod_session_recovery";
+
+/// Removes the recovery entry once the restored windows saved their lists under this session.
+pub async fn cod_clear_session_recovery(db: KeyValueStore) {
+    db.delete_kvp(COD_SESSION_RECOVERY_KEY.to_string())
+        .await
+        .log_err();
+}
+
+fn cod_recovery_root(entry: Option<String>, old_session_id: Option<&str>) -> Option<String> {
+    let pair = serde_json::from_str::<Vec<String>>(&entry?).ok()?;
+    match pair.as_slice() {
+        [root, published] if Some(published.as_str()) == old_session_id => Some(root.clone()),
+        _ => None,
+    }
+}
 
 impl Session {
     pub async fn new(session_id: String, db: KeyValueStore) -> Self {
         let old_session_id = db.read_kvp(SESSION_ID_KEY).ok().flatten();
+
+        let cod_recovery_session_id = cod_recovery_root(
+            db.read_kvp(COD_SESSION_RECOVERY_KEY).ok().flatten(),
+            old_session_id.as_deref(),
+        )
+        .filter(|root| Some(root.as_str()) != old_session_id.as_deref());
+        if let Some(root) = cod_recovery_session_id.as_ref().or(old_session_id.as_ref())
+            && let Ok(json) = serde_json::to_string(&[root.as_str(), session_id.as_str()])
+        {
+            db.write_kvp(COD_SESSION_RECOVERY_KEY.to_string(), json)
+                .await
+                .log_err();
+        }
 
         db.write_kvp(SESSION_ID_KEY.to_string(), session_id.clone())
             .await
@@ -34,6 +69,7 @@ impl Session {
             session_id,
             old_session_id,
             old_window_ids,
+            cod_recovery_session_id,
         }
     }
 
@@ -43,6 +79,7 @@ impl Session {
             session_id: uuid::Uuid::new_v4().to_string(),
             old_session_id: None,
             old_window_ids: None,
+            cod_recovery_session_id: None,
         }
     }
 
@@ -52,6 +89,7 @@ impl Session {
             session_id: uuid::Uuid::new_v4().to_string(),
             old_session_id: Some(old_session_id),
             old_window_ids: None,
+            cod_recovery_session_id: None,
         }
     }
 
@@ -122,6 +160,12 @@ impl AppSession {
         self.session.old_session_id.as_deref()
     }
 
+    /// Cod (#24): an earlier session whose restore the previous start did not finish, if any
+    /// (never the same as `last_session_id`).
+    pub fn cod_recovery_session_id(&self) -> Option<&str> {
+        self.session.cod_recovery_session_id.as_deref()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn replace_session_for_test(&mut self, session: Session) {
         self.session = session;
@@ -146,5 +190,23 @@ async fn store_window_stack(db: KeyValueStore, windows: &[u64]) {
         db.write_kvp(SESSION_WINDOW_STACK_KEY.to_string(), window_ids_json)
             .await
             .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cod_recovery_root;
+
+    #[test]
+    fn recovery_root_applies_only_after_the_published_session() {
+        let entry = Some(r#"["s1","s2"]"#.to_string());
+        assert_eq!(
+            cod_recovery_root(entry.clone(), Some("s2")),
+            Some("s1".to_string())
+        );
+        assert_eq!(cod_recovery_root(entry.clone(), Some("s3")), None);
+        assert_eq!(cod_recovery_root(entry, None), None);
+        assert_eq!(cod_recovery_root(None, Some("s2")), None);
+        assert_eq!(cod_recovery_root(Some("garbage".to_string()), Some("s2")), None);
     }
 }
