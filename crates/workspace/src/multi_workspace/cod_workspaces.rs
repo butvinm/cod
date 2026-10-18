@@ -309,6 +309,13 @@ impl MultiWorkspace {
             if !consent {
                 return anyhow::Ok(());
             }
+            // Write the closing workspace's final state (it stays in recent projects) before it
+            // leaves the session; detaching cancels its scheduled saves.
+            doomed
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.flush_serialization(window, cx)
+                })?
+                .await;
 
             let replacement = this.update(cx, |this, _cx| {
                 let index = this.held_index(&doomed)?;
@@ -364,7 +371,11 @@ impl MultiWorkspace {
             .iter()
             .filter_map(|held| held.workspace.read(cx).database_id())
             .collect();
-        for id in &self.cod_unrestored_workspace_ids {
+        for id in self
+            .cod_unrestored_workspace_ids
+            .iter()
+            .chain(&self.cod_removing_workspace_ids)
+        {
             if !ids.contains(id) {
                 ids.push(*id);
             }
@@ -376,6 +387,13 @@ impl MultiWorkspace {
     /// held by this window.
     pub fn cod_begin_restore(&mut self, saved: &[WorkspaceId]) {
         self.cod_unrestored_workspace_ids = saved.to_vec();
+    }
+
+    /// Drops from the saved list the ids of workspaces that were closed (no session binding)
+    /// but were still listed when the app stopped.
+    pub fn cod_forget_closed_workspaces(&mut self, closed: &[WorkspaceId]) {
+        self.cod_unrestored_workspace_ids
+            .retain(|id| !closed.contains(id));
     }
 
     /// Ends a restore. The ids that are still not held failed to come back; they stay in the

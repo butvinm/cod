@@ -328,6 +328,9 @@ pub struct MultiWorkspace {
     /// (still restoring, or failed to restore). They stay in the saved list so the next start
     /// retries them.
     cod_unrestored_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): ids of workspaces removed from this window whose session binding is not
+    /// cleared yet. They stay in the saved list until it is.
+    cod_removing_workspace_ids: Vec<WorkspaceId>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -393,6 +396,7 @@ impl MultiWorkspace {
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
             cod_unrestored_workspace_ids: Vec::new(),
+            cod_removing_workspace_ids: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -1440,21 +1444,34 @@ impl MultiWorkspace {
         if let Some(workspace_id) = workspace.read(cx).database_id() {
             let db = crate::persistence::WorkspaceDb::global(cx);
             // Cod (#24): a removed workspace loses its name on every removal path (palette close,
-            // sidebar, discarded empty workspace). The name goes after the session binding, so a
-            // crash in between never restores a workspace without its name.
+            // sidebar, discarded empty workspace). The steps run in one awaited sequence off the
+            // GPUI thread: the session binding goes first, which alone keeps the workspace from
+            // coming back (a restore skips saved ids without a binding), then the name, then the
+            // window's workspace list without it. A crash between steps never brings back a
+            // half removed workspace.
+            // Until the binding is gone, any save of the list in between still lists it.
             let kvp = db::kvp::KeyValueStore::global(cx);
             cod_workspaces::forget_workspace_name(workspace_id, cx);
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);
+            self.cod_removing_workspace_ids.push(workspace_id);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
-                .push(cx.background_spawn(async move {
+                .push(cx.spawn(async move |this, cx| {
                     db.set_session_binding(workspace_id, None, None)
                         .await
                         .log_err();
                     cod_workspaces::delete_stored_workspace_name(&kvp, workspace_id)
                         .await
                         .log_err();
+                    let Ok(membership) = this.update(cx, |this, cx| {
+                        this.cod_removing_workspace_ids
+                            .retain(|id| *id != workspace_id);
+                        this.serialize_now(cx)
+                    }) else {
+                        return;
+                    };
+                    membership.await;
                 }));
         }
     }

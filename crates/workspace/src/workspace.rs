@@ -10426,26 +10426,44 @@ pub async fn restore_multiworkspace(
         .collect();
     if !missing_ids.is_empty() {
         let db = cx.update(|cx| WorkspaceDb::global(cx));
-        let recovered: Vec<SessionWorkspace> = cx
+        let (recovered, closed): (Vec<SessionWorkspace>, Vec<WorkspaceId>) = cx
             .background_executor()
             .spawn(async move {
-                missing_ids
-                    .into_iter()
-                    .filter_map(|id| {
-                        let saved = db.workspace_for_id(id);
-                        if saved.is_none() {
-                            log::error!("Saved workspace {id:?} of a window was not found");
-                        }
-                        saved.map(|saved| SessionWorkspace {
+                let mut recovered = Vec::new();
+                let mut closed = Vec::new();
+                for id in missing_ids {
+                    // A workspace closed from the window has no session binding any more; a
+                    // crash before its id left the list must not bring it back.
+                    let bound = db
+                        .select_row_bound::<WorkspaceId, Option<String>>(
+                            "SELECT session_id FROM workspaces WHERE workspace_id = ?",
+                        )
+                        .and_then(|mut select| select(id))
+                        .log_err()
+                        .flatten()
+                        .flatten();
+                    if bound.is_none() {
+                        closed.push(id);
+                        continue;
+                    }
+                    match db.workspace_for_id(id) {
+                        Some(saved) => recovered.push(SessionWorkspace {
                             workspace_id: id,
                             location: saved.location,
                             paths: saved.paths,
                             window_id: None,
-                        })
-                    })
-                    .collect()
+                        }),
+                        None => log::error!("Saved workspace {id:?} of a window was not found"),
+                    }
+                }
+                (recovered, closed)
             })
             .await;
+        window_handle
+            .update(cx, |multi_workspace, _window, _cx| {
+                multi_workspace.cod_forget_closed_workspaces(&closed);
+            })
+            .ok();
         other_workspaces.extend(recovered);
     }
     for other in other_workspaces {
