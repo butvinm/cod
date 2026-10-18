@@ -1152,22 +1152,6 @@ impl MultiWorkspace {
                 return Ok(());
             }
 
-            if moved_ids.is_empty() {
-                cx.update(|cx| {
-                    Workspace::new_local(
-                        paths,
-                        app_state,
-                        None,
-                        None,
-                        None,
-                        OpenMode::NewWindow,
-                        cx,
-                    )
-                })
-                .await?;
-                return Ok(());
-            }
-
             let db = cx.update(|cx| crate::persistence::WorkspaceDb::global(cx));
             let mut members: Vec<crate::persistence::model::SessionWorkspace> = Vec::new();
             for id in &moved_ids {
@@ -1181,8 +1165,30 @@ impl MultiWorkspace {
                     None => log::error!("Moved workspace {id:?} was not found"),
                 }
             }
+
+            // Nothing saved to open by id: open the folders as a new window, as stock does. The
+            // window still takes the reserved key.
             if members.is_empty() {
-                anyhow::bail!("none of the moved workspaces was found");
+                let opened = cx
+                    .update(|cx| {
+                        Workspace::new_local(
+                            paths,
+                            app_state,
+                            None,
+                            None,
+                            None,
+                            OpenMode::NewWindow,
+                            cx,
+                        )
+                    })
+                    .await?;
+                opened
+                    .window
+                    .update(cx, |multi_workspace, _window, cx| {
+                        multi_workspace.cod_set_window_key(move_key, cx);
+                    })
+                    .ok();
+                return Ok(());
             }
             let active_workspace = members.remove(0);
             let serialized = crate::persistence::model::SerializedMultiWorkspace {

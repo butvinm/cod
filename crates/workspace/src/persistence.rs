@@ -777,6 +777,10 @@ pub fn cod_registry_move_to_window(
 /// first key join the entry under `key` (after its own members), in one edit, so no written
 /// document loses them; the first key is never used again.
 pub fn cod_registry_rename(first_key: String, key: String, cx: &mut App) -> CodRegistryWriteDone {
+    // A window closed before it took its key closes that key too.
+    if cod_registry_is_closed(&first_key, cx) {
+        return cod_registry_remove(key, cx);
+    }
     cx.default_global::<CodWindowRegistry>()
         .closed_keys
         .insert(first_key.clone());
