@@ -1581,6 +1581,10 @@ async fn restore_or_create_from(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if let Some(multi_workspaces) = restorable {
+        // Cod (#24): every window's restore owner (saved key, complete ordered membership,
+        // each member's location and folders) is in place before any window is created, so
+        // each restored window is built with its saved key and all its members.
+        cx.update(|cx| workspace::cod_install_restore_owners(&multi_workspaces, cx));
         // Cod (#24): the local windows come back first. A remote window may wait on its
         // connection (a Retry/Cancel prompt), so external opens are released once only remote
         // windows are left.

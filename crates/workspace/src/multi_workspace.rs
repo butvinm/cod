@@ -399,6 +399,16 @@ impl MultiWorkspace {
                 previous_multi_workspace_enabled = multi_workspace_enabled;
             }
         });
+        // Cod (#24): a window restored from the registry takes its saved key and complete
+        // membership here, before it can save itself, so no save writes the window under
+        // another key or without its other members. Closing it removes that saved key.
+        let first_workspace_id = workspace.read(cx).database_id();
+        let restore_owner = first_workspace_id
+            .and_then(|id| crate::persistence::cod_take_restore_owner(id, cx));
+        let (cod_window_key, cod_saved_order) = match restore_owner {
+            Some(owner) => (owner.key, owner.workspace_ids),
+            None => (crate::persistence::cod_new_window_key(), Vec::new()),
+        };
         Self::subscribe_to_workspace(&workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
@@ -418,14 +428,16 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
-            cod_unrestored_workspace_ids: Vec::new(),
+            // Every saved member counts as not back until this window holds it.
+            cod_unrestored_workspace_ids: cod_saved_order.clone(),
             cod_removing_workspace_ids: Vec::new(),
-            cod_saved_order: Vec::new(),
+            cod_saved_order,
             cod_pending: std::collections::HashMap::new(),
             cod_materializing: false,
-            // Cod (#24): a restored window or a window opened for a moving project takes its
-            // registry key after it is built (`cod_set_window_key`).
-            cod_window_key: crate::persistence::cod_new_window_key(),
+            // Cod (#24): a restored window has its saved key from its restore owner; a window
+            // opened for a moving project takes its reserved key after it is built
+            // (`cod_set_window_key`).
+            cod_window_key,
             cod_move_keys: std::collections::HashMap::new(),
             cod_queued_cycles: Vec::new(),
             cod_materialize_waiters: Vec::new(),

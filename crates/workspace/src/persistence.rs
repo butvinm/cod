@@ -579,6 +579,61 @@ pub struct CodWindowRegistry {
     /// Keys of windows closed in this session. Their entries never come back: a later save of
     /// a closing window is ignored.
     closed_keys: HashSet<String>,
+    /// Restore owners of the windows this start restores, installed before any window is
+    /// created. Each is taken once, by the window built for its shown member.
+    restore_owners: Vec<CodRestoreOwner>,
+}
+
+/// Cod (#24): one member of a window that a start restores: its saved id, where it lives
+/// (local, or the remote connection) and its saved folders.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodRestoreMember {
+    pub workspace_id: WorkspaceId,
+    pub location: SerializedWorkspaceLocation,
+    pub paths: Vec<PathBuf>,
+}
+
+/// Cod (#24): the application-owned restore record of one registry window: its saved key, its
+/// complete membership in window order (also ids whose saved data was not found), the members
+/// with their location and folders, and the shown member. The window built for the shown member
+/// takes the saved key and the whole membership from it at construction, before it can save
+/// itself, so it never saves under another key or with fewer members.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodRestoreOwner {
+    pub key: String,
+    pub workspace_ids: Vec<WorkspaceId>,
+    pub members: Vec<CodRestoreMember>,
+    pub active_workspace_id: WorkspaceId,
+}
+
+/// Cod (#24): installs the restore owners of every window of this start, before any window is
+/// created.
+pub fn cod_install_restore_owners(owners: Vec<CodRestoreOwner>, cx: &mut App) {
+    cx.default_global::<CodWindowRegistry>().restore_owners = owners;
+}
+
+/// Cod (#24): the window being built for the workspace `active` takes the restore owner whose
+/// shown member it is. Each owner is taken once.
+pub fn cod_take_restore_owner(active: WorkspaceId, cx: &mut App) -> Option<CodRestoreOwner> {
+    if !cx.has_global::<CodWindowRegistry>() {
+        return None;
+    }
+    let owners = &mut cx.global_mut::<CodWindowRegistry>().restore_owners;
+    let index = owners
+        .iter()
+        .position(|owner| owner.active_workspace_id == active)?;
+    Some(owners.remove(index))
+}
+
+/// Cod (#24): takes the restore owner with `key`, for a window whose shown member is not the
+/// first workspace it is built with (a remote window opens with a placeholder first).
+pub fn cod_take_restore_owner_by_key(key: &str, cx: &mut App) -> Option<CodRestoreOwner> {
+    if !cx.has_global::<CodWindowRegistry>() {
+        return None;
+    }
+    let owners = &mut cx.global_mut::<CodWindowRegistry>().restore_owners;
+    let index = owners.iter().position(|owner| owner.key == key)?;
+    Some(owners.remove(index))
 }
 
 impl gpui::Global for CodWindowRegistry {}

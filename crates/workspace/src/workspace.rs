@@ -10580,6 +10580,11 @@ pub async fn restore_multiworkspace(
         .await
         .map(|result| result.window)
     };
+    // The window built for the shown member took this window's restore owner at construction.
+    // When no window took it (the open failed), it goes now, so no later window takes it.
+    if let Some(key) = state.cod_window_key.clone() {
+        cx.update(|cx| drop(persistence::cod_take_restore_owner_by_key(&key, cx)));
+    }
 
     let window_handle = match workspace_result {
         Ok(handle) => {
@@ -10642,9 +10647,11 @@ pub async fn restore_multiworkspace(
             multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
         })
         .is_ok();
-    // The window is gone before it took its saved key: the user closed it while its shown
-    // workspace still loaded. That close removed only the window's first key, so the saved key
-    // goes now; the window's other members must not come back at the next start.
+    // A window built from its restore owner has its saved key already, and closing it removed
+    // that key through the normal close path. The window is gone here when the user closed it
+    // while its shown workspace still loaded; for a window built without an owner, the close
+    // removed only its first key, so the saved key goes now too (removing it again is a no-op).
+    // The window's other members must not come back at the next start.
     if !key_taken {
         if let Some(key) = state.cod_window_key.clone() {
             let removal = cx.update(|cx| persistence::cod_registry_remove(key, cx));
@@ -10788,6 +10795,39 @@ pub async fn restore_multiworkspace(
         .ok();
 
     Ok(window_handle)
+}
+
+/// Cod (#24): installs one restore owner per window this start restores, before any window is
+/// created: the saved key, the complete membership in window order, every member's id,
+/// location and folders, and the shown member. Windows without a saved key have no owner.
+pub fn cod_install_restore_owners(windows: &[SerializedMultiWorkspace], cx: &mut App) {
+    let owners = windows
+        .iter()
+        .filter_map(|window| {
+            let key = window.state.cod_window_key.clone()?;
+            let members: Vec<persistence::CodRestoreMember> =
+                std::iter::once(&window.active_workspace)
+                    .chain(window.other_workspaces.iter())
+                    .map(|member| persistence::CodRestoreMember {
+                        workspace_id: member.workspace_id,
+                        location: member.location.clone(),
+                        paths: member.paths.paths().to_vec(),
+                    })
+                    .collect();
+            let workspace_ids: Vec<WorkspaceId> = if window.state.cod_workspace_ids.is_empty() {
+                members.iter().map(|member| member.workspace_id).collect()
+            } else {
+                window.state.cod_workspace_ids.clone()
+            };
+            Some(persistence::CodRestoreOwner {
+                key,
+                workspace_ids,
+                members,
+                active_workspace_id: window.active_workspace.workspace_id,
+            })
+        })
+        .collect();
+    persistence::cod_install_restore_owners(owners, cx);
 }
 
 /// Cod (#24): whether the Cod window registry was never written in this database (the first
