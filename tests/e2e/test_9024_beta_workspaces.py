@@ -112,8 +112,12 @@ class BetaWorkspacesTest(CodTestCase):
             raise AssertionError(f"expected the window title not to show {hidden!r}, actual {title!r}")
 
     def expect_drawn(self, state: dict[str, Any], shown: str, hidden: str) -> None:
-        if shown not in state["drawn_tabs"] or hidden in state["drawn_tabs"]:
-            raise AssertionError(f"expected the window to draw {shown!r} and not {hidden!r}, actual drawn tabs {state['drawn_tabs']}")
+        # The title can change a frame before the new tabs are drawn (run 39139367154), so wait for the drawing.
+        self.wait_for(
+            lambda state: shown in state["drawn_tabs"] and hidden not in state["drawn_tabs"],
+            w24.SHOW_TIMEOUT,
+            f"the window to draw {shown!r} and not {hidden!r}",
+        )
 
     def test_two_tickets_in_one_repo(self) -> None:
         with self.step("create the invented repo checkout-api"):
