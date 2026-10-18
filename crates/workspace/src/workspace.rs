@@ -11325,23 +11325,21 @@ pub fn open_paths(
                         &SerializedWorkspaceLocation::Local,
                         cx,
                     );
-                    let window = cx
-                        .active_window()
+                    // Cod (#24): a window keeps its workspaces whatever the AI setting, so the
+                    // target window does not depend on it.
+                    cx.active_window()
                         .and_then(|window| window.downcast::<MultiWorkspace>())
                         .filter(|window| windows.contains(window))
-                        .or_else(|| windows.into_iter().next());
-                    window.filter(|window| {
-                        window
-                            .read(cx)
-                            .is_ok_and(|mw| mw.multi_workspace_enabled(cx))
-                    })
+                        .or_else(|| windows.into_iter().next())
                 });
 
                 if let Some(window) = target_window {
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
+                            if multi_workspace.multi_workspace_enabled(cx)
+                                && AgentSettings::get_global(cx).threads_sidebar.auto_open
+                            {
                                 multi_workspace.open_sidebar(cx);
                             } else {
                                 // Opening the sidebar is also what pins the

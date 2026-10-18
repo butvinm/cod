@@ -1932,11 +1932,13 @@ impl MultiWorkspace {
     pub fn open_project(
         &mut self,
         paths: Vec<PathBuf>,
-        open_mode: OpenMode,
+        _open_mode: OpenMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if self.multi_workspace_enabled(cx) {
+        // Cod (#24): the window always keeps its workspaces, whatever the AI setting, so opening
+        // a project adds a workspace and never runs the replacement close on a retained one.
+        {
             let empty_workspace = if self
                 .workspace()
                 .read(cx)
@@ -1987,24 +1989,6 @@ impl MultiWorkspace {
                 }
 
                 Ok(new_workspace)
-            })
-        } else {
-            let workspace = self.workspace().clone();
-            cx.spawn_in(window, async move |_this, cx| {
-                let should_continue = workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.prepare_to_close(crate::CloseIntent::ReplaceWindow, window, cx)
-                    })?
-                    .await?;
-                if should_continue {
-                    workspace
-                        .update_in(cx, |workspace, window, cx| {
-                            workspace.open_workspace_for_paths(open_mode, paths, window, cx)
-                        })?
-                        .await
-                } else {
-                    Ok(workspace)
-                }
             })
         }
     }
