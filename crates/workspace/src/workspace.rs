@@ -10873,7 +10873,9 @@ pub async fn cod_seed_window_registry(
         persistence::cod_registry_start(entries, cx);
         persistence::cod_registry_write_now(cx)
     });
-    write.await;
+    if let Err(err) = write.await {
+        log::error!("Failed to seed the Cod window registry: {err:#}");
+    }
 }
 
 /// Cod (#24): the start restored its windows. From now on every window change updates the

@@ -443,7 +443,7 @@ pub fn cod_registered_workspace_ids(kvp: &KeyValueStore) -> Option<Vec<Workspace
     }
 }
 
-type CodRegistryWrite = (String, futures::channel::oneshot::Sender<()>);
+type CodRegistryWrite = (String, futures::channel::oneshot::Sender<Result<()>>);
 
 /// The application-owned copy of the registry and its one writer. Every change edits this copy
 /// on the main thread and queues the whole document to one writer task, which writes the
@@ -458,48 +458,75 @@ pub struct CodWindowRegistry {
     /// registry, so a start that stops early leaves it as the previous run left it.
     writable: bool,
     writer: Option<futures::channel::mpsc::UnboundedSender<CodRegistryWrite>>,
+    /// Documents queued to the writer and not yet written. An unchanged edit queues the same
+    /// document again while this is not zero, so its waiter resolves only after the earlier
+    /// writes.
+    pending_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl gpui::Global for CodWindowRegistry {}
 
 impl CodWindowRegistry {
-    fn queue_write(&mut self, cx: &mut App) -> futures::channel::oneshot::Receiver<()> {
+    /// Queues the whole document to the writer. The receiver gets the result of the write; it
+    /// is cancelled (a failure for `cod_registry_done`) when the document was never queued.
+    fn queue_write(&mut self, cx: &mut App) -> futures::channel::oneshot::Receiver<Result<()>> {
+        use std::sync::atomic::Ordering;
         let (done_tx, done_rx) = futures::channel::oneshot::channel();
         let json = serde_json::to_string(&self.entries).log_err();
         if self.writer.is_none() {
             let (tx, rx) = futures::channel::mpsc::unbounded::<CodRegistryWrite>();
             let kvp = KeyValueStore::global(cx);
+            let pending_writes = self.pending_writes.clone();
             cx.spawn(async move |_cx| {
                 use futures::StreamExt as _;
                 let mut rx = rx;
                 while let Some((json, done)) = rx.next().await {
-                    kvp.write_kvp(COD_WINDOW_REGISTRY_KEY.to_string(), json)
-                        .await
-                        .log_err();
-                    done.send(()).ok();
+                    let result = kvp
+                        .write_kvp(COD_WINDOW_REGISTRY_KEY.to_string(), json)
+                        .await;
+                    if let Err(err) = &result {
+                        log::error!("Failed to write the Cod window registry: {err:#}");
+                    }
+                    pending_writes.fetch_sub(1, Ordering::SeqCst);
+                    done.send(result).ok();
                 }
             })
             .detach();
             self.writer = Some(tx);
         }
         if let (Some(json), Some(writer)) = (json, self.writer.as_ref()) {
+            self.pending_writes.fetch_add(1, Ordering::SeqCst);
             if writer.unbounded_send((json, done_tx)).is_err() {
+                self.pending_writes.fetch_sub(1, Ordering::SeqCst);
                 log::error!("The Cod window registry writer stopped");
             }
         }
         done_rx
     }
+
+    fn has_pending_writes(&self) -> bool {
+        self.pending_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+    }
 }
 
 /// Resolves once the registry write it stands for is done (at once when nothing was written).
-pub type CodRegistryWriteDone = futures::future::BoxFuture<'static, ()>;
+/// A failed or dropped write resolves to an error.
+pub type CodRegistryWriteDone = futures::future::BoxFuture<'static, Result<()>>;
 
 fn cod_registry_done(
-    done: Option<futures::channel::oneshot::Receiver<()>>,
+    done: Option<futures::channel::oneshot::Receiver<Result<()>>>,
 ) -> CodRegistryWriteDone {
     Box::pin(async move {
-        if let Some(done) = done {
-            done.await.ok();
+        match done {
+            Some(done) => match done.await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "the Cod window registry write was dropped before it was done"
+                )),
+            },
+            None => Ok(()),
         }
     })
 }
@@ -547,7 +574,11 @@ where
     F: FnOnce(&mut Vec<CodWindowEntry>) -> bool,
 {
     let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
-    let write = if registry.writable && edit(&mut registry.entries) {
+    // An unchanged edit still waits for writes queued before it: it queues the same document
+    // again, and the ordered writer resolves it after them.
+    let write = if registry.writable
+        && (edit(&mut registry.entries) || registry.has_pending_writes())
+    {
         Some(registry.queue_write(cx))
     } else {
         None

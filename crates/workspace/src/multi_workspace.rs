@@ -616,7 +616,9 @@ impl MultiWorkspace {
                 })
                 .ok();
             if let Some(registry_removal) = registry_removal {
-                registry_removal.await;
+                registry_removal
+                    .await
+                    .context("removing the window from the Cod window registry")?;
             }
 
             window_handle
@@ -1560,7 +1562,7 @@ impl MultiWorkspace {
         let kvp = db::kvp::KeyValueStore::global(cx);
         async move {
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
-            registry_write.await;
+            registry_write.await.log_err();
         }
     }
 
