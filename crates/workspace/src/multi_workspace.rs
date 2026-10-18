@@ -1547,6 +1547,18 @@ impl MultiWorkspace {
         window.focus(&focus_handle, cx);
     }
 
+    /// Cod (#24): the restore of a window's workspaces ends after the window already takes keys.
+    /// When the user has opened a modal (the command palette, the file finder) in the shown
+    /// workspace meanwhile, the modal keeps the focus: moving it to the active pane would take
+    /// the typed query away from the modal.
+    pub fn cod_focus_active_workspace_after_restore(&self, window: &mut Window, cx: &mut App) {
+        let workspace = self.workspace().read(cx);
+        if workspace.modal_layer().read(cx).has_active_modal() {
+            return;
+        }
+        self.focus_active_workspace(window, cx);
+    }
+
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {
         self.workspace().read(cx).panel::<T>(cx)
     }

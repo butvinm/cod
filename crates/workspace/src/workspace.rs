@@ -10526,7 +10526,7 @@ pub async fn restore_multiworkspace(
         .update(cx, |multi_workspace, window, cx| {
             multi_workspace.cod_finish_restore(cx);
             multi_workspace.cod_order_workspaces(&state.cod_workspace_ids, cx);
-            multi_workspace.focus_active_workspace(window, cx);
+            multi_workspace.cod_focus_active_workspace_after_restore(window, cx);
             multi_workspace.cod_save_workspace_list_now(cx)
         })
         .ok();
@@ -10545,9 +10545,10 @@ pub async fn restore_multiworkspace(
     window_handle
         .update(cx, |multi_workspace, window, cx| {
             // Cod (#24): the restore awaits between the steps above and a frame drawn in between
-            // can lose the focus; end with it in the workspace the window shows.
+            // can lose the focus; end with it in the workspace the window shows, unless the user
+            // opened a modal there meanwhile (the window takes keys before the restore ends).
             if multi_workspace.workspaces().count() > 1 {
-                multi_workspace.focus_active_workspace(window, cx);
+                multi_workspace.cod_focus_active_workspace_after_restore(window, cx);
             }
             window.activate_window();
         })
