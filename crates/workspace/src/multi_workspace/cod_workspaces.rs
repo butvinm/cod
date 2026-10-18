@@ -597,7 +597,13 @@ impl MultiWorkspace {
                 CodMember::Pending(id) => Some(id),
             })
             .collect();
-        for id in &self.cod_removing_workspace_ids {
+        // Registry edits apply while the start still restores this window, so members of the
+        // saved list that are not back yet stay in it.
+        for id in self
+            .cod_removing_workspace_ids
+            .iter()
+            .chain(self.cod_unrestored_workspace_ids.iter())
+        {
             if !ids.contains(id) {
                 ids.push(*id);
             }
@@ -612,11 +618,12 @@ impl MultiWorkspace {
         self.cod_saved_order = saved.to_vec();
     }
 
-    /// Saves the window's state with its workspace list now; the future ends once it is written.
+    /// Saves the window's state with its workspace list now; the future ends once it is written
+    /// and gives the result of the registry write.
     pub fn cod_save_workspace_list_now(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> impl std::future::Future<Output = ()> + use<> {
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + use<> {
         self.serialize_now(cx)
     }
 

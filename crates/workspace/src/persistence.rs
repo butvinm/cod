@@ -552,7 +552,8 @@ pub fn cod_registered_workspace_ids(kvp: &KeyValueStore) -> Option<Vec<Workspace
     }
 }
 
-type CodRegistryWrite = (String, futures::channel::oneshot::Sender<Result<()>>);
+/// One queued document: its sequence number, the JSON and the waiter for its result.
+type CodRegistryWrite = (u64, String, futures::channel::oneshot::Sender<Result<()>>);
 
 /// The application-owned copy of the registry and its one writer. Every change edits this copy
 /// on the main thread and queues the whole document to one writer task, which writes the
@@ -561,22 +562,23 @@ type CodRegistryWrite = (String, futures::channel::oneshot::Sender<Result<()>>);
 #[derive(Default)]
 pub struct CodWindowRegistry {
     entries: Vec<CodWindowEntry>,
-    /// The registry was read (or seeded) at this start, so it may be written.
+    /// The registry was read (or seeded) at this start, so it may be written. Edits apply at
+    /// once from then on, also while the start still restores windows: an edit only changes
+    /// the entry of the window it concerns, so entries of windows not opened yet stay as the
+    /// previous run left them.
     loaded: bool,
-    /// The start finished restoring its windows. Until then windows do not change the
-    /// registry, so a start that stops early leaves it as the previous run left it.
-    writable: bool,
+    /// The start finished restoring its windows.
+    startup_done: bool,
     writer: Option<futures::channel::mpsc::UnboundedSender<CodRegistryWrite>>,
-    /// Documents queued to the writer and not yet written. An unchanged edit queues the same
-    /// document again while this is not zero, so its waiter resolves only after the earlier
-    /// writes.
-    pending_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Windows closed while the start was still restoring. Their entries go when the start
-    /// finishes, and each waiter then gets the result of that write.
-    queued_removals: Vec<(String, futures::channel::oneshot::Sender<Result<()>>)>,
-    /// The key the next new window takes: a project moving to a new window already has its
-    /// entry under this key.
-    next_window_key: Option<String>,
+    /// Sequence number of the last document queued to the writer.
+    queued_seq: u64,
+    /// Sequence number of the last document the writer wrote successfully. While it is behind
+    /// `queued_seq` the document is dirty (a write is pending or failed), so the next edit or
+    /// flush writes it again, even when the edit itself changes nothing.
+    committed_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Keys of windows closed in this session. Their entries never come back: a later save of
+    /// a closing window is ignored.
+    closed_keys: HashSet<String>,
 }
 
 impl gpui::Global for CodWindowRegistry {}
@@ -600,37 +602,48 @@ impl CodWindowRegistry {
         if self.writer.is_none() {
             let (tx, rx) = futures::channel::mpsc::unbounded::<CodRegistryWrite>();
             let kvp = KeyValueStore::global(cx);
-            let pending_writes = self.pending_writes.clone();
+            let committed_seq = self.committed_seq.clone();
             cx.spawn(async move |_cx| {
                 use futures::StreamExt as _;
                 let mut rx = rx;
-                while let Some((json, done)) = rx.next().await {
+                while let Some((seq, json, done)) = rx.next().await {
                     let result = kvp
                         .write_kvp(COD_WINDOW_REGISTRY_KEY.to_string(), json)
                         .await;
-                    if let Err(err) = &result {
-                        log::error!("Failed to write the Cod window registry: {err:#}");
+                    match &result {
+                        // Each document is the whole registry, so a written document commits
+                        // every edit queued before it.
+                        Ok(()) => {
+                            committed_seq.fetch_max(seq, Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            log::error!("Failed to write the Cod window registry: {err:#}")
+                        }
                     }
-                    pending_writes.fetch_sub(1, Ordering::SeqCst);
                     done.send(result).ok();
                 }
             })
             .detach();
             self.writer = Some(tx);
         }
+        // A document that cannot be serialized or a stopped writer drops `done_tx`, which the
+        // waiter sees as a failure. The document stays dirty either way.
         if let (Some(json), Some(writer)) = (json, self.writer.as_ref()) {
-            self.pending_writes.fetch_add(1, Ordering::SeqCst);
-            if writer.unbounded_send((json, done_tx)).is_err() {
-                self.pending_writes.fetch_sub(1, Ordering::SeqCst);
+            self.queued_seq += 1;
+            if writer
+                .unbounded_send((self.queued_seq, json, done_tx))
+                .is_err()
+            {
                 log::error!("The Cod window registry writer stopped");
             }
         }
     }
 
-    fn has_pending_writes(&self) -> bool {
-        self.pending_writes
+    /// A queued write is not done yet or a write failed: the copy is not known to be on disk.
+    fn is_dirty(&self) -> bool {
+        self.committed_seq
             .load(std::sync::atomic::Ordering::SeqCst)
-            > 0
+            < self.queued_seq
     }
 }
 
@@ -655,11 +668,19 @@ fn cod_registry_done(
 }
 
 /// Startup: takes the registry read at this start (or seeded from the session) as the copy all
-/// later changes apply to. Windows still do not write until `cod_registry_set_writable`.
+/// later changes apply to. From now on every edit applies at once and is written in order.
 pub fn cod_registry_start(entries: Vec<CodWindowEntry>, cx: &mut App) {
     let registry = cx.default_global::<CodWindowRegistry>();
     registry.entries = entries;
     registry.loaded = true;
+}
+
+/// Startup: a seed that was not written. The copy goes and nothing writes the registry in this
+/// session, so the next start seeds it again from the same session data.
+pub fn cod_registry_unload(cx: &mut App) {
+    let registry = cx.default_global::<CodWindowRegistry>();
+    registry.entries.clear();
+    registry.loaded = false;
 }
 
 /// Startup: writes the whole registry now, for a registry seeded from the session data before
@@ -671,27 +692,33 @@ pub fn cod_registry_write_now(cx: &mut App) -> CodRegistryWriteDone {
     cod_registry_done(Some(write))
 }
 
-/// Startup finished restoring windows: from now on window changes update the registry. Entries
-/// of windows that did not come back stay.
+/// Startup finished restoring windows. Entries of windows that did not come back stay.
 pub fn cod_registry_set_writable(cx: &mut App) {
-    let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
-    if registry.loaded {
-        registry.writable = true;
-        // Windows closed during the start leave the registry now.
-        let removals = std::mem::take(&mut registry.queued_removals);
-        registry
-            .entries
-            .retain(|entry| !removals.iter().any(|(key, _)| *key == entry.key));
-        for (_, done_tx) in removals {
-            registry.queue_write_to(done_tx, cx);
-        }
-    }
-    *cx.default_global::<CodWindowRegistry>() = registry;
+    cx.default_global::<CodWindowRegistry>().startup_done = true;
 }
 
+/// The registry was read or seeded at this start, so window changes update it.
 pub fn cod_registry_is_writable(cx: &App) -> bool {
     cx.try_global::<CodWindowRegistry>()
-        .is_some_and(|registry| registry.writable)
+        .is_some_and(|registry| registry.loaded)
+}
+
+/// Whether the start finished restoring the windows of the registry.
+pub fn cod_registry_startup_done(cx: &App) -> bool {
+    cx.try_global::<CodWindowRegistry>()
+        .is_some_and(|registry| registry.startup_done)
+}
+
+/// Whether the window with `key` was closed in this session (its entry never comes back).
+pub fn cod_registry_is_closed(key: &str, cx: &App) -> bool {
+    cx.try_global::<CodWindowRegistry>()
+        .is_some_and(|registry| registry.closed_keys.contains(key))
+}
+
+/// Writes the registry again when it is dirty (a write is pending or failed); resolves at once
+/// when the copy is known to be on disk. Used by quit.
+pub fn cod_registry_flush(cx: &mut App) -> CodRegistryWriteDone {
+    cod_registry_edit(cx, |_| false)
 }
 
 /// Number of windows in this start's copy of the registry.
@@ -706,11 +733,9 @@ where
     F: FnOnce(&mut Vec<CodWindowEntry>) -> bool,
 {
     let mut registry = std::mem::take(cx.default_global::<CodWindowRegistry>());
-    // An unchanged edit still waits for writes queued before it: it queues the same document
-    // again, and the ordered writer resolves it after them.
-    let write = if registry.writable
-        && (edit(&mut registry.entries) || registry.has_pending_writes())
-    {
+    // An unchanged edit of a dirty copy writes it again: after a failed write that retries it,
+    // and while writes are pending the ordered writer resolves this one after them.
+    let write = if registry.loaded && (edit(&mut registry.entries) || registry.is_dirty()) {
         Some(registry.queue_write(cx))
     } else {
         None
@@ -721,48 +746,68 @@ where
 
 /// Sets a window's entry (members in order and active member), adding it at the end when new.
 /// A workspace belongs to one window: its id leaves every other entry in the same edit.
+/// A save of a window closed in this session is ignored, so its entry never comes back.
 pub fn cod_registry_upsert(entry: CodWindowEntry, cx: &mut App) -> CodRegistryWriteDone {
+    if cod_registry_is_closed(&entry.key, cx) {
+        return cod_registry_done(None);
+    }
     cod_registry_edit(cx, move |entries| cod_upsert_window_entry(entries, entry))
 }
 
-/// Moves workspaces to the window that opens next (a project moving to a new window), in one
-/// edit with their removal from the window they leave. The next new window takes the key.
-pub fn cod_registry_move_to_next_window(
+/// A new key for a window that a project moves to. The caller passes it to the one window
+/// that is opened for the move; no other window can take it.
+pub fn cod_new_window_key() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Moves workspaces, in order, to the window with `key` (a project moving to a new window),
+/// in one edit with their removal from the window they leave.
+pub fn cod_registry_move_to_window(
     ids: Vec<WorkspaceId>,
+    key: String,
     cx: &mut App,
 ) -> CodRegistryWriteDone {
-    let key = cx
-        .default_global::<CodWindowRegistry>()
-        .next_window_key
-        .get_or_insert_with(|| Uuid::new_v4().to_string())
-        .clone();
+    if cod_registry_is_closed(&key, cx) {
+        return cod_registry_done(None);
+    }
     cod_registry_edit(cx, move |entries| cod_move_ids_to_entry(entries, &ids, &key))
 }
 
-/// The key a new window takes, when a move reserved one for it.
-pub fn cod_take_next_window_key(cx: &mut App) -> Option<String> {
-    cx.try_global::<CodWindowRegistry>()?;
+/// A window takes the key it was saved or reserved under. Members the window saved under its
+/// first key join the entry under `key` (after its own members), in one edit, so no written
+/// document loses them; the first key is never used again.
+pub fn cod_registry_rename(first_key: String, key: String, cx: &mut App) -> CodRegistryWriteDone {
     cx.default_global::<CodWindowRegistry>()
-        .next_window_key
-        .take()
+        .closed_keys
+        .insert(first_key.clone());
+    cod_registry_edit(cx, move |entries| {
+        let Some(first_index) = entries.iter().position(|entry| entry.key == first_key) else {
+            return false;
+        };
+        let first = entries.remove(first_index);
+        cod_move_ids_to_entry(entries, &first.workspace_ids, &key);
+        true
+    })
 }
 
-/// Removes a window's entry, after the user agreed to close the window. While the start is
-/// still restoring windows the removal waits and is written when the start finishes.
+/// Removes a window's entry, after the user agreed to close the window. The key stays closed
+/// for the rest of the session, also when the start is still restoring windows.
 pub fn cod_registry_remove(key: String, cx: &mut App) -> CodRegistryWriteDone {
-    {
-        let registry = cx.default_global::<CodWindowRegistry>();
-        if registry.loaded && !registry.writable {
-            let (done_tx, done_rx) = futures::channel::oneshot::channel();
-            registry.queued_removals.push((key, done_tx));
-            return cod_registry_done(Some(done_rx));
-        }
-    }
+    cx.default_global::<CodWindowRegistry>()
+        .closed_keys
+        .insert(key.clone());
     cod_registry_edit(cx, move |entries| {
         let len = entries.len();
         entries.retain(|entry| entry.key != key);
         entries.len() != len
     })
+}
+
+/// A window close that failed: the window stays open, so its key may be saved again.
+pub fn cod_registry_reopen(key: &str, cx: &mut App) {
+    cx.default_global::<CodWindowRegistry>()
+        .closed_keys
+        .remove(key);
 }
 
 pub fn read_serialized_multi_workspaces(

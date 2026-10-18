@@ -10754,8 +10754,11 @@ pub async fn restore_multiworkspace(
         .ok();
     // Only once the window's list is saved under its new id may the restore list go.
     if let Some(saved_list) = saved_list {
-        saved_list.await;
-        if write_manifest {
+        let saved = saved_list.await;
+        if let Err(err) = &saved {
+            log::error!("Failed to save the restored window's workspace list: {err:#}");
+        }
+        if saved.is_ok() && write_manifest {
             persistence::delete_cod_restore_manifest(&kvp, &manifest)
                 .await
                 .log_err();
@@ -10882,12 +10885,14 @@ pub async fn cod_seed_window_registry(
             }
         }
     }
+    // Nothing writes a registry that was never seeded; the caller restores no window (which
+    // would re-bind workspaces to an unpublished session), so the next start seeds again.
+    cx.update(|cx| persistence::cod_registry_unload(cx));
     false
 }
 
-/// Cod (#24): the start restored its windows. From now on every window change updates the
-/// registry, and every open window saves its entry now (entries of windows that did not come
-/// back stay).
+/// Cod (#24): the start restored its windows. Every open window that is not closing saves its
+/// entry now (entries of windows that did not come back stay).
 pub fn cod_finish_registry_startup(cx: &mut App) {
     persistence::cod_registry_set_writable(cx);
     if !persistence::cod_registry_is_writable(cx) {
@@ -10897,6 +10902,10 @@ pub fn cod_finish_registry_startup(cx: &mut App) {
         if let Some(window) = window.downcast::<MultiWorkspace>() {
             window
                 .update(cx, |multi_workspace, _window, cx| {
+                    // A window that is closing keeps out of the registry.
+                    if persistence::cod_registry_is_closed(multi_workspace.cod_window_key(), cx) {
+                        return;
+                    }
                     multi_workspace.serialize(cx);
                 })
                 .ok();
