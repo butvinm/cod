@@ -1433,10 +1433,18 @@ impl MultiWorkspace {
 
         if let Some(workspace_id) = workspace.read(cx).database_id() {
             let db = crate::persistence::WorkspaceDb::global(cx);
+            // Cod (#24): a removed workspace loses its name on every removal path (palette close,
+            // sidebar, discarded empty workspace). The name goes after the session binding, so a
+            // crash in between never restores a workspace without its name.
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            cod_workspaces::forget_workspace_name(workspace_id, cx);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
                 .push(cx.background_spawn(async move {
                     db.set_session_binding(workspace_id, None, None)
+                        .await
+                        .log_err();
+                    cod_workspaces::delete_stored_workspace_name(&kvp, workspace_id)
                         .await
                         .log_err();
                 }));

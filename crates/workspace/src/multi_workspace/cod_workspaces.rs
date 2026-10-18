@@ -87,6 +87,23 @@ fn set_workspace_name(id: Option<WorkspaceId>, name: Option<String>, cx: &mut Ap
     .detach();
 }
 
+/// Forgets the name of a workspace that leaves its window for good, in this run's cache. The
+/// stored name goes with `delete_stored_workspace_name`, after the workspace left its session.
+pub(super) fn forget_workspace_name(id: WorkspaceId, cx: &mut App) {
+    cx.default_global::<WorkspaceNames>()
+        .0
+        .borrow_mut()
+        .insert(id, None);
+}
+
+/// Deletes the stored name of a workspace that was removed from its window.
+pub(super) async fn delete_stored_workspace_name(
+    kvp: &KeyValueStore,
+    id: WorkspaceId,
+) -> anyhow::Result<()> {
+    kvp.scoped(NAMES_SCOPE).delete(name_key(id)).await
+}
+
 /// The field of "workspace: rename workspace": it proposes the current name, enter saves the
 /// typed text, escape keeps the old name.
 pub struct RenameWorkspaceModal {
@@ -286,9 +303,8 @@ impl MultiWorkspace {
 
             this.update(cx, |this, cx| {
                 if *this.workspace() != doomed && this.held_index(&doomed).is_some() {
-                    let id = doomed.read(cx).database_id();
+                    // Detaching also deletes the workspace's name.
                     this.detach_workspace(&doomed, cx);
-                    set_workspace_name(id, None, cx);
                     this.serialize(cx);
                     cx.notify();
                 }
