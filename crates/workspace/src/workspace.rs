@@ -1930,7 +1930,14 @@ impl Workspace {
         cx.subscribe_in(&center_pane, window, Self::handle_pane_event)
             .detach();
 
-        window.focus(&center_pane.focus_handle(cx), cx);
+        // Cod (#24): a workspace built into a window that already shows another workspace
+        // (a hidden workspace being restored or added) leaves the focus where it is; the
+        // window's multi-workspace focuses it when it is shown.
+        let window_shows_another_workspace = window.root::<MultiWorkspace>().flatten().is_some()
+            && window.focused(cx).is_some();
+        if !window_shows_another_workspace {
+            window.focus(&center_pane.focus_handle(cx), cx);
+        }
 
         cx.emit(Event::PaneAdded(center_pane.clone()));
 
@@ -6728,6 +6735,13 @@ impl Workspace {
         }
     }
 
+    /// Cod (#24): whether restoring this workspace's panes and items may move the window
+    /// focus. A workspace that is not shown never takes the focus, and the shown one leaves it
+    /// in a modal the user has opened meanwhile.
+    pub(crate) fn cod_restore_may_focus(&self, cx: &App) -> bool {
+        self.owns_window_chrome() && !self.modal_layer.read(cx).has_active_modal()
+    }
+
     fn update_window_title(&mut self, window: &mut Window, cx: &mut App) {
         if !self.owns_window_chrome() {
             return;
@@ -7712,11 +7726,13 @@ impl Workspace {
             if removing_active_pane {
                 self.set_active_pane(focus_on, window, cx);
             }
-            focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            if self.owns_window_chrome() {
+                focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            }
         } else if removing_active_pane {
             let fallback_pane = self.panes.last().unwrap().clone();
             self.set_active_pane(&fallback_pane, window, cx);
-            if !self.has_active_modal(window, cx) {
+            if self.cod_restore_may_focus(cx) {
                 fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
             }
         }
@@ -8009,7 +8025,7 @@ impl Workspace {
                         workspace.set_active_pane(&active_pane, window, cx);
                         // Cod (#24): a workspace restored behind the active one does not take
                         // the focus; it focuses its active pane when it is shown.
-                        if workspace.owns_window_chrome() {
+                        if workspace.cod_restore_may_focus(cx) {
                             cx.focus_self(window);
                         }
                     } else {
@@ -9426,10 +9442,11 @@ fn open_items(
                                 ix,
                                 workspace
                                     .update_in(cx, |workspace, window, cx| {
+                                        let focus_item = workspace.cod_restore_may_focus(cx);
                                         workspace.open_path(
                                             file_project_path,
                                             None,
-                                            true,
+                                            focus_item,
                                             window,
                                             cx,
                                         )

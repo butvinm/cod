@@ -396,7 +396,12 @@ impl SerializedPane {
 
             if let Some(item_handle) = item_handle {
                 pane.update_in(cx, |pane, window, cx| {
-                    pane.add_item(item_handle.clone(), true, true, None, window, cx);
+                    // Cod (#24): a workspace restored behind the shown one, or under a modal
+                    // the user opened, adds its items without taking the focus.
+                    let focus_item = workspace
+                        .upgrade()
+                        .is_none_or(|workspace| workspace.read(cx).cod_restore_may_focus(cx));
+                    pane.add_item(item_handle.clone(), true, focus_item, None, window, cx);
                 })?;
             }
         }
