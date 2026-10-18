@@ -1566,7 +1566,8 @@ impl MultiWorkspace {
     /// typing works after a switch even while the platform window is inactive. An open modal
     /// keeps its focus.
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
-        self.workspace().read(cx).cod_focus_restored(window, cx);
+        let workspace = self.workspace().clone();
+        workspace.update(cx, |workspace, cx| workspace.cod_focus_restored(window, cx));
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {
