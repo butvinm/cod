@@ -961,7 +961,14 @@ fn main() {
                                     cx,
                                 )
                                 .await;
-                                if seeded { restorable } else { None }
+                                match seeded {
+                                    Ok(true) => restorable,
+                                    Ok(false) => None,
+                                    Err(err) => {
+                                        log::error!("{err:#}");
+                                        None
+                                    }
+                                }
                             }
                         };
                     for window in registry_windows.unwrap_or_default() {
@@ -1031,15 +1038,16 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let _first_window_subscription = _first_window_subscription;
-            let first_window_placed = first_window_rx.shared();
+            // Cod (#24): opens wait for the whole restore, not only the first window.
+            drop(first_window_rx);
             while let Some(urls) = open_rx.next().await {
                 // On a macOS cold launch, `zed <path>` arrives here after startup already
-                // began restoring the session, so wait for a restored window to exist before
-                // matching. Otherwise this open sees no windows and spawns a redundant one (#61346).
-                futures::select_biased! {
-                    _ = restore_finished.clone() => {}
-                    _ = first_window_placed.clone() => {}
-                }
+                // began restoring the session, so wait for the restore before matching.
+                // Otherwise this open sees no windows and spawns a redundant one (#61346).
+                // Cod (#24): wait until every registered window (with its pending members)
+                // exists, so the open matches every registered workspace and never makes a
+                // second live copy of one whose window is not back yet.
+                restore_finished.clone().await;
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
                         handle_open_request(request, app_state.clone(), cx);
@@ -1470,23 +1478,25 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
 /// Cod (#24): on the first start after the update (no Cod window registry yet) the registry is
 /// built from the windows the stock session path found, before any of them is restored, and
 /// only then is this start's session id published (`Session::new` held it back). A seed that
-/// is not written keeps the previous session id published, so the next start finds the same
-/// windows again. Returns whether this start seeded the registry.
+/// is not written keeps the previous session id published and restores no window (restoring
+/// re-binds workspaces to this start's session), so the next start finds the same windows
+/// again. Returns whether this start seeded the registry, or an error when the seed failed.
 async fn cod_seed_registry_and_publish_session(
     restorable: &mut Option<Vec<workspace::SerializedMultiWorkspace>>,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
-) -> bool {
+) -> Result<bool> {
     if !cx.update(|cx| workspace::cod_window_registry_absent(cx)) {
-        return false;
+        return Ok(false);
     }
     let mut no_windows: Vec<workspace::SerializedMultiWorkspace> = Vec::new();
     let seeded =
         workspace::cod_seed_window_registry(restorable.as_mut().unwrap_or(&mut no_windows), cx)
             .await;
     if !seeded {
-        log::error!("The Cod window registry was not seeded; keeping the previous session id");
-        return false;
+        anyhow::bail!(
+            "The Cod window registry was not seeded; keeping the previous session id and restoring no window"
+        );
     }
     let (kvp, session_id) = cx.update(|cx| {
         (
@@ -1495,7 +1505,7 @@ async fn cod_seed_registry_and_publish_session(
         )
     });
     session::cod_publish_session_id(kvp, session_id).await;
-    true
+    Ok(true)
 }
 
 pub(crate) async fn restore_or_create_workspace(
@@ -1512,8 +1522,15 @@ pub(crate) async fn restore_or_create_workspace(
         Some(windows) => Some(windows),
         None => {
             let mut restorable = restorable_workspaces(cx, &app_state).await;
-            cod_seed_registry_and_publish_session(&mut restorable, &app_state, cx).await;
-            restorable
+            match cod_seed_registry_and_publish_session(&mut restorable, &app_state, cx).await {
+                Ok(_) => restorable,
+                // Restoring would re-bind the previous session's workspaces to this start's
+                // unpublished session; restore none, so the next start finds them all.
+                Err(err) => {
+                    log::error!("{err:#}");
+                    None
+                }
+            }
         }
     };
     let result = restore_or_create_from(restorable, app_state, &kvp, cx).await;
