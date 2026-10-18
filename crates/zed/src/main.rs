@@ -929,6 +929,12 @@ fn main() {
             )
         };
 
+        // Cod (#24): external opens wait for the local windows of the start, not for a remote
+        // window that may wait on a connection prompt (see `CodLocalRestoreDone`).
+        let (local_restore_tx, local_restore_rx) = oneshot::channel::<()>();
+        cx.set_global(CodLocalRestoreDone(Some(local_restore_tx)));
+        let local_restore_done = local_restore_rx.shared();
+
         let restore_task = match open_rx
             .try_recv()
             .ok()
@@ -1044,10 +1050,16 @@ fn main() {
                 // On a macOS cold launch, `zed <path>` arrives here after startup already
                 // began restoring the session, so wait for the restore before matching.
                 // Otherwise this open sees no windows and spawns a redundant one (#61346).
-                // Cod (#24): wait until every registered window (with its pending members)
-                // exists, so the open matches every registered workspace and never makes a
-                // second live copy of one whose window is not back yet.
-                restore_finished.clone().await;
+                // Cod (#24): wait until every registered local window (with its pending
+                // members) exists, so the open matches every registered local workspace and
+                // never makes a second live copy of one whose window is not back yet. The
+                // restore of remote windows, which runs after the local ones, does not hold
+                // opens back.
+                let ready = future::select(
+                    Box::pin(restore_finished.clone()),
+                    Box::pin(local_restore_done.clone()),
+                );
+                let _ = ready.await;
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
                         handle_open_request(request, app_state.clone(), cx);
@@ -1538,6 +1550,22 @@ pub(crate) async fn restore_or_create_workspace(
     result
 }
 
+/// Cod (#24): fired once every local window of the start is restored and only remote windows
+/// are left, so external opens no longer wait for the restore.
+struct CodLocalRestoreDone(Option<oneshot::Sender<()>>);
+
+impl gpui::Global for CodLocalRestoreDone {}
+
+/// Cod (#24): lets external opens through before the remote windows of the start come back.
+fn cod_release_external_opens(cx: &mut App) {
+    if !cx.has_global::<CodLocalRestoreDone>() {
+        return;
+    }
+    if let Some(done) = cx.global_mut::<CodLocalRestoreDone>().0.take() {
+        done.send(()).ok();
+    }
+}
+
 async fn restore_or_create_from(
     restorable: Option<Vec<workspace::SerializedMultiWorkspace>>,
     app_state: Arc<AppState>,
@@ -1545,8 +1573,18 @@ async fn restore_or_create_from(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if let Some(multi_workspaces) = restorable {
+        // Cod (#24): the local windows come back first. A remote window may wait on its
+        // connection (a Retry/Cancel prompt), so external opens are released once only remote
+        // windows are left.
+        let (local_windows, remote_windows): (Vec<_>, Vec<_>) =
+            multi_workspaces.into_iter().partition(|multi_workspace| {
+                matches!(
+                    multi_workspace.active_workspace.location,
+                    SerializedWorkspaceLocation::Local
+                )
+            });
         let mut error_count = 0;
-        for multi_workspace in multi_workspaces {
+        for multi_workspace in local_windows.into_iter().chain(remote_windows) {
             let result = match &multi_workspace.active_workspace.location {
                 SerializedWorkspaceLocation::Local => {
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
@@ -1554,6 +1592,7 @@ async fn restore_or_create_from(
                         .map(|_| ())
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
+                    cx.update(|cx| cod_release_external_opens(cx));
                     let mut connection_options = connection_options.clone();
                     if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
                         cx.update(|cx| {
