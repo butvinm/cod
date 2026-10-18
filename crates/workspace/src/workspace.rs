@@ -10538,6 +10538,19 @@ pub async fn restore_multiworkspace(
         if !matches!(other.location, SerializedWorkspaceLocation::Local) {
             continue;
         }
+        // Cod (#24): when the window saved its workspace list, a folderless workspace bound to
+        // the window but not in that list is a placeholder left by an interrupted start, not a
+        // workspace the user made (those are in the list), so it does not come back.
+        if other.paths.is_empty()
+            && !state.cod_workspace_ids.is_empty()
+            && !state.cod_workspace_ids.contains(&other.workspace_id)
+        {
+            log::info!(
+                "Not restoring folderless workspace {:?}: it is not in the window's saved list",
+                other.workspace_id
+            );
+            continue;
+        }
         let result = if other.paths.is_empty() {
             cx.update(|cx| {
                 open_workspace_by_id(other.workspace_id, app_state.clone(), Some(window_handle), cx)
