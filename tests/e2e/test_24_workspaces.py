@@ -30,6 +30,7 @@ CLOSE_ALL_DOCKS = "workspace: close all docks"
 NEW_WINDOW = "workspace: new window"
 NEW_FILE = "workspace: new file"
 CLOSE_WINDOW = "workspace: close window"
+MOVE_PROJECT_TO_NEW_WINDOW = "multi workspace: move project to new window"
 
 PAY_NAME = "[PAY-1234] (billing-api) Fix invoice rounding"
 DOCS_NAME = "Docs: release notes"
@@ -40,6 +41,9 @@ SHOW_TIMEOUT = 15.0
 RESTORE_TIMEOUT = 45.0
 # How long a cancelled change must stay away before the test believes it.
 SETTLE_TIME = 1.5
+# Seconds after the launch at which the crash-safety test kills Cod: before Zed starts, while it
+# reads the session, while the window's workspaces come back, and after they are back.
+KILL_DELAYS = (0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0)
 
 # The answers of Zed's prompt for an unsaved file (Pane::save_item in crates/workspace/src/pane.rs).
 SAVE_ANSWERS = ["Save", "Don't Save", "Cancel"]
@@ -1203,6 +1207,175 @@ class WorkspacesTest(CodTestCase):
             self.wait_for_values("the restored workspace A", {"modal": None, **a_expected}, layout, RESTORE_TIMEOUT)
             state = self.stays(lambda state: state["workspace_count"] == 1, SETTLE_TIME, "exactly workspace A")
             self.expect_equal("workspaces", [{"name": PAY_NAME, "worktrees": folder}], workspace_list(state))
+
+    # Crash safety of the restore (review finding 4)
+
+    def test_workspaces_come_back_after_cod_is_killed_while_it_restores_them(self) -> None:
+        """Three workspaces, two of them on the same folder, come back with their names, folders, tabs and the active one after Cod is killed with SIGKILL (no clean quit) at several points of its start and restore, each time started again on the same data folder."""
+        ledger_name = "[PAY-1300] (billing-api) Ledger export"
+
+        with self.step("create the fixture repos billing-api and docs-site"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            docs_site = self.make_repo("docs-site", DOCS_SITE)
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for_worktrees([billing_api])
+
+        with self.step(f"workspace A: open invoice.rs at line 20 and rename it to {PAY_NAME!r}"):
+            self.open_file("invoice.rs")
+            self.go_to_line(20)
+            self.rename_workspace(PAY_NAME)
+            a_index = self.state()["active_workspace"]
+
+        with self.step(f"workspace B: new workspace on the SAME folder billing-api, open ledger.rs at line 12, rename it to {ledger_name!r}"):
+            self.new_workspace()
+            self.add_folder(billing_api)
+            self.open_file("ledger.rs")
+            self.go_to_line(12)
+            self.rename_workspace(ledger_name)
+            b_index = self.state()["active_workspace"]
+
+        with self.step(f"workspace C: new workspace on docs-site, open README.md at line 5, rename it to {DOCS_NAME!r}"):
+            self.new_workspace()
+            self.add_folder(docs_site)
+            self.open_file("README.md")
+            self.go_to_line(5)
+            self.rename_workspace(DOCS_NAME)
+            c_index = self.state()["active_workspace"]
+            self.expect_equal("three workspace indexes", 3, len({a_index, b_index, c_index}))
+
+        a_expected = {
+            "name": PAY_NAME,
+            "worktrees": [real(billing_api)],
+            "panes": [{"tabs": ["invoice.rs"], "active_tab": "invoice.rs"}],
+            "active_tab": "invoice.rs",
+            "cursor": {"row": 20, "column": 1},
+            "window_count": 1,
+        }
+        b_expected = {
+            "name": ledger_name,
+            "worktrees": [real(billing_api)],
+            "panes": [{"tabs": ["ledger.rs"], "active_tab": "ledger.rs"}],
+            "active_tab": "ledger.rs",
+            "cursor": {"row": 12, "column": 1},
+            "window_count": 1,
+        }
+        c_expected = {
+            "name": DOCS_NAME,
+            "worktrees": [real(docs_site)],
+            "panes": [{"tabs": ["README.md"], "active_tab": "README.md"}],
+            "active_tab": "README.md",
+            "cursor": {"row": 5, "column": 1},
+            "window_count": 1,
+        }
+
+        with self.step(f"make workspace B active with {PREVIOUS_WORKSPACE!r}; A and C stay inactive with their files open"):
+            state = self.switch_workspace(PREVIOUS_WORKSPACE, b_index, "workspace B", b_expected)
+            before = workspace_list(state)
+            self.expect_equal(
+                "workspaces",
+                sorted(
+                    [
+                        {"name": PAY_NAME, "worktrees": [real(billing_api)]},
+                        {"name": ledger_name, "worktrees": [real(billing_api)]},
+                        {"name": DOCS_NAME, "worktrees": [real(docs_site)]},
+                    ],
+                    key=str,
+                ),
+                sorted(before, key=str),
+            )
+
+        with self.step("quit with ctrl-q and start again once, so the window's workspace list is saved"):
+            self.restart_cod()
+            self.wait_for_values(
+                "the restored window", {"workspace_count": 3, "active_workspace": b_index, "modal": None, **b_expected}, layout, RESTORE_TIMEOUT
+            )
+            self.wait_for_values("the restored workspaces", {"workspaces": before}, lambda state: {"workspaces": workspace_list(state)}, SHOW_TIMEOUT)
+
+        with self.step("kill the restored Cod with SIGKILL, no clean quit"):
+            self.kill_cod()
+
+        for delay in KILL_DELAYS:
+            with self.step(f"start Cod on the same data folder and kill it with SIGKILL {delay:g} s after the launch"):
+                self.start_cod_again(connect=False)
+                time.sleep(delay)
+                self.kill_cod()
+
+        with self.step("start Cod normally: all three workspaces come back, B active with its tab and cursor"):
+            self.start_cod_again()
+            self.wait_for_values(
+                "the restored window", {"workspace_count": 3, "active_workspace": b_index, "modal": None, **b_expected}, layout, RESTORE_TIMEOUT
+            )
+            self.wait_for_values("the restored workspaces", {"workspaces": before}, lambda state: {"workspaces": workspace_list(state)}, SHOW_TIMEOUT)
+            self.wait_for_title(ledger_name)
+
+        with self.step("switch to A and to C and check their tabs, cursors and names"):
+            self.switch_workspace(PREVIOUS_WORKSPACE, a_index, "workspace A", a_expected)
+            self.wait_for_title(PAY_NAME)
+            self.switch_workspace(NEXT_WORKSPACE, b_index, "workspace B", b_expected)
+            self.switch_workspace(NEXT_WORKSPACE, c_index, "workspace C", c_expected)
+            state = self.wait_for_title(DOCS_NAME)
+            self.expect_equal("workspaces", before, workspace_list(state))
+
+    # Moving a named workspace to a new window (review new minor)
+
+    def test_a_named_workspace_moved_to_a_new_window_keeps_its_name(self) -> None:
+        """Zed's "move project to new window" moves a named workspace into a window of its own; the workspace keeps its name there and after a restart."""
+
+        def titles() -> list[str]:
+            """The titles of Cod's windows as sway shows them."""
+            return sorted(window["title"] or "" for window in self.compositor_windows())
+
+        def two_named_windows(state: dict[str, Any]) -> bool:
+            shown = titles()
+            return (
+                state["window_count"] == 2
+                and state["workspace_count"] == 1
+                and len(shown) == 2
+                and any(DOCS_NAME in title for title in shown)
+                and any(PAY_NAME in title for title in shown)
+            )
+
+        with self.step("create the fixture repos billing-api and docs-site"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            docs_site = self.make_repo("docs-site", DOCS_SITE)
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for_worktrees([billing_api])
+
+        with self.step(f"workspace A: open invoice.rs and rename it to {PAY_NAME!r}"):
+            self.open_file("invoice.rs")
+            self.rename_workspace(PAY_NAME)
+
+        with self.step(f"workspace C: new workspace on docs-site, open README.md, rename it to {DOCS_NAME!r}"):
+            self.new_workspace()
+            self.add_folder(docs_site)
+            self.open_file("README.md")
+            self.rename_workspace(DOCS_NAME)
+            self.wait_for_title(DOCS_NAME)
+            self.expect_equal("workspace count", 2, self.state()["workspace_count"])
+
+        with self.step(f"move workspace C to a new window with {MOVE_PROJECT_TO_NEW_WINDOW!r}"):
+            self.run_command(MOVE_PROJECT_TO_NEW_WINDOW)
+
+        with self.step(f"two windows: one shows {DOCS_NAME!r}, the other {PAY_NAME!r}, one workspace each"):
+            state = self.wait_for(two_named_windows, SHOW_TIMEOUT, f"two windows titled {DOCS_NAME!r} and {PAY_NAME!r}")
+            self.expect_equal("workspace in the reported window", 1, len(state["workspaces"]))
+            self.expect_equal(
+                "the reported window's workspace",
+                True,
+                workspace_list(state)
+                in (
+                    [{"name": DOCS_NAME, "worktrees": [real(docs_site)]}],
+                    [{"name": PAY_NAME, "worktrees": [real(billing_api)]}],
+                ),
+            )
+
+        with self.step("quit with ctrl-q and start again: both windows come back with their names"):
+            self.restart_cod()
+            self.wait_for(two_named_windows, RESTORE_TIMEOUT, f"two restored windows titled {DOCS_NAME!r} and {PAY_NAME!r}")
 
 
 if __name__ == "__main__":
