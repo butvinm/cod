@@ -1340,20 +1340,17 @@ impl MultiWorkspace {
 
         let old_active_workspace = self.workspace().clone();
         let old_active_was_retained = self.active_workspace_is_retained();
-        // Cod (#24): a window always keeps the workspaces it switches between.
-        let should_retain_workspaces = true;
-
-        if should_retain_workspaces && !old_active_was_retained {
+        // Cod (#24): a window always keeps the workspaces it switches between, whatever the AI
+        // setting.
+        if !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
             let index = self.hold(old_active_workspace.clone(), window, cx);
             self.pin(index, key, cx);
         }
 
         let displayed = self.hold(workspace.clone(), window, cx);
-        if should_retain_workspaces {
-            let key = workspace.read(cx).project_group_key(cx);
-            self.pin(displayed, key, cx);
-        }
+        let key = workspace.read(cx).project_group_key(cx);
+        self.pin(displayed, key, cx);
 
         // Publish the new active workspace before anyone reads the shared cell
         // to decide who owns the window chrome.
@@ -1366,10 +1363,6 @@ impl MultiWorkspace {
             .max()
             .map_or(0, |max| max + 1);
         self.held[displayed].activated_at = Some(stamp);
-
-        if !should_retain_workspaces && !old_active_was_retained {
-            self.detach_workspace(&old_active_workspace, cx);
-        }
 
         // The platform window is shared across all workspaces in this window.
         // The previously-active workspace left the title and edited indicator
@@ -1396,29 +1389,6 @@ impl MultiWorkspace {
         let key = self.held[index].workspace.read(cx).project_group_key(cx);
         self.pin(index, key, cx);
         self.serialize(cx);
-        cx.notify();
-    }
-
-    /// Collapses to a single workspace, discarding all groups.
-    /// Used when multi-workspace is disabled by settings.
-    /// Cod (#24) keeps the workspaces when AI is disabled, so nothing calls this now.
-    #[allow(dead_code)]
-    fn collapse_to_single_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
-            self.close_sidebar(window, cx);
-        }
-
-        let displayed_workspace = self.workspace().clone();
-        for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
-            if workspace != displayed_workspace {
-                self.detach_workspace(&workspace, cx);
-            }
-        }
-
-        for held in &mut self.held {
-            held.pinned = false;
-        }
-        self.project_groups.clear();
         cx.notify();
     }
 
