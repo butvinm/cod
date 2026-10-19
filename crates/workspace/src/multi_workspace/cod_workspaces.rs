@@ -20,6 +20,48 @@ use util::ResultExt as _;
 use super::{HeldWorkspace, MultiWorkspace};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
+/// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
+/// connection into the given window, where it becomes a member. Remote connections live in
+/// `recent_projects`, which registers this with `cod_set_remote_member_opener`.
+pub type CodRemoteMemberOpen = std::sync::Arc<
+    dyn Fn(
+        WorkspaceId,
+        remote::RemoteConnectionOptions,
+        Vec<std::path::PathBuf>,
+        std::sync::Arc<crate::AppState>,
+        gpui::WindowHandle<MultiWorkspace>,
+        &mut App,
+    ) -> Task<anyhow::Result<()>>,
+>;
+
+struct CodRemoteMemberOpener(CodRemoteMemberOpen);
+
+impl Global for CodRemoteMemberOpener {}
+
+/// Cod (#24): registers how a pending remote member is opened (see `CodRemoteMemberOpen`).
+pub fn cod_set_remote_member_opener(open: CodRemoteMemberOpen, cx: &mut App) {
+    cx.set_global(CodRemoteMemberOpener(open));
+}
+
+fn cod_open_remote_member(
+    id: WorkspaceId,
+    connection: remote::RemoteConnectionOptions,
+    paths: Vec<std::path::PathBuf>,
+    app_state: std::sync::Arc<crate::AppState>,
+    window: gpui::WindowHandle<MultiWorkspace>,
+    cx: &mut App,
+) -> Task<anyhow::Result<()>> {
+    let Some(open) = cx
+        .try_global::<CodRemoteMemberOpener>()
+        .map(|opener| opener.0.clone())
+    else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "remote workspace {id:?} cannot be opened: no remote opener is registered"
+        )));
+    };
+    open(id, connection, paths, app_state, window, cx)
+}
+
 actions!(
     workspace,
     [
@@ -372,8 +414,11 @@ impl MultiWorkspace {
         &self,
         path_list: &util::path_list::PathList,
     ) -> Option<WorkspaceId> {
+        // Local routing only: a remote pending member is not a local folder match.
         self.cod_pending.iter().find_map(|(id, paths)| {
-            (util::path_list::PathList::new(paths) == *path_list).then_some(*id)
+            (!self.cod_pending_remote.contains_key(id)
+                && util::path_list::PathList::new(paths) == *path_list)
+                .then_some(*id)
         })
     }
 
@@ -384,6 +429,9 @@ impl MultiWorkspace {
         &self,
         id: WorkspaceId,
     ) -> Option<util::path_list::PathList> {
+        if self.cod_pending_remote.contains_key(&id) {
+            return None;
+        }
         let paths = self.cod_pending.get(&id)?;
         let mains: Vec<std::path::PathBuf> = paths
             .iter()
@@ -392,11 +440,13 @@ impl MultiWorkspace {
         Some(util::path_list::PathList::new(&mains))
     }
 
-    /// The pending members of this window with the folders of each, in saved order.
+    /// The local pending members of this window with the folders of each, in saved order.
+    /// Remote pending members are left out: local routing never matches them.
     pub fn cod_pending_members(&self) -> Vec<(WorkspaceId, Vec<std::path::PathBuf>)> {
         let mut members: Vec<(WorkspaceId, Vec<std::path::PathBuf>)> = self
             .cod_pending
             .iter()
+            .filter(|(id, _)| !self.cod_pending_remote.contains_key(id))
             .map(|(id, paths)| (*id, paths.clone()))
             .collect();
         members.sort_by_key(|(id, _)| {
@@ -421,6 +471,24 @@ impl MultiWorkspace {
     /// The folders of a pending member, None when the id is not a pending member.
     pub fn cod_pending_paths(&self, id: WorkspaceId) -> Option<&[std::path::PathBuf]> {
         self.cod_pending.get(&id).map(|paths| paths.as_slice())
+    }
+
+    /// Whether the pending member `id` is a remote workspace (it loads over its saved
+    /// connection).
+    pub fn cod_pending_is_remote(&self, id: WorkspaceId) -> bool {
+        self.cod_pending_remote.contains_key(&id)
+    }
+
+    /// Adds a remote member that is saved but not loaded: the first time it is shown it loads
+    /// its exact saved row over its saved connection.
+    pub fn cod_add_pending_remote_workspace(
+        &mut self,
+        id: WorkspaceId,
+        connection: remote::RemoteConnectionOptions,
+        paths: Vec<std::path::PathBuf>,
+    ) {
+        self.cod_add_pending_workspace(id, paths);
+        self.cod_pending_remote.insert(id, connection);
     }
 
     /// Adds a member that is saved but not loaded: it loads the first time it is shown.
@@ -474,6 +542,7 @@ impl MultiWorkspace {
         let Some(paths) = self.cod_pending.get(&id).cloned() else {
             return Task::ready(Err(anyhow::anyhow!("workspace {id:?} is not pending")));
         };
+        let remote = self.cod_pending_remote.get(&id).cloned();
         let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
             return Task::ready(Ok(()));
         };
@@ -481,7 +550,22 @@ impl MultiWorkspace {
         let app_state = self.workspace().read(cx).app_state().clone();
         self.cod_materializing = true;
         cx.spawn_in(window, async move |this, cx| {
-            let result: anyhow::Result<()> = if paths.is_empty() {
+            let result: anyhow::Result<()> = if let Some(connection) = remote {
+                // A remote member loads its exact saved row over its saved connection.
+                match cx.update(|_window, cx| {
+                    cod_open_remote_member(
+                        id,
+                        connection,
+                        paths.clone(),
+                        app_state.clone(),
+                        window_handle,
+                        cx,
+                    )
+                }) {
+                    Ok(task) => task.await,
+                    Err(err) => Err(err),
+                }
+            } else if paths.is_empty() {
                 match cx.update(|_window, cx| {
                     crate::open_workspace_by_id(id, app_state.clone(), Some(window_handle), cx)
                 }) {
@@ -513,6 +597,7 @@ impl MultiWorkspace {
                 match (&result, loaded) {
                     (Ok(()), Some(workspace)) => {
                         this.cod_pending.remove(&id);
+                        this.cod_pending_remote.remove(&id);
                         this.cod_unrestored_workspace_ids
                             .retain(|other| *other != id);
                         this.cod_order_workspaces(&order, cx);

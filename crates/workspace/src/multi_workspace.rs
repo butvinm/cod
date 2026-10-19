@@ -30,6 +30,7 @@ pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
+pub use cod_workspaces::{CodRemoteMemberOpen, cod_set_remote_member_opener};
 pub(crate) use cod_workspaces::init_workspace_names;
 
 use crate::open_remote_project_with_existing_connection;
@@ -350,6 +351,9 @@ pub struct MultiWorkspace {
     /// Cod (#24): members of this window that are not loaded yet (lazy restore), with the
     /// folders of each. A pending member loads in the foreground the first time it is shown.
     cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
+    /// Cod (#24): the saved connection of each pending member that is remote. A pending member
+    /// not listed here is local.
+    cod_pending_remote: std::collections::HashMap<WorkspaceId, RemoteConnectionOptions>,
     /// Cod (#24): true while a pending member loads; other activation requests wait for it.
     cod_materializing: bool,
     /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
@@ -449,6 +453,7 @@ impl MultiWorkspace {
             cod_removing_workspace_ids: Vec::new(),
             cod_saved_order,
             cod_pending: std::collections::HashMap::new(),
+            cod_pending_remote: std::collections::HashMap::new(),
             cod_materializing: false,
             // Cod (#24): a restored window has its saved key from its restore owner; a window
             // opened for a moving project takes its reserved key after it is built
@@ -1184,6 +1189,7 @@ impl MultiWorkspace {
                     // The same identity as a loaded member's group key: a linked worktree
                     // belongs to the group of its main repository.
                     let in_group = group_is_local
+                        && !self.cod_pending_remote.contains_key(&id)
                         && (self
                             .cod_pending
                             .get(&id)
@@ -1872,15 +1878,23 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) {
         for member in owner.members {
-            let local = matches!(
-                member.location,
-                crate::persistence::model::SerializedWorkspaceLocation::Local
-            );
-            if local
-                && member.workspace_id != owner.active_workspace_id
+            if member.workspace_id != owner.active_workspace_id
                 && owner.workspace_ids.contains(&member.workspace_id)
             {
-                self.cod_add_pending_workspace(member.workspace_id, member.paths);
+                match member.location {
+                    crate::persistence::model::SerializedWorkspaceLocation::Local => {
+                        self.cod_add_pending_workspace(member.workspace_id, member.paths);
+                    }
+                    // A remote companion stays recoverable: it loads by its saved id over its
+                    // saved connection when it is first shown.
+                    crate::persistence::model::SerializedWorkspaceLocation::Remote(options) => {
+                        self.cod_add_pending_remote_workspace(
+                            member.workspace_id,
+                            options,
+                            member.paths,
+                        );
+                    }
+                }
             }
         }
         self.cod_finish_restore(cx);
@@ -1933,6 +1947,7 @@ impl MultiWorkspace {
         self.cod_unrestored_workspace_ids.clear();
         self.cod_saved_order.clear();
         self.cod_pending.clear();
+        self.cod_pending_remote.clear();
     }
 
     /// Used by the quit handler to ensure pending DB writes

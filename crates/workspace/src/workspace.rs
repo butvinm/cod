@@ -34,6 +34,7 @@ pub use multi_workspace::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
+pub use multi_workspace::{CodRemoteMemberOpen, cod_set_remote_member_opener};
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
@@ -10735,11 +10736,11 @@ pub async fn restore_multiworkspace(
     // window becomes a pending member (id, folders, place in the order) that loads in the
     // foreground the first time it is shown. A pending member has no live entities, so it
     // cannot take the focus or save a layout.
+    // A remote member stays pending too, with its saved connection: it loads its exact saved
+    // row over that connection when first shown.
     let mut pending: Vec<(WorkspaceId, Vec<PathBuf>)> = Vec::new();
+    let mut pending_remote: Vec<(WorkspaceId, RemoteConnectionOptions)> = Vec::new();
     for other in other_workspaces {
-        if !matches!(other.location, SerializedWorkspaceLocation::Local) {
-            continue;
-        }
         // When the window saved its workspace list, a folderless workspace bound to the window
         // but not in that list is a placeholder left by an interrupted start, not a workspace
         // the user made (those are in the list), so it does not come back.
@@ -10756,12 +10757,22 @@ pub async fn restore_multiworkspace(
         if pending.iter().any(|(id, _)| *id == other.workspace_id) {
             continue;
         }
+        if let SerializedWorkspaceLocation::Remote(connection) = &other.location {
+            pending_remote.push((other.workspace_id, connection.clone()));
+        }
         pending.push((other.workspace_id, other.paths.paths().to_vec()));
     }
     let binding = window_handle
         .update(cx, |multi_workspace, window, cx| {
             for (id, paths) in &pending {
-                multi_workspace.cod_add_pending_workspace(*id, paths.clone());
+                match pending_remote.iter().find(|(remote_id, _)| remote_id == id) {
+                    Some((_, connection)) => multi_workspace.cod_add_pending_remote_workspace(
+                        *id,
+                        connection.clone(),
+                        paths.clone(),
+                    ),
+                    None => multi_workspace.cod_add_pending_workspace(*id, paths.clone()),
+                }
             }
             multi_workspace.cod_finish_restore(cx);
             cx.notify();
