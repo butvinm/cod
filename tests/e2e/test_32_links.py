@@ -179,7 +179,7 @@ class LinksTest(CodTestCase):
             self.run_command("agent: toggle focus")
             self.run_command("agent: toggle new thread menu")
             # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
-            self.keys("up up enter")
+            self.keys("end up enter")
             self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
             self.type("Where is the ticket?")
             self.keys("enter")
