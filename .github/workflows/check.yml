@@ -209,6 +209,10 @@ jobs:
           du -sh target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null || true
           kib=$(du -sk target | cut -f 1)
           echo "target: $((kib / 1024)) MiB"
+          # The cache budget counts compressed bytes. This is the compression actions/cache uses, so the number is close to the stored size.
+          started=$(date +%s)
+          bytes=$(tar -cf - target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null | zstd -T0 -3 --long=30 -c | wc -c)
+          echo "build state compressed with zstd -3: $((bytes / 1048576)) MiB (measured in $(( $(date +%s) - started )) s)"
           if [ "$kib" -lt $((3 * 1024 * 1024)) ]; then
             echo "save=true" >> "$GITHUB_OUTPUT"
           else
