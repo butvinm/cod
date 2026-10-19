@@ -262,8 +262,14 @@ jobs:
           echo "target: $((kib / 1024)) MiB"
           # The cache budget counts compressed bytes. This is the compression actions/cache uses, so the number is close to the stored size.
           started=$(date +%s)
-          bytes=$(tar -cf - target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null | zstd -T0 -3 --long=30 -c | wc -c)
-          echo "build state compressed with zstd -3: $((bytes / 1048576)) MiB (measured in $(( $(date +%s) - started )) s)"
+          # Under "bash -e -o pipefail" a failing tar or zstd would otherwise exit the job here; an "if" condition
+          # does not trigger -e, so a failure falls through to "could not be measured" and skips the save instead.
+          if bytes=$(tar -cf - target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null | zstd -T0 -3 --long=30 -c | wc -c); then
+            echo "build state compressed with zstd -3: $((bytes / 1048576)) MiB (measured in $(( $(date +%s) - started )) s)"
+          else
+            echo "build state could not be measured (tar or zstd failed) in $(( $(date +%s) - started )) s"
+            bytes=0
+          fi
           # The guard is the compressed size, the bytes the budget counts: master and a manual measuring run save only under 3 GiB.
           if [ "$bytes" -gt 0 ] && [ "$bytes" -lt $((3 * 1024 * 1024 * 1024)) ]; then
             echo "the compressed build state is under 3 GiB, saving it"
