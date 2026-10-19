@@ -184,6 +184,9 @@ jobs:
 
       - name: Check
         if: steps.changes.outputs.code == 'true'
+        env:
+          # A manual measuring run logs why cargo considers each unit dirty.
+          CARGO_LOG: ${{ github.event_name == 'workflow_dispatch' && 'cargo::core::compiler::fingerprint=info' || '' }}
         run: |
           started=$(date +%s)
           echo "check started at $(date -u '+%H:%M:%S')"
