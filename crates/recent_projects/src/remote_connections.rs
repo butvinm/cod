@@ -228,6 +228,10 @@ async fn cod_open_remote_project_attempt(
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
+    log::info!(
+        "opening a remote project with {} path(s), new window: {created_new_window}",
+        paths.len()
+    );
 
     // Cod (#24): a restoration of this remote workspace is connecting. Wait for it, then use
     // the workspace it brought back (found below) instead of connecting a second time, so no
@@ -235,7 +239,9 @@ async fn cod_open_remote_project_attempt(
     if let Some((restore_id, restore_done)) = cx.update(|cx| {
         workspace::cod_remote_restore_in_progress(&connection_options, &paths, cx)
     }) {
+        log::info!("remote open: waiting for the restore of the same remote workspace");
         restore_done.await.ok();
+        log::info!("remote open: the restore of the same remote workspace ended");
         cx.update(|cx| workspace::cod_end_remote_restore(restore_id, cx));
     }
 
@@ -246,6 +252,7 @@ async fn cod_open_remote_project_attempt(
         cx,
     )
     .await;
+    log::info!("remote open: an open workspace matches: {}", existing.is_some());
 
     if let Some((existing_window, existing_workspace)) = existing {
         let remote_connection = cx.update(|cx| {
