@@ -1,4 +1,3 @@
-// Temporary measuring change for the fast check (#24), reverted in the next commit.
 use std::{
     collections::HashMap,
     io::{BufReader, BufWriter, Write},
