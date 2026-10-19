@@ -1,0 +1,235 @@
+# Fast affected-scope check (issue #24 PM decision): `cargo check` of the app in the dev profile, with the target folder kept between runs.
+# It is the per-edit loop. The full release-fast build and the end-to-end tests (e2e.yml) stay the integration and merge gate.
+# Only master pushes save the build state (and a manual run with "save-cache"); pull requests restore the newest master state and never save.
+# Restored fingerprints stay valid because every tracked file gets one fixed old mtime and only the files changed since the commit recorded in target/.cache-commit get the current time, so cargo rechecks just those crates and their reverse dependencies.
+# A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
+name: Check (fast)
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      save-cache:
+        description: Save the build state for this branch (to measure a warm run before merge)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  # Master runs are not cancelled: a cancelled master run never saves the build state.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # To delete the older build states of the same branch after saving a new one.
+      actions: write
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "1"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: "0"
+      # The flags of e2e.yml without mold: cargo check does not link the app.
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable"
+      CEF_PATH: /home/runner/cef
+      CC: clang
+      CXX: clang++
+      SAVE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'workflow_dispatch' && inputs.save-cache) }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # A pull request checks out its merge commit; its first parent is the base, which is enough to list the changed files.
+          fetch-depth: 2
+
+      # The same detector as e2e.yml.
+      - name: Detect code changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "Decision: $EVENT_NAME event, running the check"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(git diff --name-only HEAD^1 HEAD); then
+            echo "Decision: cannot list the changed files, running the check"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Changed files:"
+          printf '  %s\n' $files
+          code=false
+          first=
+          for file in $files; do
+            case $file in
+              *.md | docs/* | LICENSE*) ;;
+              *) code=true; first=$file; break ;;
+            esac
+          done
+          if [ -z "$files" ]; then
+            code=true
+            first="(no changed files listed)"
+          fi
+          if [ "$code" = true ]; then
+            echo "Decision: code change found ($first), running the check"
+          else
+            echo "Decision: docs-only change (*.md, docs/**, LICENSE*), skipping the check"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      # One source of truth for the CEF version: the release workflow.
+      - name: Read the CEF version
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          version=$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)
+          test -n "$version"
+          echo "CEF_VERSION=$version" >> "$GITHUB_ENV"
+          echo "CEF $version"
+
+      # Only the build packages of e2e.yml: no runtime libraries, compositor or linker, because nothing runs or links.
+      - name: Install Linux dependencies
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang lld llvm libstdc++-14-dev \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev libva-dev \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.code == 'true'
+        id: toolchain
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+          echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the CEF download
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # The build state: the target folder plus the downloaded crates and git dependencies, so a warm run downloads nothing.
+      # The key is unique per run; the restore keys pick the newest state, preferring the same toolchain and lock file.
+      - name: Restore the build state
+        if: steps.changes.outputs.code == 'true'
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: check-dev-v1-${{ runner.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            check-dev-v1-${{ runner.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            check-dev-v1-${{ runner.os }}-${{ steps.toolchain.outputs.version }}-
+            check-dev-v1-${{ runner.os }}-
+
+      # A fresh checkout gives every file the current time, which would make cargo recheck every workspace crate.
+      # Every tracked file and folder gets one fixed old time; then the files changed since the commit the restored state was built from get the current time.
+      # Without a known commit (cold run, or the commit cannot be fetched) every tracked file gets the current time.
+      - name: Fix file times
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          started=$(date +%s)
+          git ls-files -z | xargs -0 -r touch -c -h -d '2000-01-01 00:00:00 UTC'
+          find . -path ./.git -prune -o -path ./target -prune -o -type d -print0 | xargs -0 -r touch -c -h -d '2000-01-01 00:00:00 UTC'
+          base=
+          if [ -f target/.cache-commit ]; then
+            base=$(cat target/.cache-commit)
+          fi
+          echo "Restored state: ${{ steps.restore.outputs.cache-matched-key || 'none' }}"
+          echo "Commit of the restored state: ${base:-unknown}"
+          if [ -n "$base" ] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 "https://github.com/${{ github.repository }}" "$base" || true
+          fi
+          if [ -n "$base" ] && changed=$(git diff --name-only --no-renames -z "$base" HEAD | tr '\0' '\n'); then
+            count=0
+            while IFS= read -r file; do
+              if [ -n "$file" ] && [ -e "$file" ]; then
+                touch -c -h "$file"
+                count=$((count + 1))
+              fi
+            done <<< "$changed"
+            echo "Files changed since $base: $count"
+            printf '%s\n' "$changed" | head -n 50 || true
+          else
+            echo "No usable commit for the restored state, every tracked file counts as changed"
+            git ls-files -z | xargs -0 -r touch -c -h
+          fi
+          echo "File times fixed in $(( $(date +%s) - started )) s"
+
+      - name: Check
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          started=$(date +%s)
+          echo "check started at $(date -u '+%H:%M:%S')"
+          cargo check --locked -p zed -p cod_browser 2>&1 | tee check.log
+          finished=$(date +%s)
+          echo "check finished at $(date -u '+%H:%M:%S')"
+          echo "cargo check took $((finished - started)) s"
+          echo "units checked or compiled: $(grep -a -c -E '(Checking|Compiling) ' check.log || true)"
+          echo "crates downloaded: $(grep -a -c -E 'Downloaded ' check.log || true)"
+
+      - name: Measure the build state
+        if: steps.changes.outputs.code == 'true' && env.SAVE == 'true'
+        id: size
+        run: |
+          git rev-parse HEAD > target/.cache-commit
+          du -sh target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null || true
+          kib=$(du -sk target | cut -f 1)
+          echo "target: $((kib / 1024)) MiB"
+          if [ "$kib" -lt $((3 * 1024 * 1024)) ]; then
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "target is 3 GiB or more, not saving it"
+            echo "save=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save the build state
+        if: steps.changes.outputs.code == 'true' && steps.size.outputs.save == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            target
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: check-dev-v1-${{ runner.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+
+      # Keep one build state per branch: delete the older ones of this ref, so the states do not push other caches out of the 10 GB budget.
+      - name: Delete older build states
+        if: steps.changes.outputs.code == 'true' && steps.size.outputs.save == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: check-dev-v1-${{ runner.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.run_id }}
+        run: |
+          gh cache list -R "${{ github.repository }}" --key check-dev-v1- --ref "${{ github.ref }}" --limit 100 --json id,key \
+            --jq '.[] | select(.key != env.KEEP) | "\(.id) \(.key)"' |
+            while read -r id key; do
+              echo "deleting $key"
+              gh cache delete "$id" -R "${{ github.repository }}" || true
+            done
