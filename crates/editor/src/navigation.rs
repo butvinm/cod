@@ -1146,6 +1146,7 @@ impl Editor {
             None
         };
 
+        let workspace = self.workspace();
         let url_finder = cx.spawn_in(window, async move |_editor, cx| {
             let url = if let Some(end_pos) = end_position {
                 find_url_from_range(&buffer, start_position..end_pos, cx)
@@ -1161,7 +1162,7 @@ impl Editor {
                             cx,
                         );
                     } else {
-                        cx.open_url(&url);
+                        cod_open_link(workspace.as_ref(), &url, window, cx);
                     }
                 })?;
             }
@@ -1857,7 +1858,7 @@ impl Editor {
                                     cx,
                                 );
                             } else {
-                                cx.open_url(&url);
+                                cod_open_link(workspace.as_ref(), &url, window, cx);
                             }
                         })?;
                         Ok(Navigated::Yes)
@@ -2559,5 +2560,20 @@ impl Editor {
                 s.select_ranges([destination..destination]);
             });
         }
+    }
+}
+
+/// Opens a URL from the buffer the Cod way (#32): web links in a page tab of the editor's workspace, others through the system.
+fn cod_open_link(
+    workspace: Option<&Entity<::workspace::Workspace>>,
+    url: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match workspace {
+        Some(workspace) => {
+            workspace.update(cx, |workspace, cx| workspace.cod_open_link(url, window, cx))
+        }
+        None => cx.open_url(url),
     }
 }
