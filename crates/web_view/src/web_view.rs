@@ -17,6 +17,7 @@ mod offscreen_driver;
 mod open_page_modal;
 #[cfg(target_os = "linux")]
 mod page_db;
+pub mod page_control;
 pub mod page_url;
 #[cfg(target_os = "linux")]
 pub mod pages;

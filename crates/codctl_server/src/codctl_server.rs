@@ -8,13 +8,14 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use codctl::Request;
 use editor::Editor;
+use git_ui::commit_view::CommitView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Entity, EntityId, Focusable as _, WindowHandle};
+use gpui::{App, AsyncApp, Axis, Bounds, Entity, EntityId, Focusable as _, Pixels, WindowHandle};
 use serde_json::{Value, json};
 use workspace::{
     CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Pane, RemovalIntent,
@@ -101,6 +102,11 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
         } => split_pane(workspace.as_deref(), pane, &direction, cx).await,
         Request::PaneFocus { workspace, pane } => focus_pane(workspace.as_deref(), pane, cx).await,
         Request::PaneClose { workspace, pane } => close_pane(workspace.as_deref(), pane, cx).await,
+        Request::PaneResize {
+            workspace,
+            pane,
+            size,
+        } => resize_pane(workspace.as_deref(), pane, size, cx).await,
         Request::Open {
             workspace,
             path,
@@ -108,11 +114,22 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
             column,
             pane,
         } => open_file(workspace.as_deref(), path, line, column, pane, cx).await,
+        Request::OpenPage { workspace, url } => open_page(workspace.as_deref(), url, cx).await,
         Request::Diff {
             workspace,
             old,
             new,
         } => open_diff(workspace.as_deref(), old, new, cx).await,
+        Request::DiffRevisions {
+            workspace,
+            old,
+            new,
+        } => open_diff_revisions(workspace.as_deref(), old, new, cx).await,
+        Request::PageGet { page } => get_page(page, cx).await,
+        Request::PageReload { page } => reload_page(page, cx).await,
+        Request::PageBack { page } => back_page(page, cx).await,
+        Request::PageForward { page } => forward_page(page, cx).await,
+        Request::PageClose { page } => close_page(page, cx).await,
     }
 }
 
@@ -429,7 +446,9 @@ fn find_pane(workspace: &Entity<Workspace>, id: u64, cx: &App) -> Result<Entity<
         .with_context(|| format!("unknown pane {id}: see codctl pane list"))
 }
 
-/// What `pane list` reports: every center pane with its ID, whether it is the active one and its tab titles.
+/// What `pane list` reports: every center pane with its ID, whether it is the active one, its
+/// tab titles and its pixel bounds (null until the window has painted it once), so `codctl pane
+/// resize`'s effect on the split can be checked precisely (#38 AC1).
 fn list_panes(workspace: &Entity<Workspace>, cx: &App) -> Value {
     let read = workspace.read(cx);
     let active = read.active_pane().clone();
@@ -442,7 +461,10 @@ fn list_panes(workspace: &Entity<Workspace>, cx: &App) -> Value {
                     .items()
                     .map(|item| item.tab_content_text(0, cx).to_string())
                     .collect();
-                json!({ "id": pane_id(pane), "active": *pane == active, "tabs": tabs })
+                let bounds = read.bounding_box_for_pane(pane).map(|bounds| {
+                    json!({ "width": f32::from(bounds.size.width), "height": f32::from(bounds.size.height) })
+                });
+                json!({ "id": pane_id(pane), "active": *pane == active, "tabs": tabs, "bounds": bounds })
             })
             .collect(),
     )
@@ -533,6 +555,70 @@ async fn close_pane(reference: Option<&str>, pane: u64, cx: &mut AsyncApp) -> Re
     Ok(json!({ "closed": true }))
 }
 
+/// Sets the pane's share of its split to `size` percent (#38 AC1), the way dragging the split's
+/// handle to that position would. `Workspace::resize_pane` only ever resizes the active pane, so
+/// the pane is focused first (as `focus_pane` above does) and, when it was not the active pane
+/// already, the previous active pane is re-focused afterward: only the size changes.
+async fn resize_pane(
+    reference: Option<&str>,
+    pane: u64,
+    size: u8,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let pane = cx.update(|cx| find_pane(&workspace, pane, cx))?;
+    let (axis, amount) = cx
+        .update(|cx| resize_amount(&workspace, &pane, size, cx))
+        .with_context(|| format!("pane {} has not been shown yet", pane_id(&pane)))?;
+    let previous_active = cx.update(|cx| workspace.read(cx).active_pane().clone());
+    window.update(cx, |_, window, cx| {
+        let focus = |target: &Entity<Pane>, window: &mut gpui::Window, cx: &mut App| {
+            let handle = target.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            target.update(cx, |_, cx| cx.emit(workspace::pane::Event::Focus));
+        };
+        focus(&pane, window, cx);
+        workspace.update(cx, |workspace, cx| workspace.resize_pane(axis, amount, window, cx));
+        if previous_active != pane {
+            focus(&previous_active, window, cx);
+        }
+    })?;
+    Ok(json!({ "id": pane_id(&pane) }))
+}
+
+/// The axis and pixel delta that would set `pane`'s share of its split to `size` percent, from
+/// the current bounds of `pane` and of the other panes of the workspace. Exact for a simple
+/// split of two panes (what `codctl pane split` makes); with more panes in the same split the
+/// total is still the sum of every other pane's bounds, which only approximates that group's
+/// true span when panes of more than one split are mixed together.
+fn resize_amount(
+    workspace: &Entity<Workspace>,
+    pane: &Entity<Pane>,
+    size: u8,
+    cx: &App,
+) -> Option<(Axis, Pixels)> {
+    let read = workspace.read(cx);
+    let bounds = read.bounding_box_for_pane(pane)?;
+    let others: Vec<Bounds<Pixels>> = read
+        .panes()
+        .iter()
+        .filter(|other| *other != pane)
+        .filter_map(|other| read.bounding_box_for_pane(other))
+        .collect();
+    let sibling = others.first()?;
+    let close = |a: Pixels, b: Pixels| (a - b).abs() < gpui::px(1.);
+    let axis = if close(sibling.origin.y, bounds.origin.y) && close(sibling.size.height, bounds.size.height) {
+        Axis::Horizontal
+    } else {
+        Axis::Vertical
+    };
+    let span = |bounds: &Bounds<Pixels>| if axis == Axis::Horizontal { bounds.size.width } else { bounds.size.height };
+    let current = span(&bounds);
+    let total = others.iter().fold(current, |total, other| total + span(other));
+    let target = total * (f32::from(size) / 100.);
+    Some((axis, target - current))
+}
+
 /// Opens the file in the pane (else the active pane) like Zed's file finder does, then puts the cursor at the 1-based line and column like `zed <file>:<line>:<column>`.
 async fn open_file(
     reference: Option<&str>,
@@ -585,6 +671,15 @@ async fn open_file(
     Ok(json!({ "pane": pane_id(&pane) }))
 }
 
+/// Opens the URL as a page tab (#31) in the active pane and returns its page ID (#38 AC3).
+async fn open_page(reference: Option<&str>, url: String, cx: &mut AsyncApp) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let id = window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| web_view::page_control::open(workspace, url, window, cx))
+    })??;
+    Ok(json!({ "id": id }))
+}
+
 /// Opens Zed's diff view of two files (`FileDiffView`, as `zed --diff <old> <new>` does) in the active pane.
 async fn open_diff(
     reference: Option<&str>,
@@ -599,6 +694,105 @@ async fn open_diff(
             FileDiffView::open(old, new, None, weak, window, cx)
         })?
         .await?;
+    Ok(json!({}))
+}
+
+/// Resolves `revision` (for example `HEAD`, `HEAD~1`, a branch or a commit SHA) to a commit SHA
+/// in the repo at `repo_dir` by asking git directly: Cod's own git plumbing diffs a commit only
+/// against its immediate parent, not two arbitrary revisions, so the two revisions `codctl diff`
+/// is given are checked here before the parent's commit is shown.
+fn resolve_revision(repo_dir: &Path, revision: &str) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{revision}^{{commit}}"))
+        .output()
+        .with_context(|| format!("cannot run git to resolve {revision:?}"))?;
+    if !output.status.success() {
+        bail!("unknown revision {revision:?}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Opens Zed's diff view of the commit `new` against its direct parent (`CommitView`, the same
+/// view a commit's row in `git: open modified files`/the commit graph opens), checked first to
+/// be `old` (#38 AC6). A repo has one diff view per call, matching the story's own default.
+async fn open_diff_revisions(
+    reference: Option<&str>,
+    old: String,
+    new: String,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let project = cx.update(|cx| workspace.read(cx).project().clone());
+    let repo = cx
+        .update(|cx| project.read(cx).active_repository(cx))
+        .context("the workspace has no git repository")?;
+    let repo_dir = cx.update(|cx| repo.read(cx).work_directory_abs_path.to_path_buf());
+    let (old_for_check, new_for_check) = (old.clone(), new.clone());
+    let (old_sha, parent_sha) = cx
+        .background_executor()
+        .spawn(async move {
+            let old_sha = resolve_revision(&repo_dir, &old_for_check)?;
+            let parent_sha = resolve_revision(&repo_dir, &format!("{new_for_check}~1"))?;
+            Ok::<_, anyhow::Error>((old_sha, parent_sha))
+        })
+        .await?;
+    if old_sha != parent_sha {
+        bail!("{old} is not the direct parent of {new}: codctl diff only shows a commit against its parent");
+    }
+    let weak_repo = repo.downgrade();
+    let weak_workspace = workspace.downgrade();
+    window.update(cx, |_, window, cx| {
+        CommitView::open(new, weak_repo, weak_workspace, None, None, window, cx);
+    })?;
+    Ok(json!({}))
+}
+
+/// Prints the page's current URL, title and state (#38 AC4).
+async fn get_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
+    cx.update(|cx| web_view::page_control::get(&page, cx))
+}
+
+/// Reloads the page tab (#38 AC5).
+async fn reload_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
+    cx.update(|cx| web_view::page_control::reload(&page, cx))?;
+    Ok(json!({}))
+}
+
+/// Goes back in the page tab's history (#38 AC5).
+async fn back_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
+    cx.update(|cx| web_view::page_control::back(&page, cx))?;
+    Ok(json!({}))
+}
+
+/// Goes forward in the page tab's history (#38 AC5).
+async fn forward_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
+    cx.update(|cx| web_view::page_control::forward(&page, cx))?;
+    Ok(json!({}))
+}
+
+/// The window that shows this workspace live, if any (for `codctl page close`, which must act
+/// on the window of the page's own workspace, not necessarily the active one).
+fn window_of(workspace: &Entity<Workspace>, cx: &App) -> Option<WindowHandle<MultiWorkspace>> {
+    members(cx)
+        .into_iter()
+        .find(|member| member.live.as_ref() == Some(workspace))
+        .map(|member| member.window)
+}
+
+/// Closes the page tab (#38 AC5).
+async fn close_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
+    let workspace = cx
+        .update(|cx| web_view::page_control::workspace_of(&page, cx))
+        .with_context(|| format!("unknown page {page}"))?
+        .upgrade()
+        .with_context(|| format!("the workspace of page {page} is gone"))?;
+    let window = cx
+        .update(|cx| window_of(&workspace, cx))
+        .with_context(|| format!("the window of page {page} is gone"))?;
+    window.update(cx, |_, window, cx| web_view::page_control::close(&page, window, cx))??;
     Ok(json!({}))
 }
 
@@ -872,6 +1066,45 @@ mod socket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `git` in `repo`, with no user or system config, an invented author (so the test
+    /// never touches the real user's git identity), and panics on failure.
+    fn git(repo: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Cod Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Cod Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .status()
+            .expect("cannot run git");
+        assert!(status.success(), "git {args:?} failed in {repo:?}");
+    }
+
+    #[test]
+    fn resolve_revision_reads_a_real_git_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo = repo.path();
+        git(repo, &["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "--quiet", "--no-gpg-sign", "-m", "first"]);
+        let first = resolve_revision(repo, "HEAD").unwrap();
+        assert_eq!(resolve_revision(repo, "main").unwrap(), first);
+
+        std::fs::write(repo.join("a.txt"), "two\n").unwrap();
+        git(repo, &["commit", "--quiet", "--no-gpg-sign", "-a", "-m", "second"]);
+        let second = resolve_revision(repo, "HEAD").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(resolve_revision(repo, "HEAD~1").unwrap(), first);
+        assert!(resolve_revision(repo, "no-such-revision").is_err());
+        assert!(resolve_revision(repo, "HEAD~2").is_err());
+    }
 
     #[test]
     fn folders_must_exist() {
