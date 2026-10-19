@@ -8,7 +8,7 @@
 //!
 //! - Request: `{"v":1,"id":7,"cmd":"workspace.new","args":{"name":"...","folders":["/abs"],"focus":false}}`.
 //! - Reply: `{"v":1,"id":7,"ok":true,"result":{...}}` or `{"v":1,"id":7,"ok":false,"error":"<one line>"}`.
-//! - Commands: `workspace.new`, `workspace.list`, `workspace.focus`, `workspace.rename`, `workspace.close`, `workspace.add_folder`. A workspace is addressed by its ID (the number Cod stores it under) or by its exact name.
+//! - Commands: `workspace.new`, `workspace.list`, `workspace.focus`, `workspace.rename`, `workspace.close`, `workspace.add_folder`; from #38 `pane.list`, `pane.split`, `pane.focus`, `pane.close`, `open` and `diff`, where a pane is addressed by the ID `pane.list` prints. A workspace is addressed by its ID (the number Cod stores it under) or by its exact name.
 //! - A request with another `v` gets an error reply, so a newer `codctl` fails clearly against an older Cod. The `id` lets one connection carry several requests later (`codctl events`, #41).
 
 use std::path::{Path, PathBuf};
@@ -81,6 +81,32 @@ pub enum Request {
         workspace: String,
         folders: Vec<PathBuf>,
     },
+    /// List the center panes of the workspace (#38). Pane, open and diff commands act on the named workspace, else on the shown workspace of the active window.
+    PaneList { workspace: Option<String> },
+    /// Split the pane; `direction` is `right` or `down`. The new pane is empty.
+    PaneSplit {
+        workspace: Option<String>,
+        pane: u64,
+        direction: String,
+    },
+    /// Focus the pane.
+    PaneFocus { workspace: Option<String>, pane: u64 },
+    /// Close the pane and its tabs; Cod asks about unsaved files as the UI does.
+    PaneClose { workspace: Option<String>, pane: u64 },
+    /// Open a file, with the cursor at the 1-based line and column, in the pane or the active one.
+    Open {
+        workspace: Option<String>,
+        path: PathBuf,
+        line: Option<u32>,
+        column: Option<u32>,
+        pane: Option<u64>,
+    },
+    /// Show Zed's diff view of two files in a tab.
+    Diff {
+        workspace: Option<String>,
+        old: PathBuf,
+        new: PathBuf,
+    },
 }
 
 fn paths_json(paths: &[PathBuf]) -> Value {
@@ -102,6 +128,12 @@ impl Request {
             Request::WorkspaceRename { .. } => "workspace.rename",
             Request::WorkspaceClose { .. } => "workspace.close",
             Request::WorkspaceAddFolder { .. } => "workspace.add_folder",
+            Request::PaneList { .. } => "pane.list",
+            Request::PaneSplit { .. } => "pane.split",
+            Request::PaneFocus { .. } => "pane.focus",
+            Request::PaneClose { .. } => "pane.close",
+            Request::Open { .. } => "open",
+            Request::Diff { .. } => "diff",
         }
     }
 
@@ -124,6 +156,37 @@ impl Request {
             Request::WorkspaceAddFolder { workspace, folders } => {
                 json!({ "workspace": workspace, "folders": paths_json(folders) })
             }
+            Request::PaneList { workspace } => json!({ "workspace": workspace }),
+            Request::PaneSplit {
+                workspace,
+                pane,
+                direction,
+            } => json!({ "workspace": workspace, "pane": pane, "direction": direction }),
+            Request::PaneFocus { workspace, pane } | Request::PaneClose { workspace, pane } => {
+                json!({ "workspace": workspace, "pane": pane })
+            }
+            Request::Open {
+                workspace,
+                path,
+                line,
+                column,
+                pane,
+            } => json!({
+                "workspace": workspace,
+                "path": path.to_string_lossy(),
+                "line": line,
+                "column": column,
+                "pane": pane,
+            }),
+            Request::Diff {
+                workspace,
+                old,
+                new,
+            } => json!({
+                "workspace": workspace,
+                "old": old.to_string_lossy(),
+                "new": new.to_string_lossy(),
+            }),
         }
     }
 
@@ -154,6 +217,47 @@ fn arg_bool(args: &Map<String, Value>, key: &str) -> Result<bool, String> {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(value)) => Ok(*value),
         _ => Err(format!("{key} must be true or false")),
+    }
+}
+
+fn arg_optional_string(args: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => arg_string(args, key).map(Some),
+    }
+}
+
+fn arg_optional_number(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a whole number")),
+    }
+}
+
+fn arg_number(args: &Map<String, Value>, key: &str) -> Result<u64, String> {
+    arg_optional_number(args, key)?.ok_or_else(|| format!("missing {key}"))
+}
+
+fn arg_position(args: &Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
+    match arg_optional_number(args, key)? {
+        None => Ok(None),
+        Some(number) => u32::try_from(number)
+            .ok()
+            .filter(|number| *number > 0)
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a number from 1")),
+    }
+}
+
+fn arg_file(args: &Map<String, Value>, key: &str) -> Result<PathBuf, String> {
+    let path = arg_string(args, key)?;
+    if Path::new(&path).is_absolute() {
+        Ok(PathBuf::from(path))
+    } else {
+        Err(format!("{key} must be an absolute path: {path}"))
     }
 }
 
@@ -229,6 +333,37 @@ pub fn parse_request_line(line: &str) -> Result<Envelope, (Value, String)> {
             workspace: arg_string(args, "workspace").map_err(&fail)?,
             folders: arg_folders(args, true).map_err(&fail)?,
         },
+        "pane.list" => Request::PaneList {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+        },
+        "pane.split" => Request::PaneSplit {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            pane: arg_number(args, "pane").map_err(&fail)?,
+            direction: match arg_string(args, "direction").map_err(&fail)?.as_str() {
+                direction @ ("right" | "down") => direction.to_owned(),
+                other => return Err(fail(format!("direction must be right or down, not {other}"))),
+            },
+        },
+        "pane.focus" => Request::PaneFocus {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            pane: arg_number(args, "pane").map_err(&fail)?,
+        },
+        "pane.close" => Request::PaneClose {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            pane: arg_number(args, "pane").map_err(&fail)?,
+        },
+        "open" => Request::Open {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            path: arg_file(args, "path").map_err(&fail)?,
+            line: arg_position(args, "line").map_err(&fail)?,
+            column: arg_position(args, "column").map_err(&fail)?,
+            pane: arg_optional_number(args, "pane").map_err(&fail)?,
+        },
+        "diff" => Request::Diff {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            old: arg_file(args, "old").map_err(&fail)?,
+            new: arg_file(args, "new").map_err(&fail)?,
+        },
         other => return Err(fail(format!("unknown command {other}"))),
     };
     Ok(Envelope { id, request })
@@ -284,11 +419,25 @@ Workspace commands:
   workspace add-folder [<workspace>] <path>...
       Add folders to the workspace.
 
+Pane, file and diff commands:
+  pane list
+      Print ID, active or -, and the tabs of every pane, one pane per line.
+  pane split <pane> --right|--down
+      Split the pane, making a new empty pane, and print its ID.
+  pane focus <pane>
+      Focus the pane.
+  pane close <pane>
+      Close the pane and its tabs. Cod asks about unsaved files as the UI does.
+  open <file>[:<line>[:<column>]] [--pane <pane>]
+      Open the file in the active pane (or the pane), with the cursor at the line and column.
+  diff <old file> <new file>
+      Show the diff of two files in a tab.
+
 <workspace> is a workspace ID or its exact name, also given as --workspace <workspace>.
-Without one, commands act on the workspace in $COD_WORKSPACE.
+Without one, workspace commands act on the workspace in $COD_WORKSPACE. Pane, file and diff commands act on --workspace, else $COD_WORKSPACE, else the workspace shown in the active window.
 --json prints the result as JSON.
 
-Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace (close).
+Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace or pane (close).
 ";
 
 /// What the command line asks for.
@@ -306,9 +455,12 @@ struct Options {
     json: bool,
     focus: bool,
     force: bool,
+    right: bool,
+    down: bool,
     name: Option<String>,
     folders: Vec<String>,
     workspace: Option<String>,
+    pane: Option<String>,
     seen: Vec<&'static str>,
     positionals: Vec<String>,
 }
@@ -348,6 +500,21 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--force" => {
                 options.force = true;
                 "--force"
+            }
+            "--right" => {
+                options.right = true;
+                "--right"
+            }
+            "--down" => {
+                options.down = true;
+                "--down"
+            }
+            "--pane" => {
+                if options.pane.is_some() {
+                    return Err("--pane is given twice".to_owned());
+                }
+                options.pane = Some(take_value("--pane", &mut rest)?);
+                "--pane"
             }
             "--name" => {
                 if options.name.is_some() {
@@ -416,6 +583,9 @@ pub fn parse_cli(
     };
     if wants_help(group) {
         return Ok(Cli::Help);
+    }
+    if matches!(group.as_str(), "pane" | "open" | "diff") {
+        return parse_layout_cli(group, &args[1..], env, cwd);
     }
     if group != "workspace" {
         return Err(format!("unknown command {group}: run codctl --help"));
@@ -537,6 +707,139 @@ pub fn parse_cli(
     })
 }
 
+/// Splits `path:line:column` or `path:line` into its parts. A part after a colon that is not a number from 1 belongs to the path.
+pub fn split_position(target: &str) -> (&str, Option<u32>, Option<u32>) {
+    let number = |text: &str| {
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<u32>().ok().filter(|number| *number > 0)
+    };
+    if let Some((rest, last)) = target.rsplit_once(':')
+        && let Some(last) = number(last)
+    {
+        if let Some((path, middle)) = rest.rsplit_once(':')
+            && let Some(middle) = number(middle)
+            && !path.is_empty()
+        {
+            return (path, Some(middle), Some(last));
+        }
+        if !rest.is_empty() {
+            return (rest, Some(last), None);
+        }
+    }
+    (target, None, None)
+}
+
+fn pane_id(text: &str) -> Result<u64, String> {
+    text.parse::<u64>()
+        .map_err(|_| format!("a pane ID is a number from codctl pane list, not {text:?}"))
+}
+
+/// Parses `pane <command> ...`, `open ...` and `diff ...` (#38). `args` are the arguments after the group.
+fn parse_layout_cli(
+    group: &str,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+    cwd: &Path,
+) -> Result<Cli, String> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(Cli::Help);
+    }
+    let (command, rest) = if group == "pane" {
+        let Some(command) = args.first() else {
+            return Ok(Cli::Help);
+        };
+        if command == "help" {
+            return Ok(Cli::Help);
+        }
+        (format!("pane {command}"), &args[1..])
+    } else {
+        (group.to_owned(), args)
+    };
+    let options = parse_options(rest)?;
+    let allowed: &[&str] = match command.as_str() {
+        "pane list" | "pane focus" | "pane close" | "diff" => &["--json", "--workspace"],
+        "pane split" => &["--json", "--workspace", "--right", "--down"],
+        "open" => &["--json", "--workspace", "--pane"],
+        _ => return Err(format!("unknown command {command}: run codctl --help")),
+    };
+    if let Some(flag) = options.seen.iter().find(|flag| !allowed.contains(*flag)) {
+        return Err(format!("{command} does not take {flag}"));
+    }
+    let workspace = options
+        .workspace
+        .clone()
+        .or_else(|| env(WORKSPACE_ENV).filter(|workspace| !workspace.is_empty()));
+    let positionals = options.positionals.as_slice();
+    let takes = |expected: &str| format!("{command} takes {expected}");
+    let request = match command.as_str() {
+        "pane list" => {
+            if !positionals.is_empty() {
+                return Err(takes("no arguments"));
+            }
+            Request::PaneList { workspace }
+        }
+        "pane split" => {
+            let [pane] = positionals else {
+                return Err(takes("one pane ID and --right or --down"));
+            };
+            let direction = match (options.right, options.down) {
+                (true, false) => "right",
+                (false, true) => "down",
+                _ => return Err(takes("one of --right and --down")),
+            };
+            Request::PaneSplit {
+                workspace,
+                pane: pane_id(pane)?,
+                direction: direction.to_owned(),
+            }
+        }
+        "pane focus" | "pane close" => {
+            let [pane] = positionals else {
+                return Err(takes("one pane ID"));
+            };
+            let pane = pane_id(pane)?;
+            if command == "pane focus" {
+                Request::PaneFocus { workspace, pane }
+            } else {
+                Request::PaneClose { workspace, pane }
+            }
+        }
+        "open" => {
+            let [target] = positionals else {
+                return Err(takes("one file, as <file>[:<line>[:<column>]]"));
+            };
+            let (path, line, column) = split_position(target);
+            Request::Open {
+                workspace,
+                path: absolute_folder(path, env, cwd)?,
+                line,
+                column,
+                pane: options.pane.as_deref().map(pane_id).transpose()?,
+            }
+        }
+        "diff" => {
+            let [old, new] = positionals else {
+                return Err(takes("two files"));
+            };
+            Request::Diff {
+                workspace,
+                old: absolute_folder(old, env, cwd)?,
+                new: absolute_folder(new, env, cwd)?,
+            }
+        }
+        _ => unreachable!("checked above"),
+    };
+    Ok(Cli::Run {
+        request,
+        json: options.json,
+    })
+}
+
 /// What `codctl` prints on stdout for a successful reply, and its exit code.
 pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
     match request {
@@ -571,9 +874,49 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
         }
         Request::WorkspaceFocus { .. }
         | Request::WorkspaceRename { .. }
-        | Request::WorkspaceAddFolder { .. } => {
+        | Request::WorkspaceAddFolder { .. }
+        | Request::PaneFocus { .. }
+        | Request::Open { .. }
+        | Request::Diff { .. } => {
             let out = if json { format!("{result}\n") } else { String::new() };
             (out, EXIT_OK)
+        }
+        Request::PaneList { .. } => {
+            if json {
+                return (format!("{result}\n"), EXIT_OK);
+            }
+            let mut out = String::new();
+            for pane in result.as_array().into_iter().flatten() {
+                let id = pane.get("id").map(Value::to_string).unwrap_or_default();
+                let active = if pane.get("active").and_then(Value::as_bool) == Some(true) {
+                    "active"
+                } else {
+                    "-"
+                };
+                let tabs: Vec<String> = pane
+                    .get("tabs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(one_line)
+                    .collect();
+                out.push_str(&format!("{id}\t{active}\t{}\n", tabs.join("\t")));
+            }
+            (out, EXIT_OK)
+        }
+        Request::PaneSplit { .. } => {
+            if json {
+                (format!("{result}\n"), EXIT_OK)
+            } else {
+                let id = result.get("id").map(Value::to_string).unwrap_or_default();
+                (format!("{id}\n"), EXIT_OK)
+            }
+        }
+        Request::PaneClose { .. } => {
+            let closed = result.get("closed").and_then(Value::as_bool).unwrap_or(false);
+            let out = if json { format!("{result}\n") } else { String::new() };
+            (out, if closed { EXIT_OK } else { EXIT_KEPT })
         }
     }
 }
@@ -776,6 +1119,113 @@ mod tests {
         assert_eq!(render(&new, false, &json!({"id": 12})), ("12\n".to_owned(), EXIT_OK));
         let close = Request::WorkspaceClose { workspace: "1".to_owned(), force: false };
         assert_eq!(render(&close, false, &json!({"closed": true})), (String::new(), EXIT_OK));
+        assert_eq!(render(&close, false, &json!({"closed": false})), (String::new(), EXIT_KEPT));
+    }
+
+    #[test]
+    fn file_positions() {
+        assert_eq!(split_position("src/invoice.rs:18:9"), ("src/invoice.rs", Some(18), Some(9)));
+        assert_eq!(split_position("src/invoice.rs:18"), ("src/invoice.rs", Some(18), None));
+        assert_eq!(split_position("src/invoice.rs"), ("src/invoice.rs", None, None));
+        assert_eq!(split_position("notes:draft.md"), ("notes:draft.md", None, None));
+        assert_eq!(split_position("a.rs:0"), ("a.rs:0", None, None));
+        assert_eq!(split_position(":5"), (":5", None, None));
+        assert_eq!(split_position("x:y:7"), ("x:y", Some(7), None));
+    }
+
+    #[test]
+    fn pane_open_and_diff_commands() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(parse(&["pane", "list"], none), run(Request::PaneList { workspace: None }, false));
+        assert_eq!(
+            parse(&["pane", "list", "--json"], &[("COD_WORKSPACE", "4")]),
+            run(Request::PaneList { workspace: Some("4".to_owned()) }, true)
+        );
+        assert_eq!(
+            parse(&["pane", "split", "12", "--down", "--workspace", "billing"], &[("COD_WORKSPACE", "4")]),
+            run(
+                Request::PaneSplit { workspace: Some("billing".to_owned()), pane: 12, direction: "down".to_owned() },
+                false
+            )
+        );
+        assert!(parse(&["pane", "split", "12"], none).is_err());
+        assert!(parse(&["pane", "split", "12", "--right", "--down"], none).is_err());
+        assert!(parse(&["pane", "split", "twelve", "--right"], none).is_err());
+        assert_eq!(parse(&["pane", "focus", "3"], none), run(Request::PaneFocus { workspace: None, pane: 3 }, false));
+        assert_eq!(parse(&["pane", "close", "3"], none), run(Request::PaneClose { workspace: None, pane: 3 }, false));
+        assert!(parse(&["pane", "close"], none).is_err());
+        assert!(parse(&["pane", "explode", "3"], none).is_err());
+        assert!(parse(&["pane", "focus", "3", "--force"], none).is_err());
+        assert_eq!(
+            parse(&["open", "src/invoice.rs:18:9", "--pane", "7"], none),
+            run(
+                Request::Open {
+                    workspace: None,
+                    path: PathBuf::from("/cwd/src/invoice.rs"),
+                    line: Some(18),
+                    column: Some(9),
+                    pane: Some(7),
+                },
+                false
+            )
+        );
+        assert!(parse(&["open"], none).is_err());
+        assert!(parse(&["open", "a.rs", "b.rs"], none).is_err());
+        assert_eq!(
+            parse(&["diff", "src/invoice.rs", "/tmp/invoice_old.rs"], none),
+            run(
+                Request::Diff {
+                    workspace: None,
+                    old: PathBuf::from("/cwd/src/invoice.rs"),
+                    new: PathBuf::from("/tmp/invoice_old.rs"),
+                },
+                false
+            )
+        );
+        assert!(parse(&["diff", "a.rs"], none).is_err());
+        assert_eq!(parse(&["pane", "--help"], none), Ok(Cli::Help));
+        for command in ["pane list", "pane split", "pane focus", "pane close", "open", "diff"] {
+            assert!(HELP.contains(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn pane_requests_round_trip_and_render() {
+        let requests = [
+            Request::PaneList { workspace: None },
+            Request::PaneSplit { workspace: Some("1".to_owned()), pane: 5, direction: "right".to_owned() },
+            Request::PaneFocus { workspace: None, pane: 5 },
+            Request::PaneClose { workspace: None, pane: 5 },
+            Request::Open {
+                workspace: None,
+                path: PathBuf::from("/w/src/invoice.rs"),
+                line: Some(18),
+                column: None,
+                pane: None,
+            },
+            Request::Diff { workspace: None, old: PathBuf::from("/a.rs"), new: PathBuf::from("/b.rs") },
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let line = request.to_line(index as u64);
+            assert_eq!(parse_request_line(&line), Ok(Envelope { id: json!(index), request }), "{line}");
+        }
+        let bad = r#"{"v":1,"id":1,"cmd":"pane.split","args":{"pane":5,"direction":"up"}}"#;
+        assert!(parse_request_line(bad).is_err());
+        let relative = r#"{"v":1,"id":1,"cmd":"open","args":{"path":"src/a.rs"}}"#;
+        assert!(parse_request_line(relative).is_err());
+
+        let list = Request::PaneList { workspace: None };
+        let panes = json!([
+            {"id": 5, "active": true, "tabs": ["invoice.rs", "README.md"]},
+            {"id": 9, "active": false, "tabs": []},
+        ]);
+        assert_eq!(
+            render(&list, false, &panes),
+            ("5\tactive\tinvoice.rs\tREADME.md\n9\t-\t\n".to_owned(), EXIT_OK)
+        );
+        let split = Request::PaneSplit { workspace: None, pane: 5, direction: "down".to_owned() };
+        assert_eq!(render(&split, false, &json!({"id": 9})), ("9\n".to_owned(), EXIT_OK));
+        let close = Request::PaneClose { workspace: None, pane: 5 };
         assert_eq!(render(&close, false, &json!({"closed": false})), (String::new(), EXIT_KEPT));
     }
 }
