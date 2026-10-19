@@ -18,6 +18,9 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+mod cod_overview_state;
+mod cod_tabs_state;
+
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -102,7 +105,7 @@ struct Memory {
 pub fn init(_cx: &mut App) {}
 
 /// One parsed request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Key presses, in order.
     Keys(Vec<Keystroke>),
@@ -110,6 +113,10 @@ pub enum Request {
     Type(Vec<Keystroke>),
     /// Read what the window shows.
     State,
+    /// A left click at a window position (#25, see `cod_tabs_state`).
+    Click { x: f32, y: f32 },
+    /// The test fixture that sets a session or page status (#25, see `cod_tabs_state`).
+    SetEntry(cod_tabs_state::SetEntry),
 }
 
 #[derive(Deserialize)]
@@ -118,6 +125,8 @@ enum WireRequest {
     Keys { keys: String },
     Type { text: String },
     State,
+    Click { x: f32, y: f32 },
+    SetEntry(cod_tabs_state::SetEntry),
 }
 
 /// Parses one request line.
@@ -128,6 +137,14 @@ pub fn parse_request(line: &str) -> Result<Request> {
         WireRequest::Keys { keys } => Request::Keys(parse_keys(&keys)?),
         WireRequest::Type { text } => Request::Type(typed_keystrokes(&text)?),
         WireRequest::State => Request::State,
+        WireRequest::Click { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::Click { x, y }
+        }
+        WireRequest::SetEntry(entry) => {
+            cod_tabs_state::check_set_entry(&entry)?;
+            Request::SetEntry(entry)
+        }
     })
 }
 
@@ -378,6 +395,8 @@ async fn run(
             }
             Ok(None)
         }
+        Request::Click { x, y } => cod_tabs_state::click(x, y, memory, cx).await.map(|()| None),
+        Request::SetEntry(entry) => cod_tabs_state::set_entry(entry, memory, cx).map(|()| None),
         Request::State => {
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
             let window_count = cx.update(|cx| cx.windows().len());
@@ -584,6 +603,7 @@ fn read_state(
                         "worktrees": worktrees,
                         "drawn": false,
                         "remote": multi_workspace.cod_pending_is_remote(*id),
+                        "status": cod_tabs_state::member_status(member, cx),
                     });
                 }
             };
@@ -599,6 +619,7 @@ fn read_state(
                 "worktrees": worktrees_of(workspace.read(cx), cx),
                 "drawn": drawn,
                 "remote": workspace.read(cx).project().read(cx).is_via_remote_server(),
+                "status": cod_tabs_state::member_status(member, cx),
             })
         })
         .collect();
@@ -763,7 +784,7 @@ fn read_state(
     } else {
         None
     };
-    Ok(json!({
+    let mut state = json!({
         "active_tab": active_tab,
         "tabs": tabs,
         "worktrees": worktrees,
@@ -788,7 +809,11 @@ fn read_state(
         "window_active": window_active,
         "focus": focus,
         "prompt": prompt,
-    }))
+        "title_bar": cod_tabs_state::title_bar_state(&active, cx),
+    });
+    // Set outside `json!` to keep the macro's recursion short.
+    state["overview"] = cod_overview_state::overview_state(workspace, window, cx);
+    Ok(state)
 }
 
 /// What holds the window's focus, read only: null when nothing is focused, else `kind` is

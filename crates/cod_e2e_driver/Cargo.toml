@@ -27,8 +27,10 @@ project_panel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+title_bar.workspace = true
 ui_prompt.workspace = true
 workspace.workspace = true
+workspace_overview.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
