@@ -115,6 +115,8 @@ pub struct CodChatSnapshot {
     pub agent: String,
     /// The provider's own session id of the chat.
     pub session_id: String,
+    /// What the chat is doing (Cod's local status until the status contract of PR #65 lands).
+    pub status: crate::cod_chat_status::CodChatStatus,
     /// The thread title, once there is one.
     pub title: Option<String>,
     /// The whole transcript as markdown.
@@ -4237,6 +4239,7 @@ impl AgentPanel {
         Some(CodChatSnapshot {
             agent,
             session_id: thread.session_id().0.to_string(),
+            status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
             title: thread.title().map(|title| title.to_string()),
             transcript: thread.to_markdown(cx),
             reply_focused: focused_markdown.is_some(),

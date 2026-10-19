@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+pub mod cod_chat_status;
 mod completion_provider;
 mod config_options;
 mod context;
