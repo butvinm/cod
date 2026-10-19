@@ -4598,18 +4598,39 @@ impl AgentPanel {
             return;
         };
 
-        if self
+        let is_current_draft = self
             .draft_thread
             .as_ref()
-            .is_some_and(|d| d.entity_id() == conversation_view.entity_id())
-        {
-            if self.draft_has_content(&conversation_view, cx) {
+            .is_some_and(|d| d.entity_id() == conversation_view.entity_id());
+
+        // Cod (#28 AC1): an unused empty draft never becomes a chat tab. `activate_new_thread`
+        // clears `draft_thread` before this runs when the user switches agents away from an
+        // empty draft (its old draft no longer matches the newly selected agent, so it is
+        // deleted, not parked): without this check, that now-untracked draft would fall through
+        // to the unconditional retention below and leak into the panel's chat tabs as an extra
+        // chat the user never touched.
+        let is_empty_draft = conversation_view
+            .read(cx)
+            .root_thread(cx)
+            .is_some_and(|thread| thread.read(cx).is_draft_thread())
+            && !self.draft_has_content(&conversation_view, cx);
+
+        if is_current_draft {
+            if !is_empty_draft {
                 let thread_id = conversation_view.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
                 self.insert_retained_thread(thread_id, conversation_view, cx);
                 self.cleanup_retained_threads(cx);
             }
+            return;
+        }
+
+        if is_empty_draft {
+            let thread_id = conversation_view.read(cx).thread_id;
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(thread_id, cx);
+            });
             return;
         }
 
