@@ -730,7 +730,14 @@ fn start_pages_beside(page: &Entity<OffscreenView>, bounds: Bounds<Pixels>, scal
         .read(cx)
         .panes()
         .iter()
-        .flat_map(|pane| pane.read(cx).items_of_type::<OffscreenView>().collect::<Vec<_>>())
+        .flat_map(|pane| {
+            // The active tab of a pane is drawn itself and starts its browser at its own size.
+            let pane = pane.read(cx);
+            let active = pane.active_item().map(|item| item.item_id());
+            pane.items_of_type::<OffscreenView>()
+                .filter(|other| Some(other.entity_id()) != active)
+                .collect::<Vec<_>>()
+        })
         .filter(|other| other != page && !other.read(cx).browser_started)
         .collect();
     for other in waiting {
@@ -981,7 +988,11 @@ impl Render for OffscreenView {
                             let shown_again = hidden.replace(false);
                             if shown_again {
                                 log::info!("web_view: tab shown, page visible");
-                                if let Some(page) = &page {
+                                // The browser may have started hidden after this render, so read the page now.
+                                let current = page.clone().or_else(|| {
+                                    this.upgrade().and_then(|this| this.read(cx).page.clone())
+                                });
+                                if let Some(page) = &current {
                                     page.set_hidden(false);
                                 }
                             }
