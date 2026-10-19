@@ -77,6 +77,7 @@ jobs:
           script/cod-linux-desktop-files cod | tee out/package-files.txt
           desktop-file-validate cod/share/applications/dev.zed.Zed.desktop
           grep -qx 'Icon=cod' cod/share/applications/dev.zed.Zed.desktop
+          grep -qx 'X-Cod-Launcher=true' cod/share/applications/dev.zed.Zed.desktop
           for size in 16 32 48 64 128 256 512 1024; do
             test -f "cod/share/icons/hicolor/${size}x${size}/apps/cod.png"
           done
@@ -117,6 +118,58 @@ jobs:
             cmp "cod/share/icons/hicolor/${size}x${size}/apps/cod.png" "$home/.local/share/icons/hicolor/${size}x${size}/apps/cod.png"
           done
           { echo "$exec_line"; echo "$tryexec_line"; find "$home" -type f | sort; } | tee -a out/install-launcher.txt
+          # A second run updates the Cod launcher it installed.
+          (cd "$home" && env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh") | tee -a out/install-launcher.txt
+          desktop-file-validate "$installed"
+          grep -qx 'X-Cod-Launcher=true' "$installed"
+          test "$(grep '^Exec=' "$installed")" = "$exec_line"
+
+      # Stock Zed's install.sh writes the same launcher file. The installer must refuse and leave a launcher it did not install byte-identical.
+      - name: Refuse to replace a launcher or icon that Cod did not install
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          home="$RUNNER_TEMP/zed-home"
+          apps="$home/.local/share/applications"
+          mkdir -p "$apps"
+          {
+            echo "[Desktop Entry]"
+            echo "Version=1.0"
+            echo "Type=Application"
+            echo "Name=Zed"
+            echo "Comment=A customized stock Zed launcher"
+            echo "TryExec=$home/.local/zed.app/bin/zed"
+            echo "Exec=$home/.local/zed.app/bin/zed %U"
+            echo "Icon=$home/.local/zed.app/share/icons/hicolor/512x512/apps/zed.png"
+            echo "StartupWMClass=dev.zed.Zed"
+            echo "Categories=Utility;TextEditor;Development;IDE;"
+          } > "$apps/dev.zed.Zed.desktop"
+          cp "$apps/dev.zed.Zed.desktop" "$RUNNER_TEMP/seed.desktop"
+          find "$home" | sort > "$RUNNER_TEMP/before.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-launcher.txt 2>&1; then
+            cat out/refuse-launcher.txt
+            echo "install-launcher.sh replaced a launcher it did not install" >&2
+            exit 1
+          fi
+          cat out/refuse-launcher.txt
+          grep -q 'was not installed by Cod' out/refuse-launcher.txt
+          cmp "$RUNNER_TEMP/seed.desktop" "$apps/dev.zed.Zed.desktop"
+          find "$home" | sort | diff "$RUNNER_TEMP/before.txt" -
+          # The same for a cod.png icon from another source when there is no Cod launcher.
+          home="$RUNNER_TEMP/icon-home"
+          icon="$home/.local/share/icons/hicolor/48x48/apps/cod.png"
+          mkdir -p "${icon%/cod.png}"
+          echo "not a Cod icon" > "$icon"
+          cp "$icon" "$RUNNER_TEMP/seed-icon"
+          find "$home" | sort > "$RUNNER_TEMP/before-icon.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-icon.txt 2>&1; then
+            cat out/refuse-icon.txt
+            echo "install-launcher.sh replaced an icon it did not install" >&2
+            exit 1
+          fi
+          cat out/refuse-icon.txt
+          grep -q 'was not installed by Cod' out/refuse-icon.txt
+          cmp "$RUNNER_TEMP/seed-icon" "$icon"
+          find "$home" | sort | diff "$RUNNER_TEMP/before-icon.txt" -
 
       - name: Record where the app uses the icons
         run: |
