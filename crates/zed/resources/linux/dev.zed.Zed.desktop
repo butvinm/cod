@@ -11,3 +11,4 @@ StartupNotify=true
 StartupWMClass=dev.zed.Zed
 Categories=Utility;TextEditor;Development;IDE;
 Keywords=cod;
+X-Cod-Launcher=true

@@ -21,7 +21,7 @@ On a Wayland desktop, use `cod-wayland.sh` (recommended). Cod runs as a native W
 
 To open another page and a folder: `./cod/cod-wayland.sh <url> <folder>`.
 
-To start Cod from your desktop's app launcher with the Cod icon, run `./cod/install-launcher.sh` once. It copies the icons and the launcher into `~/.local/share` (or `$XDG_DATA_HOME`) and points the launcher at `cod-wayland.sh` in the unpacked folder, so run it again if you move that folder. To remove the launcher, delete `~/.local/share/applications/dev.zed.Zed.desktop` and `~/.local/share/icons/hicolor/*/apps/cod.png`.
+To start Cod from your desktop's app launcher with the Cod icon, run `./cod/install-launcher.sh` once. It copies the icons and the launcher into `~/.local/share` (or `$XDG_DATA_HOME`) and points the launcher at `cod-wayland.sh` in the unpacked folder, so run it again if you move that folder. Stock Zed's launcher uses the same file name, so if `~/.local/share/applications/dev.zed.Zed.desktop` exists and Cod did not install it, the script changes nothing and stops with an error; move that file away first if you want Cod's launcher instead. To remove the launcher, delete `~/.local/share/applications/dev.zed.Zed.desktop` and `~/.local/share/icons/hicolor/*/apps/cod.png`.
 
 Without a Wayland session (X11), or if the off-screen browser does not work for you, use `./cod/cod-xwayland.sh [url] [folder]` instead. It makes Cod use X11 (through XWayland on a Wayland desktop) with the older WebKitGTK web view.
 
