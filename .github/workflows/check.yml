@@ -1,7 +1,7 @@
 # Fast affected-scope check (issue #24 PM decision): `cargo check` of the app in the dev profile, with the target folder kept between runs.
 # It is the per-edit loop. The full release-fast build and the end-to-end tests (e2e.yml) stay the integration and merge gate.
 # Only master pushes save the build state (and a manual run with "save-cache"); pull requests restore the newest master state and never save.
-# Restored fingerprints stay valid because every tracked file gets one fixed old mtime and only the files changed since the commit recorded in target/.cache-commit get the current time, so cargo rechecks just those crates and their reverse dependencies.
+# Restored fingerprints stay valid because every tracked file gets one fixed old mtime and only the files changed since the commit recorded in target/.cache-commit get the current time, so cargo rechecks just those crates and their reverse dependencies. Files that had another time when the state was saved get that exact time back from target/.cache-mtimes.
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 name: Check (fast)
 
@@ -163,6 +163,18 @@ jobs:
           fi
           echo "Restored state: ${{ steps.restore.outputs.cache-matched-key || 'none' }}"
           echo "Commit of the restored state: ${base:-unknown}"
+          # The files that had a time other than the fixed one when the state was saved get that exact time back.
+          # Cargo stores the newest file time of a package whose build script names no inputs, so the fixed time would make such a package dirty.
+          if [ -f target/.cache-mtimes ]; then
+            restored=0
+            while IFS=$'\t' read -r time file; do
+              if [ -n "$file" ] && [ -e "$file" ]; then
+                touch -c -h -d "@$time" -- "$file"
+                restored=$((restored + 1))
+              fi
+            done < target/.cache-mtimes
+            echo "Exact saved times restored for $restored files"
+          fi
           if [ -n "$base" ] && ! git cat-file -e "$base^{commit}" 2>/dev/null; then
             git fetch --no-tags --depth=1 "https://github.com/${{ github.repository }}" "$base" || true
           fi
@@ -187,9 +199,6 @@ jobs:
 
       - name: Check
         if: steps.changes.outputs.code == 'true'
-        env:
-          # A manual measuring run logs why cargo considers each unit dirty.
-          CARGO_LOG: ${{ github.event_name == 'workflow_dispatch' && 'cargo::core::compiler::fingerprint=info' || '' }}
         run: |
           started=$(date +%s)
           echo "check started at $(date -u '+%H:%M:%S')"
@@ -208,6 +217,9 @@ jobs:
         id: size
         run: |
           git rev-parse HEAD > target/.cache-commit
+          # The exact times of the tracked files that do not carry the fixed time (946684800 is 2000-01-01 00:00:00 UTC), for "Fix file times" of the next run.
+          git ls-files -z | xargs -0 -r stat --printf '%.9Y\t%n\n' -- | awk -F '\t' '$1 + 0 != 946684800' > target/.cache-mtimes || true
+          echo "Exact times recorded for $(wc -l < target/.cache-mtimes) files"
           echo "Largest folders of target before pruning:"
           du -h --max-depth=3 target | sort -h | tail -n 15
           # The first cold run measured target at 8.9 GiB, far over the budget. The incremental state of the workspace crates is not saved:
@@ -220,14 +232,12 @@ jobs:
           started=$(date +%s)
           bytes=$(tar -cf - target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null | zstd -T0 -3 --long=30 -c | wc -c)
           echo "build state compressed with zstd -3: $((bytes / 1048576)) MiB (measured in $(( $(date +%s) - started )) s)"
-          # A manual measuring run is guarded by the compressed size (the bytes the budget counts); master by the size on disk, until that guard is decided.
-          if [ "${{ github.event_name }}" = workflow_dispatch ] && [ "$bytes" -lt $((3 * 1024 * 1024 * 1024)) ]; then
-            echo "manual run: the compressed build state is under 3 GiB, saving it"
-            echo "save=true" >> "$GITHUB_OUTPUT"
-          elif [ "$kib" -lt $((3 * 1024 * 1024)) ]; then
+          # The guard is the compressed size, the bytes the budget counts: master and a manual measuring run save only under 3 GiB.
+          if [ "$bytes" -gt 0 ] && [ "$bytes" -lt $((3 * 1024 * 1024 * 1024)) ]; then
+            echo "the compressed build state is under 3 GiB, saving it"
             echo "save=true" >> "$GITHUB_OUTPUT"
           else
-            echo "target is 3 GiB or more, not saving it"
+            echo "the compressed build state is 3 GiB or more (or could not be measured), not saving it"
             echo "save=false" >> "$GITHUB_OUTPUT"
           fi
 
