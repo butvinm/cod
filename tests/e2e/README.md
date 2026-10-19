@@ -23,6 +23,10 @@ Optional environment:
 - `COD_CEF_DIR`: the folder with `libcef.so`. By default `script/e2e` looks in `$CEF_PATH/<CEF_VERSION>/cef_linux_x86_64` (the version is read from `.github/workflows/linux-release.yml`), then in the cargo build folder, then in the preview data folder `~/.local/share/cod-preview/cef-<CEF_VERSION>`.
 - `COD_E2E_ARTIFACTS`: where the tests save screenshots and logs. Default `target/e2e-artifacts`.
 
+## Fast check vs full e2e
+
+CI has two tiers. The workflow "Check (fast)" (`.github/workflows/check.yml`) is the per-edit loop: it runs `cargo check --locked -p zed -p cod_browser` in the dev profile, with no linking and no tests. It restores the build state that the last master push saved, so it rechecks only the crates changed since that commit and the crates that depend on them. Pull requests restore that state and never save it. The `e2e` job of the `E2E` workflow builds the release-fast app and runs every test here; it is the integration and merge gate. A green fast check says the code compiles; only a green `e2e` says the app works.
+
 ## Prerequisites
 
 The build dependencies of Cod (`script/linux`), plus:
