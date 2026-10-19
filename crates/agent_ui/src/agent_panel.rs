@@ -109,7 +109,8 @@ const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 
 /// What the active chat of a panel shows (`AgentPanel::cod_chat_snapshot`), for Cod's end-to-end driver (Cod #28).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Only `PartialEq`, not `Eq`: `link_bounds` carries pixel bounds as floats (Cod #32).
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodChatSnapshot {
     /// The id of the chat's agent, for example `claude-acp`.
     pub agent: String,
@@ -125,6 +126,10 @@ pub struct CodChatSnapshot {
     pub reply_focused: bool,
     /// The link of that reply that has the keyboard focus.
     pub focused_link: Option<CodFocusedLink>,
+    /// The window bounds of every link across the chat's replies, keyed by destination URL (Cod
+    /// #32 e2e driver click target): the driver cannot otherwise find where a link was drawn
+    /// inside a reply, so this is its target for a real mouse click on the link.
+    pub link_bounds: Vec<CodChatLinkBounds>,
 }
 
 /// The link of an agent reply that has the keyboard focus (Cod #28).
@@ -134,6 +139,15 @@ pub struct CodFocusedLink {
     pub text: String,
     /// Where it leads, for example a `file://` url with the line.
     pub url: String,
+}
+
+/// One link's destination and window bounds, read from `markdown::Markdown::cod_link_bounds`
+/// (Cod #32 e2e driver click target).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodChatLinkBounds {
+    pub url: String,
+    /// `(x, y, width, height)` in window pixels, None before the reply painted.
+    pub bounds: Option<(f32, f32, f32, f32)>,
 }
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
@@ -4234,7 +4248,7 @@ impl AgentPanel {
     pub fn cod_chat_snapshot(&self, window: &Window, cx: &App) -> Option<CodChatSnapshot> {
         let thread = self.active_agent_thread(cx)?;
         let thread = thread.read(cx);
-        let focused_markdown = thread
+        let reply_markdowns: Vec<_> = thread
             .entries()
             .iter()
             .flat_map(|entry| match entry {
@@ -4250,6 +4264,9 @@ impl AgentPanel {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
+            .collect();
+        let focused_markdown = reply_markdowns
+            .iter()
             .find(|markdown| markdown.read(cx).focus_handle(cx).is_focused(window));
         let focused_link = focused_markdown.as_ref().and_then(|markdown| {
             let markdown = markdown.read(cx);
@@ -4258,6 +4275,27 @@ impl AgentPanel {
                 url: markdown.focused_link_url()?.to_string(),
             })
         });
+        let link_bounds: Vec<CodChatLinkBounds> = reply_markdowns
+            .iter()
+            .flat_map(|markdown| {
+                markdown
+                    .read(cx)
+                    .cod_link_bounds()
+                    .iter()
+                    .map(|link| CodChatLinkBounds {
+                        url: link.url.to_string(),
+                        bounds: link.bounds.map(|bounds| {
+                            (
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.origin.y),
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                            )
+                        }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let agent = self
             .active_conversation_view()
             .map(|conversation| conversation.read(cx).agent_key().id().0.to_string())
@@ -4270,6 +4308,7 @@ impl AgentPanel {
             transcript: thread.to_markdown(cx),
             reply_focused: focused_markdown.is_some(),
             focused_link,
+            link_bounds,
         })
     }
 

@@ -72,8 +72,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CodChatSnapshot, CodFocusedLink,
-    TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CodChatLinkBounds, CodChatSnapshot,
+    CodFocusedLink, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
