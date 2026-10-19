@@ -645,8 +645,9 @@
       "alt-open": "projects::OpenRecent",
       "f11": "zed::ToggleFullScreen",
       // Change the default action on `menu::Confirm` by setting the parameter
-      // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],
-      "alt-ctrl-o": "projects::OpenRecent",
+      // Cod (#26, D25): Ctrl-Alt-O opens the workspace overview instead of Zed's recent projects
+      // (still on ctrl-r). Left and Right in the overview live in keymaps/specific-overrides.json.
+      "alt-ctrl-o": "workspace_overview::Toggle",
       "ctrl-r": "projects::OpenRecent",
       "alt-shift-open": ["projects::OpenRemote", { "from_existing_connection": false }],
       // Change to open path modal for existing remote connection by setting the parameter
