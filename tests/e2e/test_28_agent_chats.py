@@ -170,8 +170,8 @@ def chat_of(state: dict[str, Any]) -> dict[str, Any]:
 
 
 class WorkspaceChatsTest(CodTestCase):
-    def start_chat(self, prompt: str, reply: str, other_sessions: list[str]) -> str:
-        """Opens the agent panel of the active workspace, starts a chat with the fake agent from the new thread menu, sends the prompt, waits for the reply and returns the chat's session id."""
+    def open_chat(self, other_sessions: list[str]) -> dict[str, Any]:
+        """Opens the agent panel of the active workspace, starts a chat with the fake agent from the new thread menu and returns the first state that shows it."""
         # The agent commands join the palette once the panel has loaded, a moment after the workspace.
         self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
         self.run_command("agent: toggle focus")
@@ -180,11 +180,15 @@ class WorkspaceChatsTest(CodTestCase):
         known = [*other_sessions, *self.provider_sessions(), chat(self.state()).get("session_id")]
         # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
         self.keys("up up enter")
-        self.wait_for(
+        return self.wait_for(
             lambda state: chat(state).get("agent") == AGENT_ID and chat(state).get("session_id") not in [None, "", *known],
             30,
             "a new chat with the fake agent",
         )
+
+    def start_chat(self, prompt: str, reply: str, other_sessions: list[str]) -> str:
+        """Opens a chat with the fake agent (open_chat), sends the prompt, waits for the reply and returns the chat's session id."""
+        self.open_chat(other_sessions)
         self.type(prompt)
         self.keys("enter")
         state = self.wait_for(lambda state: reply in chat(state).get("transcript", ""), 30, "the scripted reply in the transcript")
@@ -195,21 +199,16 @@ class WorkspaceChatsTest(CodTestCase):
         path = self.workdir / "agent-state.json"
         return sorted(json.loads(path.read_text())["sessions"]) if path.exists() else []
 
-    def start_fake_agent_cod(self, persistent: bool) -> Any:
-        """Creates billing-api and the agent script with two scripted replies, starts Cod on billing-api with the fake agent and returns the repo."""
+    def start_fake_agent_cod(self, persistent: bool, turns: list[dict[str, Any]] | None = None) -> Any:
+        """Creates billing-api and the agent script (by default two scripted replies), starts Cod on billing-api with the fake agent and returns the repo."""
         repo = self.make_repo("billing-api", BILLING_API)
         script = self.workdir / "agent-script.json"
-        script.write_text(
-            json.dumps(
-                {
-                    "session_ids": [PAY_SESSION, LEDGER_SESSION],
-                    "turns": [
-                        {"steps": [{"chunk": PAY_REPLY}, {"end": "end_turn"}]},
-                        {"steps": [{"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
-                    ],
-                }
-            )
-        )
+        if turns is None:
+            turns = [
+                {"steps": [{"chunk": PAY_REPLY}, {"end": "end_turn"}]},
+                {"steps": [{"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
+            ]
+        script.write_text(json.dumps({"session_ids": [PAY_SESSION, LEDGER_SESSION], "turns": turns}))
         agent_servers = {
             AGENT_ID: fake_agent_settings(script, state=self.workdir / "agent-state.json", log=self.workdir / "agent.log")
         }
@@ -220,6 +219,58 @@ class WorkspaceChatsTest(CodTestCase):
             "the billing-api folder to open",
         )
         return repo
+
+    def test_ac3_the_chat_state_follows_the_agent(self) -> None:
+        """The chat's own state: working, needs input, done, error. The workspace tab dot and the overview row follow with the status contract (#25, #26)."""
+        permission = "Allow edit to src/invoice.rs?"
+        with self.step("start Cod on billing-api with a fake agent that streams, asks for permission, ends, then fails"):
+            self.start_fake_agent_cod(
+                persistent=False,
+                turns=[
+                    {
+                        "steps": [
+                            {"chunk": "Reading src/invoice.rs."},
+                            {"wait": "streamed"},
+                            {"permission": permission},
+                            {"chunk": PAY_REPLY},
+                            {"end": "end_turn"},
+                        ]
+                    },
+                    {"steps": [{"error": "the fake agent failed"}]},
+                ],
+            )
+
+        with self.step("open a chat with the fake agent: it is idle"):
+            self.open_chat([])
+            self.wait_for_values("chat status", {"status": "idle"}, lambda state: {"status": chat(state).get("status")}, 10)
+
+        with self.step("send a prompt: the chat is working while the reply streams"):
+            self.type("Fix the rounding.")
+            self.keys("enter")
+            self.wait_for_values(
+                "chat status",
+                {"status": "working", "streamed": True},
+                lambda state: {"status": chat(state).get("status"), "streamed": "Reading src/invoice.rs." in chat(state).get("transcript", "")},
+                10,
+            )
+
+        with self.step(f"let the agent ask {permission!r}: the chat needs input"):
+            (self.workdir / "streamed").touch()
+            self.wait_for_values("chat status", {"status": "needs_input"}, lambda state: {"status": chat(state).get("status")}, 10)
+
+        with self.step("allow it once with shift-alt-a: the turn ends and the chat is done"):
+            self.keys("shift-alt-a")
+            self.wait_for_values(
+                "chat status",
+                {"status": "done", "reply": True},
+                lambda state: {"status": chat(state).get("status"), "reply": PAY_REPLY in chat(state).get("transcript", "")},
+                10,
+            )
+
+        with self.step("send another prompt that the agent fails: the chat shows an error"):
+            self.type("And the tax lines?")
+            self.keys("enter")
+            self.wait_for_values("chat status", {"status": "error"}, lambda state: {"status": chat(state).get("status")}, 10)
 
     def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
         with self.step("start Cod on billing-api with the fake agent"):
