@@ -8,7 +8,7 @@
 //!
 //! - Request: `{"v":1,"id":7,"cmd":"workspace.new","args":{"name":"...","folders":["/abs"],"focus":false}}`.
 //! - Reply: `{"v":1,"id":7,"ok":true,"result":{...}}` or `{"v":1,"id":7,"ok":false,"error":"<one line>"}`.
-//! - Commands: `workspace.new`, `workspace.list`, `workspace.focus`, `workspace.rename`, `workspace.close`, `workspace.add_folder`; from #38 `pane.list`, `pane.split`, `pane.focus`, `pane.close`, `open` and `diff`, where a pane is addressed by the ID `pane.list` prints. A workspace is addressed by its ID (the number Cod stores it under) or by its exact name.
+//! - Commands: `workspace.new`, `workspace.list`, `workspace.focus`, `workspace.rename`, `workspace.close`, `workspace.add_folder`; from #38 `pane.list`, `pane.split`, `pane.focus`, `pane.close`, `pane.resize`, `open` (a file or, with a `url` argument, a page) and `diff` (two files, or two git revisions), plus `page.get`, `page.reload`, `page.back`, `page.forward` and `page.close`, where a pane is addressed by the ID `pane.list` prints and a page by the ID `open` (of a URL) prints. A workspace is addressed by its ID (the number Cod stores it under) or by its exact name.
 //! - A request with another `v` gets an error reply, so a newer `codctl` fails clearly against an older Cod. The `id` lets one connection carry several requests later (`codctl events`, #41).
 
 use std::path::{Path, PathBuf};
@@ -93,6 +93,12 @@ pub enum Request {
     PaneFocus { workspace: Option<String>, pane: u64 },
     /// Close the pane and its tabs; Cod asks about unsaved files as the UI does.
     PaneClose { workspace: Option<String>, pane: u64 },
+    /// Sets the pane's share of its split, as a whole percentage from 1 to 99.
+    PaneResize {
+        workspace: Option<String>,
+        pane: u64,
+        size: u8,
+    },
     /// Open a file, with the cursor at the 1-based line and column, in the pane or the active one.
     Open {
         workspace: Option<String>,
@@ -101,12 +107,30 @@ pub enum Request {
         column: Option<u32>,
         pane: Option<u64>,
     },
+    /// Opens a URL as a page tab (#31) in the active pane and returns its page ID.
+    OpenPage { workspace: Option<String>, url: String },
     /// Show Zed's diff view of two files in a tab.
     Diff {
         workspace: Option<String>,
         old: PathBuf,
         new: PathBuf,
     },
+    /// Show Zed's diff view of the commit `new` against its direct parent, checked to be `old`.
+    DiffRevisions {
+        workspace: Option<String>,
+        old: String,
+        new: String,
+    },
+    /// Prints a page's current URL, title and state (`loading`, `loaded` or `failed`).
+    PageGet { page: String },
+    /// Reloads the page tab.
+    PageReload { page: String },
+    /// Goes back in the page tab's history.
+    PageBack { page: String },
+    /// Goes forward in the page tab's history.
+    PageForward { page: String },
+    /// Closes the page tab.
+    PageClose { page: String },
 }
 
 fn paths_json(paths: &[PathBuf]) -> Value {
@@ -132,8 +156,16 @@ impl Request {
             Request::PaneSplit { .. } => "pane.split",
             Request::PaneFocus { .. } => "pane.focus",
             Request::PaneClose { .. } => "pane.close",
+            Request::PaneResize { .. } => "pane.resize",
             Request::Open { .. } => "open",
+            Request::OpenPage { .. } => "open",
             Request::Diff { .. } => "diff",
+            Request::DiffRevisions { .. } => "diff",
+            Request::PageGet { .. } => "page.get",
+            Request::PageReload { .. } => "page.reload",
+            Request::PageBack { .. } => "page.back",
+            Request::PageForward { .. } => "page.forward",
+            Request::PageClose { .. } => "page.close",
         }
     }
 
@@ -165,6 +197,11 @@ impl Request {
             Request::PaneFocus { workspace, pane } | Request::PaneClose { workspace, pane } => {
                 json!({ "workspace": workspace, "pane": pane })
             }
+            Request::PaneResize {
+                workspace,
+                pane,
+                size,
+            } => json!({ "workspace": workspace, "pane": pane, "size": size }),
             Request::Open {
                 workspace,
                 path,
@@ -178,6 +215,7 @@ impl Request {
                 "column": column,
                 "pane": pane,
             }),
+            Request::OpenPage { workspace, url } => json!({ "workspace": workspace, "url": url }),
             Request::Diff {
                 workspace,
                 old,
@@ -187,6 +225,16 @@ impl Request {
                 "old": old.to_string_lossy(),
                 "new": new.to_string_lossy(),
             }),
+            Request::DiffRevisions {
+                workspace,
+                old,
+                new,
+            } => json!({ "workspace": workspace, "old": old, "new": new }),
+            Request::PageGet { page }
+            | Request::PageReload { page }
+            | Request::PageBack { page }
+            | Request::PageForward { page }
+            | Request::PageClose { page } => json!({ "page": page }),
         }
     }
 
@@ -352,17 +400,58 @@ pub fn parse_request_line(line: &str) -> Result<Envelope, (Value, String)> {
             workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
             pane: arg_number(args, "pane").map_err(&fail)?,
         },
-        "open" => Request::Open {
+        "pane.resize" => Request::PaneResize {
             workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
-            path: arg_file(args, "path").map_err(&fail)?,
-            line: arg_position(args, "line").map_err(&fail)?,
-            column: arg_position(args, "column").map_err(&fail)?,
-            pane: arg_optional_number(args, "pane").map_err(&fail)?,
+            pane: arg_number(args, "pane").map_err(&fail)?,
+            size: {
+                let size = arg_number(args, "size").map_err(&fail)?;
+                u8::try_from(size)
+                    .ok()
+                    .filter(|size| (1..=99).contains(size))
+                    .ok_or_else(|| fail("size must be a whole percentage from 1 to 99".to_owned()))?
+            },
         },
-        "diff" => Request::Diff {
-            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
-            old: arg_file(args, "old").map_err(&fail)?,
-            new: arg_file(args, "new").map_err(&fail)?,
+        "open" => match args.get("url") {
+            Some(_) => Request::OpenPage {
+                workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+                url: arg_string(args, "url").map_err(&fail)?,
+            },
+            None => Request::Open {
+                workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+                path: arg_file(args, "path").map_err(&fail)?,
+                line: arg_position(args, "line").map_err(&fail)?,
+                column: arg_position(args, "column").map_err(&fail)?,
+                pane: arg_optional_number(args, "pane").map_err(&fail)?,
+            },
+        },
+        "diff" => {
+            let old = arg_string(args, "old").map_err(&fail)?;
+            let new = arg_string(args, "new").map_err(&fail)?;
+            let workspace = arg_optional_string(args, "workspace").map_err(&fail)?;
+            match (old.starts_with('/'), new.starts_with('/')) {
+                (true, true) => Request::Diff {
+                    workspace,
+                    old: PathBuf::from(old),
+                    new: PathBuf::from(new),
+                },
+                (false, false) => Request::DiffRevisions { workspace, old, new },
+                _ => return Err(fail("diff needs two files or two revisions, not one of each".to_owned())),
+            }
+        }
+        "page.get" => Request::PageGet {
+            page: arg_string(args, "page").map_err(&fail)?,
+        },
+        "page.reload" => Request::PageReload {
+            page: arg_string(args, "page").map_err(&fail)?,
+        },
+        "page.back" => Request::PageBack {
+            page: arg_string(args, "page").map_err(&fail)?,
+        },
+        "page.forward" => Request::PageForward {
+            page: arg_string(args, "page").map_err(&fail)?,
+        },
+        "page.close" => Request::PageClose {
+            page: arg_string(args, "page").map_err(&fail)?,
         },
         other => return Err(fail(format!("unknown command {other}"))),
     };
@@ -428,13 +517,33 @@ Pane, file and diff commands:
       Focus the pane.
   pane close <pane>
       Close the pane and its tabs. Cod asks about unsaved files as the UI does.
+  pane resize <pane> --size <percent>%
+      Set the pane's share of its split, a whole percentage from 1 to 99.
   open <file>[:<line>[:<column>]] [--pane <pane>]
       Open the file in the active pane (or the pane), with the cursor at the line and column.
+  open <url>
+      Open the URL as a page tab in the active pane and print its page ID, such as page-3.
   diff <old file> <new file>
       Show the diff of two files in a tab.
+  diff <old revision> <new revision>
+      Show the diff of the workspace's repo between two git revisions (for example HEAD~1 HEAD)
+      in a tab. A revision contains no /; anything with a / is read as a file.
+
+Page commands:
+  page get <page> [--json]
+      Print the page's URL, title and state (loading, loaded or failed), tab-separated.
+  page reload <page>
+      Reload the page tab.
+  page back <page>
+      Go back in the page tab's history.
+  page forward <page>
+      Go forward in the page tab's history.
+  page close <page>
+      Close the page tab.
 
 <workspace> is a workspace ID or its exact name, also given as --workspace <workspace>.
 Without one, workspace commands act on the workspace in $COD_WORKSPACE. Pane, file and diff commands act on --workspace, else $COD_WORKSPACE, else the workspace shown in the active window.
+Page commands act on the page ID alone: a page keeps the same ID across every workspace and window, and across a restart.
 --json prints the result as JSON.
 
 Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace or pane (close).
@@ -461,6 +570,7 @@ struct Options {
     folders: Vec<String>,
     workspace: Option<String>,
     pane: Option<String>,
+    size: Option<String>,
     seen: Vec<&'static str>,
     positionals: Vec<String>,
 }
@@ -515,6 +625,13 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 }
                 options.pane = Some(take_value("--pane", &mut rest)?);
                 "--pane"
+            }
+            "--size" => {
+                if options.size.is_some() {
+                    return Err("--size is given twice".to_owned());
+                }
+                options.size = Some(take_value("--size", &mut rest)?);
+                "--size"
             }
             "--name" => {
                 if options.name.is_some() {
@@ -584,7 +701,7 @@ pub fn parse_cli(
     if wants_help(group) {
         return Ok(Cli::Help);
     }
-    if matches!(group.as_str(), "pane" | "open" | "diff") {
+    if matches!(group.as_str(), "pane" | "open" | "diff" | "page") {
         return parse_layout_cli(group, &args[1..], env, cwd);
     }
     if group != "workspace" {
@@ -749,14 +866,14 @@ fn parse_layout_cli(
     {
         return Ok(Cli::Help);
     }
-    let (command, rest) = if group == "pane" {
+    let (command, rest) = if group == "pane" || group == "page" {
         let Some(command) = args.first() else {
             return Ok(Cli::Help);
         };
         if command == "help" {
             return Ok(Cli::Help);
         }
-        (format!("pane {command}"), &args[1..])
+        (format!("{group} {command}"), &args[1..])
     } else {
         (group.to_owned(), args)
     };
@@ -764,7 +881,9 @@ fn parse_layout_cli(
     let allowed: &[&str] = match command.as_str() {
         "pane list" | "pane focus" | "pane close" | "diff" => &["--json", "--workspace"],
         "pane split" => &["--json", "--workspace", "--right", "--down"],
+        "pane resize" => &["--json", "--workspace", "--size"],
         "open" => &["--json", "--workspace", "--pane"],
+        "page get" | "page reload" | "page back" | "page forward" | "page close" => &["--json"],
         _ => return Err(format!("unknown command {command}: run codctl --help")),
     };
     if let Some(flag) = options.seen.iter().find(|flag| !allowed.contains(*flag)) {
@@ -809,27 +928,71 @@ fn parse_layout_cli(
                 Request::PaneClose { workspace, pane }
             }
         }
+        "pane resize" => {
+            let [pane] = positionals else {
+                return Err(takes("one pane ID and --size <percent>%"));
+            };
+            let Some(size) = options.size.as_deref() else {
+                return Err(takes("--size <percent>%"));
+            };
+            Request::PaneResize {
+                workspace,
+                pane: pane_id(pane)?,
+                size: parse_size_percent(size)?,
+            }
+        }
         "open" => {
             let [target] = positionals else {
-                return Err(takes("one file, as <file>[:<line>[:<column>]]"));
+                return Err(takes("one file, as <file>[:<line>[:<column>]], or one URL"));
             };
-            let (path, line, column) = split_position(target);
-            Request::Open {
-                workspace,
-                path: absolute_folder(path, env, cwd)?,
-                line,
-                column,
-                pane: options.pane.as_deref().map(pane_id).transpose()?,
+            if target.contains("://") {
+                if options.pane.is_some() {
+                    return Err(takes("a URL, which does not take --pane"));
+                }
+                Request::OpenPage {
+                    workspace,
+                    url: target.clone(),
+                }
+            } else {
+                let (path, line, column) = split_position(target);
+                Request::Open {
+                    workspace,
+                    path: absolute_folder(path, env, cwd)?,
+                    line,
+                    column,
+                    pane: options.pane.as_deref().map(pane_id).transpose()?,
+                }
             }
         }
         "diff" => {
             let [old, new] = positionals else {
-                return Err(takes("two files"));
+                return Err(takes("two files, or two git revisions"));
             };
-            Request::Diff {
-                workspace,
-                old: absolute_folder(old, env, cwd)?,
-                new: absolute_folder(new, env, cwd)?,
+            if old.contains('/') || new.contains('/') {
+                Request::Diff {
+                    workspace,
+                    old: absolute_folder(old, env, cwd)?,
+                    new: absolute_folder(new, env, cwd)?,
+                }
+            } else {
+                Request::DiffRevisions {
+                    workspace,
+                    old: old.clone(),
+                    new: new.clone(),
+                }
+            }
+        }
+        "page get" | "page reload" | "page back" | "page forward" | "page close" => {
+            let [page] = positionals else {
+                return Err(takes("one page ID"));
+            };
+            let page = page.clone();
+            match command.as_str() {
+                "page get" => Request::PageGet { page },
+                "page reload" => Request::PageReload { page },
+                "page back" => Request::PageBack { page },
+                "page forward" => Request::PageForward { page },
+                _ => Request::PageClose { page },
             }
         }
         _ => unreachable!("checked above"),
@@ -838,6 +1001,14 @@ fn parse_layout_cli(
         request,
         json: options.json,
     })
+}
+
+/// Parses `<percent>%` into a whole percentage from 1 to 99.
+fn parse_size_percent(text: &str) -> Result<u8, String> {
+    text.strip_suffix('%')
+        .and_then(|digits| digits.parse::<u8>().ok())
+        .filter(|size| (1..=99).contains(size))
+        .ok_or_else(|| format!("--size must be a percentage from 1 to 99, such as 40%, not {text:?}"))
 }
 
 /// What `codctl` prints on stdout for a successful reply, and its exit code.
@@ -876,8 +1047,14 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
         | Request::WorkspaceRename { .. }
         | Request::WorkspaceAddFolder { .. }
         | Request::PaneFocus { .. }
+        | Request::PaneResize { .. }
         | Request::Open { .. }
-        | Request::Diff { .. } => {
+        | Request::Diff { .. }
+        | Request::DiffRevisions { .. }
+        | Request::PageReload { .. }
+        | Request::PageBack { .. }
+        | Request::PageForward { .. }
+        | Request::PageClose { .. } => {
             let out = if json { format!("{result}\n") } else { String::new() };
             (out, EXIT_OK)
         }
@@ -917,6 +1094,23 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
             let closed = result.get("closed").and_then(Value::as_bool).unwrap_or(false);
             let out = if json { format!("{result}\n") } else { String::new() };
             (out, if closed { EXIT_OK } else { EXIT_KEPT })
+        }
+        Request::OpenPage { .. } => {
+            if json {
+                (format!("{result}\n"), EXIT_OK)
+            } else {
+                let id = result.get("id").and_then(Value::as_str).unwrap_or_default();
+                (format!("{id}\n"), EXIT_OK)
+            }
+        }
+        Request::PageGet { .. } => {
+            if json {
+                return (format!("{result}\n"), EXIT_OK);
+            }
+            let url = result.get("url").and_then(Value::as_str).unwrap_or_default();
+            let title = result.get("title").and_then(Value::as_str).unwrap_or("-");
+            let state = result.get("state").and_then(Value::as_str).unwrap_or_default();
+            (format!("{url}\t{}\t{state}\n", one_line(title)), EXIT_OK)
         }
     }
 }
@@ -1184,9 +1378,188 @@ mod tests {
         );
         assert!(parse(&["diff", "a.rs"], none).is_err());
         assert_eq!(parse(&["pane", "--help"], none), Ok(Cli::Help));
-        for command in ["pane list", "pane split", "pane focus", "pane close", "open", "diff"] {
+        for command in [
+            "pane list",
+            "pane split",
+            "pane focus",
+            "pane close",
+            "pane resize",
+            "open",
+            "diff",
+            "page get",
+            "page reload",
+            "page back",
+            "page forward",
+            "page close",
+        ] {
             assert!(HELP.contains(command), "{command}");
         }
+    }
+
+    #[test]
+    fn pane_resize() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            parse(&["pane", "resize", "5", "--size", "40%"], none),
+            run(Request::PaneResize { workspace: None, pane: 5, size: 40 }, false)
+        );
+        assert_eq!(
+            parse(&["pane", "resize", "5", "--size", "40%", "--workspace", "billing"], none),
+            run(Request::PaneResize { workspace: Some("billing".to_owned()), pane: 5, size: 40 }, false)
+        );
+        assert!(parse(&["pane", "resize", "5"], none).is_err());
+        assert!(parse(&["pane", "resize", "5", "--size", "100%"], none).is_err());
+        assert!(parse(&["pane", "resize", "5", "--size", "0%"], none).is_err());
+        assert!(parse(&["pane", "resize", "5", "--size", "40"], none).is_err());
+        assert!(parse(&["pane", "resize", "5", "--size", "40%", "--right"], none).is_err());
+        let line = Request::PaneResize { workspace: Some("1".to_owned()), pane: 5, size: 40 }.to_line(1);
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(Envelope {
+                id: json!(1),
+                request: Request::PaneResize { workspace: Some("1".to_owned()), pane: 5, size: 40 },
+            })
+        );
+        let bad_size = r#"{"v":1,"id":1,"cmd":"pane.resize","args":{"pane":5,"size":100}}"#;
+        assert!(parse_request_line(bad_size).is_err());
+        assert_eq!(
+            render(&Request::PaneResize { workspace: None, pane: 5, size: 40 }, false, &json!({})),
+            (String::new(), EXIT_OK)
+        );
+    }
+
+    #[test]
+    fn open_a_url_as_a_page() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            parse(&["open", "http://127.0.0.1:8000/tracker/PAY-1234"], none),
+            run(
+                Request::OpenPage {
+                    workspace: None,
+                    url: "http://127.0.0.1:8000/tracker/PAY-1234".to_owned(),
+                },
+                false
+            )
+        );
+        assert!(parse(&["open", "http://127.0.0.1:8000/tracker/PAY-1234", "--pane", "7"], none).is_err());
+        let line = Request::OpenPage { workspace: None, url: "http://127.0.0.1:8000/x".to_owned() }.to_line(1);
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(Envelope {
+                id: json!(1),
+                request: Request::OpenPage { workspace: None, url: "http://127.0.0.1:8000/x".to_owned() },
+            })
+        );
+        assert_eq!(
+            render(
+                &Request::OpenPage { workspace: None, url: "http://127.0.0.1:8000/x".to_owned() },
+                false,
+                &json!({"id": "page-3"}),
+            ),
+            ("page-3\n".to_owned(), EXIT_OK)
+        );
+    }
+
+    #[test]
+    fn diff_of_two_revisions() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            parse(&["diff", "HEAD~1", "HEAD"], none),
+            run(Request::DiffRevisions { workspace: None, old: "HEAD~1".to_owned(), new: "HEAD".to_owned() }, false)
+        );
+        let line =
+            Request::DiffRevisions { workspace: Some("1".to_owned()), old: "HEAD~1".to_owned(), new: "HEAD".to_owned() }
+                .to_line(1);
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(Envelope {
+                id: json!(1),
+                request: Request::DiffRevisions {
+                    workspace: Some("1".to_owned()),
+                    old: "HEAD~1".to_owned(),
+                    new: "HEAD".to_owned(),
+                },
+            })
+        );
+        let mixed = r#"{"v":1,"id":1,"cmd":"diff","args":{"old":"HEAD~1","new":"/a.rs"}}"#;
+        assert!(parse_request_line(mixed).is_err());
+        assert_eq!(
+            render(
+                &Request::DiffRevisions { workspace: None, old: "HEAD~1".to_owned(), new: "HEAD".to_owned() },
+                false,
+                &json!({}),
+            ),
+            (String::new(), EXIT_OK)
+        );
+    }
+
+    #[test]
+    fn page_commands() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            parse(&["page", "get", "page-3"], none),
+            run(Request::PageGet { page: "page-3".to_owned() }, false)
+        );
+        assert_eq!(
+            parse(&["page", "get", "page-3", "--json"], none),
+            run(Request::PageGet { page: "page-3".to_owned() }, true)
+        );
+        assert_eq!(
+            parse(&["page", "reload", "page-3"], none),
+            run(Request::PageReload { page: "page-3".to_owned() }, false)
+        );
+        assert_eq!(
+            parse(&["page", "back", "page-3"], none),
+            run(Request::PageBack { page: "page-3".to_owned() }, false)
+        );
+        assert_eq!(
+            parse(&["page", "forward", "page-3"], none),
+            run(Request::PageForward { page: "page-3".to_owned() }, false)
+        );
+        assert_eq!(
+            parse(&["page", "close", "page-3"], none),
+            run(Request::PageClose { page: "page-3".to_owned() }, false)
+        );
+        assert!(parse(&["page", "get"], none).is_err());
+        assert!(parse(&["page", "get", "page-3", "--workspace", "1"], none).is_err());
+        assert!(parse(&["page", "explode", "page-3"], none).is_err());
+        assert_eq!(parse(&["page", "--help"], none), Ok(Cli::Help));
+
+        for request in [
+            Request::PageGet { page: "page-3".to_owned() },
+            Request::PageReload { page: "page-3".to_owned() },
+            Request::PageBack { page: "page-3".to_owned() },
+            Request::PageForward { page: "page-3".to_owned() },
+            Request::PageClose { page: "page-3".to_owned() },
+        ] {
+            let line = request.to_line(1);
+            assert_eq!(parse_request_line(&line), Ok(Envelope { id: json!(1), request }), "{line}");
+        }
+        assert!(parse_request_line(r#"{"v":1,"id":1,"cmd":"page.get","args":{}}"#).is_err());
+
+        assert_eq!(
+            render(&Request::PageGet { page: "page-3".to_owned() }, false, &json!({"url": "http://127.0.0.1:8000/x", "title": "PAY-1234 Fix invoice rounding", "state": "loaded"})),
+            ("http://127.0.0.1:8000/x\tPAY-1234 Fix invoice rounding\tloaded\n".to_owned(), EXIT_OK)
+        );
+        assert_eq!(
+            render(&Request::PageGet { page: "page-3".to_owned() }, true, &json!({"url": "u", "title": null, "state": "loading"})).0,
+            format!("{}\n", json!({"url": "u", "title": null, "state": "loading"}))
+        );
+        assert_eq!(
+            render(&Request::PageClose { page: "page-3".to_owned() }, false, &json!({})),
+            (String::new(), EXIT_OK)
+        );
+    }
+
+    #[test]
+    fn size_percentages() {
+        assert_eq!(parse_size_percent("40%"), Ok(40));
+        assert_eq!(parse_size_percent("1%"), Ok(1));
+        assert_eq!(parse_size_percent("99%"), Ok(99));
+        assert!(parse_size_percent("0%").is_err());
+        assert!(parse_size_percent("100%").is_err());
+        assert!(parse_size_percent("40").is_err());
+        assert!(parse_size_percent("-5%").is_err());
     }
 
     #[test]

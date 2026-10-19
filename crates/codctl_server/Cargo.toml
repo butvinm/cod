@@ -18,11 +18,17 @@ anyhow.workspace = true
 codctl.workspace = true
 editor.workspace = true
 futures.workspace = true
+git_ui.workspace = true
 git_ui_core.workspace = true
 gpui.workspace = true
 log.workspace = true
+project.workspace = true
 serde_json.workspace = true
+web_view.workspace = true
 workspace.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
