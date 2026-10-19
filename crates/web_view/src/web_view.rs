@@ -13,6 +13,7 @@ mod linux;
 mod offscreen;
 #[cfg(target_os = "linux")]
 mod offscreen_driver;
+pub mod page_url;
 #[cfg(target_os = "macos")]
 mod spike_driver;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
