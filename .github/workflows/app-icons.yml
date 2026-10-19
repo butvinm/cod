@@ -30,6 +30,10 @@ jobs:
     name: app-icons
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # "bash" runs every step as "bash --noprofile --norc -eo pipefail {0}", so a failing command before "| tee" fails the step.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check out
         uses: actions/checkout@v4
