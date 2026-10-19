@@ -23,8 +23,15 @@ pub struct CodTabInfo {
     /// The name the tab stands for (the user's name, else its folders, else "New workspace").
     pub name: String,
     pub active: bool,
-    /// The status of the workspace; the dot shows when it is not idle.
-    pub status: Option<CodStatus>,
+    /// The dot's color name ("yellow", "red", "blue", "green"), written only when the title bar
+    /// actually prepainted the dot in the last frame; None otherwise (no dot, idle or not drawn
+    /// at all). Set by the dot's own `on_children_prepainted`, not derived from the workspace's
+    /// status, so removing the drawn dot from the tab turns this back to None on its own.
+    pub dot: Option<&'static str>,
+    /// Whether the dot's pulsing animation actually ran in the last frame. Set from inside the
+    /// animation's own frame callback, so removing the animation (while keeping a static dot)
+    /// turns this back to false on its own.
+    pub pulsing: bool,
     /// The text of the tab's tooltip: the full name.
     pub tooltip: String,
     /// Where the tab was drawn, None before it was drawn.
@@ -107,16 +114,38 @@ fn member_name(member: &CodMember, multi_workspace: &MultiWorkspace, cx: &App) -
     }
 }
 
-fn status_dot(status: CodStatus, index: usize) -> Option<AnyElement> {
+/// Builds the status dot, if the status calls for one, and wires it so the end-to-end driver
+/// reads back what was actually drawn rather than the status that was computed for it: the
+/// color is written into `layout` only from the dot's own prepaint callback, and the pulsing
+/// flag only from inside its animation's own frame callback.
+fn status_dot(status: CodStatus, index: usize, layout: &Rc<RefCell<CodTabsLayout>>) -> Option<AnyElement> {
     let color = status.color()?;
-    let dot = div().flex_none().child(Indicator::dot().color(color));
+    let color_name = status.dot_name()?;
+    let drawn_layout = layout.clone();
+    let dot = div()
+        .flex_none()
+        .child(Indicator::dot().color(color))
+        .on_children_prepainted(move |bounds, _window, _cx| {
+            let drawn = bounds
+                .first()
+                .is_some_and(|bounds| bounds.size.width > px(0.) && bounds.size.height > px(0.));
+            if let Some(tab) = drawn_layout.borrow_mut().tabs.get_mut(index) {
+                tab.dot = drawn.then_some(color_name);
+            }
+        });
     Some(if status.pulses() {
+        let pulse_layout = layout.clone();
         dot.with_animation(
             ("cod-workspace-tab-dot", index),
             Animation::new(Duration::from_secs(2))
                 .repeat()
                 .with_easing(pulsating_between(0.3, 1.0)),
-            |dot, delta| dot.opacity(delta),
+            move |dot, delta| {
+                if let Some(tab) = pulse_layout.borrow_mut().tabs.get_mut(index) {
+                    tab.pulsing = true;
+                }
+                dot.opacity(delta)
+            },
         )
         .into_any_element()
     } else {
@@ -153,7 +182,8 @@ pub fn render_cod_workspace_tabs(
         infos.push(CodTabInfo {
             name: name.clone(),
             active: is_active,
-            status: Some(status),
+            dot: None,
+            pulsing: false,
             tooltip: name.clone(),
             bounds: None,
             cut: false,
@@ -169,7 +199,7 @@ pub fn render_cod_workspace_tabs(
         let content = h_flex()
             .min_w_0()
             .gap_1()
-            .children(status_dot(status, index))
+            .children(status_dot(status, index, &layout))
             .when_some(id, |content, id| {
                 content.child(
                     div()

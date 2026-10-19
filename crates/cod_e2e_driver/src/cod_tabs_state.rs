@@ -115,12 +115,14 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
         .tabs
         .iter()
         .map(|tab| {
-            let status = tab.status.unwrap_or(CodStatus::Idle);
             json!({
                 "name": tab.name,
                 "active": tab.active,
-                "dot": status.dot_name(),
-                "pulsing": status.pulses(),
+                // Review #25/#26: the dot's color and pulsing come from what the title bar
+                // actually prepainted and animated in the last frame, not from the workspace's
+                // status (crates/title_bar/src/cod_workspace_tabs.rs::status_dot).
+                "dot": tab.dot,
+                "pulsing": tab.pulsing,
                 "tooltip": tab.tooltip,
                 "truncated": tab.truncated(),
                 "bounds": bounds_json(tab.bounds),
