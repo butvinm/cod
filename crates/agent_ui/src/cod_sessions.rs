@@ -149,7 +149,7 @@ pub fn send_message(
         .context("the chat has no message box yet")?;
     thread_view.update(cx, |view, cx| {
         view.message_editor
-            .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            .update(cx, |editor, cx| editor.insert_text(text, window, cx));
     });
     thread_view.update(cx, |view, cx| view.send(window, cx));
     Ok(())
