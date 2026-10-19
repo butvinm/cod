@@ -3437,6 +3437,7 @@ dependencies = [
  "gpui",
  "libc",
  "log",
+ "markdown_preview",
  "open_path_prompt",
  "picker",
  "project_panel",
