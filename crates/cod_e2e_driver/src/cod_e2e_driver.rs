@@ -18,6 +18,7 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+mod cod_overview_state;
 mod cod_tabs_state;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
@@ -783,7 +784,7 @@ fn read_state(
     } else {
         None
     };
-    Ok(json!({
+    let mut state = json!({
         "active_tab": active_tab,
         "tabs": tabs,
         "worktrees": worktrees,
@@ -809,7 +810,10 @@ fn read_state(
         "focus": focus,
         "prompt": prompt,
         "title_bar": cod_tabs_state::title_bar_state(&active, cx),
-    }))
+    });
+    // Set outside `json!` to keep the macro's recursion short.
+    state["overview"] = cod_overview_state::overview_state(workspace, window, cx);
+    Ok(state)
 }
 
 /// What holds the window's focus, read only: null when nothing is focused, else `kind` is
