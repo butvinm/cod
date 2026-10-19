@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use db::kvp::KeyValueStore;
-use gpui::{App, Entity, Global, TaskExt as _, WeakEntity, Window};
+use gpui::{App, AppContext as _, Entity, Global, TaskExt as _, WeakEntity, Window};
 use ui::SharedString;
 use workspace::Workspace;
 
