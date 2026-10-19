@@ -7,8 +7,8 @@ use crate::{
 use agent_settings::AgentSettings;
 use git::Clone as GitClone;
 use gpui::{
-    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    ParentElement, Render, Styled, Task, TaskExt, Window, actions,
+    Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Image, ImageFormat,
+    InteractiveElement, ParentElement, Render, Styled, Task, TaskExt, Window, actions, img,
 };
 use gpui::{WeakEntity, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
@@ -16,7 +16,8 @@ use menu::{SelectNext, SelectPrevious};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
-use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
+use std::sync::{Arc, LazyLock};
+use ui::{ButtonLike, Divider, DividerColor, KeyBinding, prelude::*};
 use util::ResultExt;
 use zed_actions::{
     Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
@@ -36,6 +37,18 @@ actions!(
         ShowWelcome
     ]
 );
+
+/// Cod's app icon, the same 512 px raster the About window shows, drawn as is (no tint, no crop).
+/// The Welcome page and onboarding show it as the app identity (issue #57).
+pub fn cod_app_icon() -> Arc<Image> {
+    static ICON: LazyLock<Arc<Image>> = LazyLock::new(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../../zed/resources/app-icon.png").to_vec(),
+        ))
+    });
+    ICON.clone()
+}
 
 #[derive(IntoElement)]
 struct SectionHeader {
@@ -477,7 +490,11 @@ impl Render for WelcomePage {
                             .justify_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
+                            .child(
+                                img(cod_app_icon())
+                                    .size(rems_from_px(45_f32))
+                                    .flex_none(),
+                            )
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
                                     Label::new("The editor for what's next")

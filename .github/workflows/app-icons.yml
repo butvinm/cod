@@ -1,0 +1,247 @@
+# Checks Cod's app icons and the Linux package layout of the icons and the launcher (issue #57). No Rust build.
+# (a) the committed master has the approved SHA-256, (b) a fresh run of script/cod-app-icons gives the committed icons,
+# (c) sizes, ICO entries and alpha are right and no predecessor (Zed) icon is left in the tree,
+# (d) the icon and launcher part of the Linux release tarball is built and listed.
+# The contact sheet, the package listing and the icon metadata are kept as the app-icons artifact.
+name: App icons
+
+on:
+  pull_request:
+    paths:
+      - "crates/zed/resources/**"
+      - "crates/auto_update_helper/app-icon.ico"
+      - "crates/zed/Cargo.toml"
+      - "crates/zed/build.rs"
+      - "script/cod-app-icons*"
+      - "script/cod-linux-desktop-files"
+      - "script/install-launcher.sh"
+      - "script/cod-wayland.sh"
+      - "crates/zed/src/zed.rs"
+      - "crates/workspace/src/welcome.rs"
+      - "crates/onboarding/src/onboarding.rs"
+      - "script/bundle-*"
+      - ".github/workflows/app-icons.yml"
+      - ".github/workflows/linux-release.yml"
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  app-icons:
+    name: app-icons
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # "bash" runs every step as "bash --noprofile --norc -eo pipefail {0}", so a failing command before "| tee" fails the step.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Pillow in a virtual environment
+        run: |
+          python -m venv "$RUNNER_TEMP/icon-venv"
+          "$RUNNER_TEMP/icon-venv/bin/pip" install -r script/cod-app-icons-requirements.txt
+
+      - name: Verify the master checksum
+        run: |
+          echo "bb82c4ce6cc59e896861a6813d114b26c2b1eb9d7735169420017e45997a65f3  crates/zed/resources/cod-app-icon-1024.png" | sha256sum -c -
+
+      - name: Regenerate and compare the icons, check sizes, alpha and predecessor hashes
+        run: |
+          mkdir -p out
+          "$RUNNER_TEMP/icon-venv/bin/python" script/cod-app-icons --check | tee out/icon-check.txt
+
+      - name: Draw the contact sheet
+        run: |
+          "$RUNNER_TEMP/icon-venv/bin/python" script/cod-app-icons --contact-sheet out/contact-sheet.png
+
+      # The same command as the "Package the Cod tarball" step of linux-release.yml, on an empty cod/ folder.
+      - name: Build the Linux package layout (icons and launcher only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends desktop-file-utils
+          mkdir cod
+          script/cod-linux-desktop-files cod | tee out/package-files.txt
+          desktop-file-validate cod/share/applications/dev.zed.Zed.desktop
+          grep -qx 'Icon=cod' cod/share/applications/dev.zed.Zed.desktop
+          grep -qx 'X-Cod-Launcher=true' cod/share/applications/dev.zed.Zed.desktop
+          for size in 16 32 48 64 128 256 512 1024; do
+            test -f "cod/share/icons/hicolor/${size}x${size}/apps/cod.png"
+          done
+          # The launcher is named after the app id of a stable build, so the window matches it.
+          test "$(tr -d '[:space:]' < crates/zed/RELEASE_CHANNEL)" = stable
+          grep -q 'ReleaseChannel::Stable => "dev.zed.Zed",' crates/release_channel/src/lib.rs
+          grep -q 'script/cod-linux-desktop-files cod' .github/workflows/linux-release.yml
+          test -x cod/install-launcher.sh
+          grep -q 'cp script/cod-xwayland.sh script/cod-wayland.sh cod/' .github/workflows/linux-release.yml
+          tar -cJf cod-desktop-files.tar.xz cod
+          tar -tvJf cod-desktop-files.tar.xz | tee out/package-listing.txt
+          cp cod/share/applications/dev.zed.Zed.desktop out/
+
+      # Unpacks the layout with the start script into a folder with a space, as a user would, and installs the launcher into a temporary HOME.
+      - name: Install the launcher into a temporary HOME
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$unpacked" "$home"
+          tar -xJf cod-desktop-files.tar.xz -C "$unpacked"
+          cp script/cod-wayland.sh "$unpacked/cod/"
+          chmod +x "$unpacked/cod/cod-wayland.sh"
+          # Run from another folder, so nothing depends on the current directory.
+          (cd "$home" && env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh") | tee out/install-launcher.txt
+          installed="$home/.local/share/applications/dev.zed.Zed.desktop"
+          desktop-file-validate "$installed"
+          cp "$installed" out/installed-dev.zed.Zed.desktop
+          grep -qx 'Icon=cod' "$installed"
+          exec_line=$(grep '^Exec=' "$installed")
+          tryexec_line=$(grep '^TryExec=' "$installed")
+          test "$exec_line" = "Exec=\"$unpacked/cod/cod-wayland.sh\""
+          test "$tryexec_line" = "TryExec=$unpacked/cod/cod-wayland.sh"
+          exec_path=${exec_line#Exec=\"}
+          exec_path=${exec_path%\"}
+          test -x "$exec_path"
+          test -x "${tryexec_line#TryExec=}"
+          for size in 16 32 48 64 128 256 512 1024; do
+            cmp "cod/share/icons/hicolor/${size}x${size}/apps/cod.png" "$home/.local/share/icons/hicolor/${size}x${size}/apps/cod.png"
+          done
+          { echo "$exec_line"; echo "$tryexec_line"; find "$home" -type f | sort; } | tee -a out/install-launcher.txt
+          # A second run updates the Cod launcher it installed.
+          (cd "$home" && env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh") | tee -a out/install-launcher.txt
+          desktop-file-validate "$installed"
+          grep -qx 'X-Cod-Launcher=true' "$installed"
+          test "$(grep '^Exec=' "$installed")" = "$exec_line"
+
+      # Stock Zed's install.sh writes the same launcher file. The installer must refuse and leave a launcher it did not install byte-identical.
+      - name: Refuse to replace a launcher or icon that Cod did not install
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          home="$RUNNER_TEMP/zed-home"
+          apps="$home/.local/share/applications"
+          mkdir -p "$apps"
+          {
+            echo "[Desktop Entry]"
+            echo "Version=1.0"
+            echo "Type=Application"
+            echo "Name=Zed"
+            echo "Comment=A customized stock Zed launcher"
+            echo "TryExec=$home/.local/zed.app/bin/zed"
+            echo "Exec=$home/.local/zed.app/bin/zed %U"
+            echo "Icon=$home/.local/zed.app/share/icons/hicolor/512x512/apps/zed.png"
+            echo "StartupWMClass=dev.zed.Zed"
+            echo "Categories=Utility;TextEditor;Development;IDE;"
+          } > "$apps/dev.zed.Zed.desktop"
+          cp "$apps/dev.zed.Zed.desktop" "$RUNNER_TEMP/seed.desktop"
+          find "$home" | sort > "$RUNNER_TEMP/before.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-launcher.txt 2>&1; then
+            cat out/refuse-launcher.txt
+            echo "install-launcher.sh replaced a launcher it did not install" >&2
+            exit 1
+          fi
+          cat out/refuse-launcher.txt
+          grep -q 'was not installed by Cod' out/refuse-launcher.txt
+          cmp "$RUNNER_TEMP/seed.desktop" "$apps/dev.zed.Zed.desktop"
+          find "$home" | sort | diff "$RUNNER_TEMP/before.txt" -
+          # The same for a cod.png icon from another source when there is no Cod launcher.
+          home="$RUNNER_TEMP/icon-home"
+          icon="$home/.local/share/icons/hicolor/48x48/apps/cod.png"
+          mkdir -p "${icon%/cod.png}"
+          echo "not a Cod icon" > "$icon"
+          cp "$icon" "$RUNNER_TEMP/seed-icon"
+          find "$home" | sort > "$RUNNER_TEMP/before-icon.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-icon.txt 2>&1; then
+            cat out/refuse-icon.txt
+            echo "install-launcher.sh replaced an icon it did not install" >&2
+            exit 1
+          fi
+          cat out/refuse-icon.txt
+          grep -q 'was not installed by Cod' out/refuse-icon.txt
+          cmp "$RUNNER_TEMP/seed-icon" "$icon"
+          find "$home" | sort | diff "$RUNNER_TEMP/before-icon.txt" -
+
+      # A symlink at a path the installer writes must never lead it to write through the link into another file.
+      - name: Refuse to write through a symlink and never use a predictable temporary file
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          # (a) On an update, 48x48/apps/cod.png is a symlink to a foreign file: the installer refuses and leaves the link and its target byte-identical.
+          home="$RUNNER_TEMP/link-home"
+          mkdir -p "$home"
+          env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > /dev/null
+          grep -qx 'X-Cod-Launcher=true' "$home/.local/share/applications/dev.zed.Zed.desktop"
+          foreign="$RUNNER_TEMP/foreign-icon.png"
+          echo "a foreign file behind a symlink" > "$foreign"
+          cp "$foreign" "$RUNNER_TEMP/seed-foreign-icon"
+          icon="$home/.local/share/icons/hicolor/48x48/apps/cod.png"
+          rm "$icon"
+          ln -s "$foreign" "$icon"
+          cp "$home/.local/share/applications/dev.zed.Zed.desktop" "$RUNNER_TEMP/seed-cod.desktop"
+          find "$home" | sort > "$RUNNER_TEMP/before-link.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-symlink-icon.txt 2>&1; then
+            cat out/refuse-symlink-icon.txt
+            echo "install-launcher.sh wrote through a symlinked icon" >&2
+            exit 1
+          fi
+          cat out/refuse-symlink-icon.txt
+          grep -q 'is a symbolic link' out/refuse-symlink-icon.txt
+          test -L "$icon"
+          test "$(readlink "$icon")" = "$foreign"
+          cmp "$RUNNER_TEMP/seed-foreign-icon" "$foreign"
+          cmp "$RUNNER_TEMP/seed-cod.desktop" "$home/.local/share/applications/dev.zed.Zed.desktop"
+          find "$home" | sort | diff "$RUNNER_TEMP/before-link.txt" -
+          # (b) A symlink at the old predictable temporary path points to a foreign launcher: that file stays byte-identical.
+          home="$RUNNER_TEMP/tmp-home"
+          apps="$home/.local/share/applications"
+          mkdir -p "$apps"
+          foreign="$RUNNER_TEMP/foreign.desktop"
+          {
+            echo "[Desktop Entry]"
+            echo "Type=Application"
+            echo "Name=Foreign"
+            echo "Exec=/usr/bin/true"
+          } > "$foreign"
+          cp "$foreign" "$RUNNER_TEMP/seed-foreign.desktop"
+          ln -s "$foreign" "$apps/.dev.zed.Zed.desktop.tmp"
+          env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" 2>&1 | tee out/install-with-tmp-link.txt
+          cmp "$RUNNER_TEMP/seed-foreign.desktop" "$foreign"
+          test -L "$apps/.dev.zed.Zed.desktop.tmp"
+          test "$(readlink "$apps/.dev.zed.Zed.desktop.tmp")" = "$foreign"
+          test ! -L "$apps/dev.zed.Zed.desktop"
+          grep -qx 'X-Cod-Launcher=true' "$apps/dev.zed.Zed.desktop"
+          # No temporary file is left behind.
+          test -z "$(find "$home" -name '.*.??????' -print)"
+
+      - name: Record where the app uses the icons
+        run: |
+          {
+            echo "## Bundle icon lists (crates/zed/Cargo.toml)"
+            grep -n 'icon = ' crates/zed/Cargo.toml
+            echo "## X11 window icon source (crates/zed/build.rs)"
+            grep -n 'app-icon' crates/zed/build.rs
+            echo "## About window icon (crates/zed/src/zed.rs)"
+            grep -n 'resources/app-icon' crates/zed/src/zed.rs
+            echo "## Windows resources (crates/windows_resources/src/windows_resources.rs)"
+            grep -n 'app-icon' crates/windows_resources/src/windows_resources.rs
+            echo "## Derived icon files"
+            file crates/zed/resources/app-icon*.png crates/zed/resources/windows/*.ico crates/auto_update_helper/app-icon.ico
+            sha256sum crates/zed/resources/cod-app-icon-1024.png crates/zed/resources/app-icon*.png crates/zed/resources/windows/*.ico crates/auto_update_helper/app-icon.ico
+          } | tee out/icon-metadata.txt
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-icons
+          path: out/
+          retention-days: 30

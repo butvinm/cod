@@ -21,6 +21,8 @@ On a Wayland desktop, use `cod-wayland.sh` (recommended). Cod runs as a native W
 
 To open another page and a folder: `./cod/cod-wayland.sh <url> <folder>`.
 
+To start Cod from your desktop's app launcher with the Cod icon, run `./cod/install-launcher.sh` once. It copies the icons and the launcher into `~/.local/share` (or `$XDG_DATA_HOME`) and points the launcher at `cod-wayland.sh` in the unpacked folder, so run it again if you move that folder. Stock Zed's launcher uses the same file name, so if `~/.local/share/applications/dev.zed.Zed.desktop` exists and Cod did not install it, the script changes nothing and stops with an error; move that file away first if you want Cod's launcher instead. To remove the launcher, delete `~/.local/share/applications/dev.zed.Zed.desktop` and `~/.local/share/icons/hicolor/*/apps/cod.png`.
+
 Without a Wayland session (X11), or if the off-screen browser does not work for you, use `./cod/cod-xwayland.sh [url] [folder]` instead. It makes Cod use X11 (through XWayland on a Wayland desktop) with the older WebKitGTK web view.
 
 Both start scripts keep its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), a core dump is available if systemd-coredump is installed and enabled: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
