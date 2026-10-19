@@ -13,7 +13,7 @@ pub(crate) fn agent_panel_ready(window: &Window, cx: &App) -> bool {
         .is_ok_and(|action| window.is_action_available(action.as_ref(), cx))
 }
 
-/// `{"agent", "title", "transcript", "reply_focused", "focused_link"}` for the active chat of the workspace's agent panel, or null when the panel shows no chat.
+/// `{"agent", "session_id", "title", "transcript", "reply_focused", "focused_link"}` for the active chat of the workspace's agent panel, or null when the panel shows no chat.
 /// `focused_link` is `{"text", "url"}` for the link of an agent reply that has the keyboard focus, else null.
 pub(crate) fn chat_state(workspace: &Workspace, window: &Window, cx: &App) -> Value {
     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
@@ -24,6 +24,7 @@ pub(crate) fn chat_state(workspace: &Workspace, window: &Window, cx: &App) -> Va
     };
     json!({
         "agent": snapshot.agent,
+        "session_id": snapshot.session_id,
         "title": snapshot.title,
         "transcript": snapshot.transcript,
         "reply_focused": snapshot.reply_focused,

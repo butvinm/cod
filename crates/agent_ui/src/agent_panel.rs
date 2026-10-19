@@ -113,6 +113,8 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 pub struct CodChatSnapshot {
     /// The id of the chat's agent, for example `claude-acp`.
     pub agent: String,
+    /// The provider's own session id of the chat.
+    pub session_id: String,
     /// The thread title, once there is one.
     pub title: Option<String>,
     /// The whole transcript as markdown.
@@ -4201,6 +4203,7 @@ impl AgentPanel {
             .unwrap_or_default();
         Some(CodChatSnapshot {
             agent,
+            session_id: thread.session_id().0.to_string(),
             title: thread.title().map(|title| title.to_string()),
             transcript: thread.to_markdown(cx),
             reply_focused: focused_markdown.is_some(),
