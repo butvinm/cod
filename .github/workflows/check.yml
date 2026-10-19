@@ -213,7 +213,11 @@ jobs:
           started=$(date +%s)
           bytes=$(tar -cf - target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null | zstd -T0 -3 --long=30 -c | wc -c)
           echo "build state compressed with zstd -3: $((bytes / 1048576)) MiB (measured in $(( $(date +%s) - started )) s)"
-          if [ "$kib" -lt $((3 * 1024 * 1024)) ]; then
+          # A manual measuring run is guarded by the compressed size (the bytes the budget counts); master by the size on disk, until that guard is decided.
+          if [ "${{ github.event_name }}" = workflow_dispatch ] && [ "$bytes" -lt $((3 * 1024 * 1024 * 1024)) ]; then
+            echo "manual run: the compressed build state is under 3 GiB, saving it"
+            echo "save=true" >> "$GITHUB_OUTPUT"
+          elif [ "$kib" -lt $((3 * 1024 * 1024)) ]; then
             echo "save=true" >> "$GITHUB_OUTPUT"
           else
             echo "target is 3 GiB or more, not saving it"
