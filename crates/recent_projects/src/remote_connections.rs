@@ -133,6 +133,50 @@ struct CodRemoteAttempt {
     owner: Option<workspace::CodRestoreOwner>,
     window: Option<WindowHandle<MultiWorkspace>>,
     done: Option<oneshot::Sender<()>>,
+    /// The saved row of a pending remote member that this open loads into its window, which
+    /// keeps its restore owner (the open reserves none).
+    pending_restore_id: Option<workspace::WorkspaceId>,
+}
+
+/// Cod (#24): loads the pending remote member `id` of `window`: its exact saved row over its
+/// saved connection, as a new member of that window. Registered as the workspace crate's
+/// remote member opener.
+pub fn cod_open_remote_member(
+    id: workspace::WorkspaceId,
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    app_state: Arc<AppState>,
+    window: WindowHandle<MultiWorkspace>,
+    cx: &mut gpui::App,
+) -> gpui::Task<Result<()>> {
+    // As at start: the saved SSH connection gets its settings (user, port forwards, ...).
+    let mut connection_options = connection_options;
+    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+        RemoteSettings::get_global(cx).fill_connection_options_from_settings(options);
+    }
+    cx.spawn(async move |cx| {
+        let open_options = OpenOptions {
+            requesting_window: Some(window),
+            workspace_matching: workspace::WorkspaceMatching::None,
+            ..Default::default()
+        };
+        let mut attempt = CodRemoteAttempt {
+            pending_restore_id: Some(id),
+            ..Default::default()
+        };
+        let result = cod_open_remote_project_attempt(
+            connection_options,
+            paths,
+            app_state,
+            open_options,
+            &mut attempt,
+            cx,
+        )
+        .await;
+        cod_give_back_restore_owner(&mut attempt, cx);
+        drop(attempt.done.take());
+        result.map(|_| ())
+    })
 }
 
 /// Cod (#24): an attempt that did not bring its remote workspace up (cancelled, failed, or
@@ -308,7 +352,8 @@ async fn cod_open_remote_project_attempt(
     cod_attempt.done = cod_restore_done;
     let cod_restore_id = cod_restore_owner
         .as_ref()
-        .map(|owner| owner.active_workspace_id);
+        .map(|owner| owner.active_workspace_id)
+        .or(cod_attempt.pending_restore_id);
 
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {

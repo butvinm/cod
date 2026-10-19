@@ -1621,18 +1621,24 @@ async fn restore_or_create_from(
                         .map(PathBuf::from)
                         .collect::<Vec<_>>();
                     let state = multi_workspace.state.clone();
-                    // Cod (#24): the window's local members come back as pending members of
-                    // the remote window, as in a local window. They load when first shown.
+                    // Cod (#24): the window's other members (local and remote) come back as
+                    // pending members of the remote window, as in a local window. They load
+                    // when first shown; a remote one over its saved connection.
                     let cod_local_members: Vec<_> = multi_workspace
                         .other_workspaces
                         .iter()
                         .filter(|other| {
-                            matches!(other.location, SerializedWorkspaceLocation::Local)
-                                && (!other.paths.is_empty()
-                                    || state.cod_workspace_ids.is_empty()
-                                    || state.cod_workspace_ids.contains(&other.workspace_id))
+                            !other.paths.is_empty()
+                                || state.cod_workspace_ids.is_empty()
+                                || state.cod_workspace_ids.contains(&other.workspace_id)
                         })
-                        .map(|other| (other.workspace_id, other.paths.paths().to_vec()))
+                        .map(|other| {
+                            (
+                                other.workspace_id,
+                                other.location.clone(),
+                                other.paths.paths().to_vec(),
+                            )
+                        })
                         .collect();
                     async {
                         let window = open_remote_project(
@@ -1652,8 +1658,17 @@ async fn restore_or_create_from(
                                 {
                                     return;
                                 }
-                                for (id, paths) in cod_local_members {
-                                    multi_workspace.cod_add_pending_workspace(id, paths);
+                                for (id, location, paths) in cod_local_members {
+                                    match location {
+                                        SerializedWorkspaceLocation::Local => {
+                                            multi_workspace.cod_add_pending_workspace(id, paths)
+                                        }
+                                        SerializedWorkspaceLocation::Remote(connection) => {
+                                            multi_workspace.cod_add_pending_remote_workspace(
+                                                id, connection, paths,
+                                            )
+                                        }
+                                    }
                                 }
                                 multi_workspace.cod_finish_restore(cx);
                                 multi_workspace.serialize(cx);
