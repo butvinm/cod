@@ -1168,6 +1168,9 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+    /// Cod (#28): the fresh chat of a new workspace waits for the workspace's first folder.
+    cod_fresh_chat_pending: bool,
+    _cod_fresh_chat_subscription: Option<Subscription>,
 }
 
 impl AgentPanel {
@@ -1487,36 +1490,18 @@ impl AgentPanel {
             })?;
 
             // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
-            // the default agent, ready for typing. The panel joins its dock after this load
-            // returns, so the chat starts once the workspace holds the panel.
+            // the default agent in its agent panel, so opening the panel lands in it ready for
+            // typing. It never takes the focus: the user may already be in the command palette,
+            // the path picker or another panel of the new workspace (#24).
             let fresh_chat = cx
                 .update(|_window, cx| workspace::cod_take_fresh_chat(workspace.entity_id(), cx))
                 .unwrap_or(false);
             if fresh_chat {
-                let workspace = workspace.clone();
-                cx.spawn(async move |cx| {
-                    for _ in 0..100 {
-                        let started = workspace
-                            .update_in(cx, |workspace, window, cx| {
-                                let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
-                                    return false;
-                                };
-                                panel.update(cx, |panel, cx| {
-                                    panel.new_thread_with_workspace(Some(workspace), window, cx)
-                                });
-                                workspace.focus_panel::<AgentPanel>(window, cx);
-                                true
-                            })
-                            .unwrap_or(true);
-                        if started {
-                            break;
-                        }
-                        cx.background_executor()
-                            .timer(Duration::from_millis(50))
-                            .await;
-                    }
-                })
-                .detach();
+                panel
+                    .update_in(cx, |panel, window, cx| {
+                        panel.cod_watch_for_fresh_chat(window, cx)
+                    })
+                    .ok();
             }
 
             Ok(panel)
@@ -1639,6 +1624,8 @@ impl AgentPanel {
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
+            cod_fresh_chat_pending: false,
+            _cod_fresh_chat_subscription: None,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -3014,6 +3001,45 @@ impl AgentPanel {
 
     fn has_open_project(&self, cx: &App) -> bool {
         self.project.read(cx).visible_worktrees(cx).next().is_some()
+    }
+
+    /// Cod (#28): starts the fresh chat of a new workspace now if its project has a folder, else
+    /// as soon as the first folder is added. Zed's agent panel holds chats only for a project
+    /// with a folder, and a new workspace opens without folders (#24).
+    fn cod_watch_for_fresh_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cod_fresh_chat_pending = true;
+        if self.cod_start_fresh_chat(window, cx) {
+            return;
+        }
+        let project = self.project.clone();
+        self._cod_fresh_chat_subscription = Some(cx.subscribe_in(
+            &project,
+            window,
+            |this, _project, event: &project::Event, window, cx| match event {
+                project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeOrderChanged
+                | project::Event::WorktreePathsChanged { .. } => {
+                    this.cod_start_fresh_chat(window, cx);
+                }
+                _ => {}
+            },
+        ));
+    }
+
+    /// Cod (#28): opens the pending fresh chat of the selected agent without moving the focus.
+    /// Returns false while the project has no folder yet.
+    fn cod_start_fresh_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.cod_fresh_chat_pending {
+            return true;
+        }
+        if !self.has_open_project(cx) {
+            return false;
+        }
+        self.cod_fresh_chat_pending = false;
+        self._cod_fresh_chat_subscription = None;
+        self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+        cx.notify();
+        true
     }
 
     fn ensure_native_agent_connection(&self, cx: &mut Context<Self>) {
