@@ -214,7 +214,11 @@ class PagesTest(CodTestCase):
         with self.step("make workspace B and switch to it"):
             self.run_command(NEW_WORKSPACE)
             state = self.wait_for(
-                lambda state: state["workspace_count"] == 2 and state["active_workspace"] == 1 and state["tabs"] == [],
+                # drawn_tabs reads the last drawn frame, which can still be A's for one frame after the switch (as in test_24's new_workspace).
+                lambda state: state["workspace_count"] == 2
+                and state["active_workspace"] == 1
+                and state["tabs"] == []
+                and state["drawn_tabs"] == [],
                 SHOW_TIMEOUT,
                 "workspace B to show",
             )
