@@ -471,12 +471,20 @@ async fn split_pane(
 }
 
 /// Focuses the pane, which makes it the active pane of its workspace.
+///
+/// `window.focus` alone only queues the raw GPUI focus change: `Pane::focus_in` (and so
+/// `Workspace::active_pane`) only runs once a frame draws with the window counted as active
+/// ("activated" by the platform, which tracks real keyboard focus and stays false for a window
+/// nothing has put real input focus on, as in a driven end-to-end run). Emitting the pane's own
+/// `Focus` event tells the workspace directly, the same way `close_pane` below already emits
+/// `Remove` for its own bookkeeping, so `pane list` reports the new active pane right away.
 async fn focus_pane(reference: Option<&str>, pane: u64, cx: &mut AsyncApp) -> Result<Value> {
     let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
     let pane = cx.update(|cx| find_pane(&workspace, pane, cx))?;
     window.update(cx, |_, window, cx| {
         let handle = pane.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        pane.update(cx, |_, cx| cx.emit(workspace::pane::Event::Focus));
     })?;
     Ok(json!({ "id": pane_id(&pane) }))
 }
