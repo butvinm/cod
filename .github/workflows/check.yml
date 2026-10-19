@@ -191,14 +191,21 @@ jobs:
           finished=$(date +%s)
           echo "check finished at $(date -u '+%H:%M:%S')"
           echo "cargo check took $((finished - started)) s"
-          echo "units checked or compiled: $(grep -a -c -E '(Checking|Compiling) ' check.log || true)"
-          echo "crates downloaded: $(grep -a -c -E 'Downloaded ' check.log || true)"
+          # Cargo colors the verb, so the escape code sits between the verb and the crate name.
+          echo "units checked: $(grep -a -c 'Checking' check.log || true)"
+          echo "units compiled (build scripts, proc macros and their dependencies): $(grep -a -c 'Compiling' check.log || true)"
+          echo "crates downloaded: $(grep -a -c 'Downloaded' check.log || true)"
 
       - name: Measure the build state
         if: steps.changes.outputs.code == 'true' && env.SAVE == 'true'
         id: size
         run: |
           git rev-parse HEAD > target/.cache-commit
+          echo "Largest folders of target before pruning:"
+          du -h --max-depth=3 target | sort -h | tail -n 15
+          # The first cold run measured target at 8.9 GiB, far over the budget. The incremental state of the workspace crates is not saved:
+          # without it a changed crate is checked from scratch, which costs seconds, while storing and restoring it costs gigabytes.
+          rm -rf target/debug/incremental
           du -sh target ~/.cargo/registry/index ~/.cargo/registry/cache ~/.cargo/git/db 2>/dev/null || true
           kib=$(du -sk target | cut -f 1)
           echo "target: $((kib / 1024)) MiB"
