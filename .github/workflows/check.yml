@@ -150,6 +150,7 @@ jobs:
 
       # A fresh checkout gives every file the current time, which would make cargo recheck every workspace crate.
       # Every tracked file and folder gets one fixed old time; then the files changed since the commit the restored state was built from get the current time.
+      # An added or deleted path also changes its ancestor directories' entries, so every surviving ancestor up to the repo root gets the current time too; a build script that watches a directory (rerun-if-changed on a folder) would otherwise miss a deletion under it.
       # Without a known commit (cold run, or the commit cannot be fetched) every tracked file gets the current time.
       - name: Fix file times
         if: steps.changes.outputs.code == 'true'
@@ -180,13 +181,44 @@ jobs:
           fi
           if [ -n "$base" ] && changed=$(git diff --name-only --no-renames -z "$base" HEAD | tr '\0' '\n'); then
             count=0
-            while IFS= read -r file; do
-              if [ -n "$file" ] && [ -e "$file" ]; then
+            dirs=0
+            declare -A touched_dirs
+            # "--name-status -z" separates the status and the path with NUL, not a tab, so read the two
+            # NUL-terminated fields of each record in turn rather than splitting one line on a tab.
+            while IFS= read -r -d '' status && IFS= read -r -d '' file; do
+              if [ -z "$file" ]; then
+                continue
+              fi
+              if [ -e "$file" ]; then
                 touch -c -h "$file"
                 count=$((count + 1))
               fi
-            done <<< "$changed"
+              # An added or deleted path changes the directory entries of every ancestor up to the repo
+              # root; a modified file's content does not. A deleted path's own directory may be gone too,
+              # so walk up and touch every ancestor that still exists instead of only the nearest one.
+              case "$status" in
+                A | D)
+                  dir=$(dirname -- "$file")
+                  while :; do
+                    if [ -z "${touched_dirs[$dir]:-}" ] && [ -d "$dir" ]; then
+                      touch -c "$dir"
+                      touched_dirs[$dir]=1
+                      dirs=$((dirs + 1))
+                    fi
+                    if [ "$dir" = "." ]; then
+                      break
+                    fi
+                    parent=$(dirname -- "$dir")
+                    if [ "$parent" = "$dir" ]; then
+                      break
+                    fi
+                    dir=$parent
+                  done
+                  ;;
+              esac
+            done < <(git diff --name-status --no-renames -z "$base" HEAD)
             echo "Files changed since $base: $count"
+            echo "Ancestor directories touched for added/deleted paths: $dirs"
             printf '%s\n' "$changed" | head -n 50 || true
           elif [ -z "${{ steps.restore.outputs.cache-matched-key }}" ]; then
             # Nothing restored: keep the fixed time, so the saved fingerprints record it. Cargo stores the newest file time of a package whose build script names no inputs and reruns that script when the value differs.
