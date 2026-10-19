@@ -49,6 +49,16 @@ PREDECESSOR_SHA256 = {
 # A GPUI example image (a test fixture of the upstream UI framework, never shipped in Cod).
 PREDECESSOR_ALLOWED = {"crates/gpui/examples/image/app-icon.png"}
 
+# Source files that show the app identity. Each must embed the app icon raster and not the predecessor logo vector.
+IDENTITY_SOURCES = {
+    "crates/zed/src/zed.rs": ['include_bytes!("../resources/app-icon.png")'],
+    "crates/workspace/src/welcome.rs": [
+        'include_bytes!("../../zed/resources/app-icon.png")',
+        "img(cod_app_icon())",
+    ],
+    "crates/onboarding/src/onboarding.rs": ["img(cod_app_icon())"],
+}
+
 
 def png_outputs():
     """Maps each derived PNG path to its pixel size."""
@@ -184,6 +194,15 @@ def check(root):
     if stale:
         fail("predecessor icons remain: " + ", ".join(stale))
     print(f"ok  no predecessor icon among {len(tracked)} tracked files (allowed: {', '.join(sorted(PREDECESSOR_ALLOWED))})")
+    for path, needles in IDENTITY_SOURCES.items():
+        with open(os.path.join(root, path), encoding="utf-8") as f:
+            source = f.read()
+        if "VectorName::ZedLogo" in source:
+            fail(f"{path} still shows the predecessor logo (VectorName::ZedLogo)")
+        for needle in needles:
+            if needle not in source:
+                fail(f"{path} does not show the app icon (missing {needle!r})")
+        print(f"ok  {path} shows the app icon ({', '.join(needles)})")
 
 
 def contact_sheet(root, out):
