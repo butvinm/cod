@@ -171,6 +171,57 @@ jobs:
           cmp "$RUNNER_TEMP/seed-icon" "$icon"
           find "$home" | sort | diff "$RUNNER_TEMP/before-icon.txt" -
 
+      # A symlink at a path the installer writes must never lead it to write through the link into another file.
+      - name: Refuse to write through a symlink and never use a predictable temporary file
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          # (a) On an update, 48x48/apps/cod.png is a symlink to a foreign file: the installer refuses and leaves the link and its target byte-identical.
+          home="$RUNNER_TEMP/link-home"
+          mkdir -p "$home"
+          env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > /dev/null
+          grep -qx 'X-Cod-Launcher=true' "$home/.local/share/applications/dev.zed.Zed.desktop"
+          foreign="$RUNNER_TEMP/foreign-icon.png"
+          echo "a foreign file behind a symlink" > "$foreign"
+          cp "$foreign" "$RUNNER_TEMP/seed-foreign-icon"
+          icon="$home/.local/share/icons/hicolor/48x48/apps/cod.png"
+          rm "$icon"
+          ln -s "$foreign" "$icon"
+          cp "$home/.local/share/applications/dev.zed.Zed.desktop" "$RUNNER_TEMP/seed-cod.desktop"
+          find "$home" | sort > "$RUNNER_TEMP/before-link.txt"
+          if env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" > out/refuse-symlink-icon.txt 2>&1; then
+            cat out/refuse-symlink-icon.txt
+            echo "install-launcher.sh wrote through a symlinked icon" >&2
+            exit 1
+          fi
+          cat out/refuse-symlink-icon.txt
+          grep -q 'is a symbolic link' out/refuse-symlink-icon.txt
+          test -L "$icon"
+          test "$(readlink "$icon")" = "$foreign"
+          cmp "$RUNNER_TEMP/seed-foreign-icon" "$foreign"
+          cmp "$RUNNER_TEMP/seed-cod.desktop" "$home/.local/share/applications/dev.zed.Zed.desktop"
+          find "$home" | sort | diff "$RUNNER_TEMP/before-link.txt" -
+          # (b) A symlink at the old predictable temporary path points to a foreign launcher: that file stays byte-identical.
+          home="$RUNNER_TEMP/tmp-home"
+          apps="$home/.local/share/applications"
+          mkdir -p "$apps"
+          foreign="$RUNNER_TEMP/foreign.desktop"
+          {
+            echo "[Desktop Entry]"
+            echo "Type=Application"
+            echo "Name=Foreign"
+            echo "Exec=/usr/bin/true"
+          } > "$foreign"
+          cp "$foreign" "$RUNNER_TEMP/seed-foreign.desktop"
+          ln -s "$foreign" "$apps/.dev.zed.Zed.desktop.tmp"
+          env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh" 2>&1 | tee out/install-with-tmp-link.txt
+          cmp "$RUNNER_TEMP/seed-foreign.desktop" "$foreign"
+          test -L "$apps/.dev.zed.Zed.desktop.tmp"
+          test "$(readlink "$apps/.dev.zed.Zed.desktop.tmp")" = "$foreign"
+          test ! -L "$apps/dev.zed.Zed.desktop"
+          grep -qx 'X-Cod-Launcher=true' "$apps/dev.zed.Zed.desktop"
+          # No temporary file is left behind.
+          test -z "$(find "$home" -name '.*.??????' -print)"
+
       - name: Record where the app uses the icons
         run: |
           {
