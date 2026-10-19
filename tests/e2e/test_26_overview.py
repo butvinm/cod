@@ -204,14 +204,15 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
             self.expect_equal("rows", [OPS_NAME, "Codex: plan Postgres 17 upgrade"], titles(state))
             self.expect_equal("first row selected", 0, overview(state)["selected_index"])
 
-        with self.step("type tax tests instead: the session stays under PAY-1234"):
+        # "add tax", not "tax tests": the fuzzy match also finds t-a-x and t-e-s-t-s in the MR page's "gitlab.example.com/billing/-/merge_requests/42".
+        with self.step("type add tax instead: the session stays under PAY-1234"):
             self.keys(" ".join(["backspace"] * len("postgres")))
-            self.type("tax tests")
-            state = self.wait_for(lambda state: is_open(state) and overview(state)["query"] == "tax tests", SHOW_TIMEOUT, "the query")
+            self.type("add tax")
+            state = self.wait_for(lambda state: is_open(state) and overview(state)["query"] == "add tax", SHOW_TIMEOUT, "the query")
             self.expect_equal("rows", [PAY_NAME, "Claude: add tax tests"], titles(state))
 
         with self.step("backspace widens the filter again: every row is back"):
-            self.keys(" ".join(["backspace"] * len("tax tests")))
+            self.keys(" ".join(["backspace"] * len("add tax")))
             state = self.wait_for(lambda state: is_open(state) and overview(state)["query"] == "", SHOW_TIMEOUT, "an empty query")
             self.expect_equal("rows", [title for _, title, _, _ in EXPECTED_ROWS], titles(state))
 
