@@ -15,11 +15,11 @@ A selection that runs no test fails with status 5 and says so, so a typo never l
 
 The default run and the required `e2e` job run every `test_*.py`, which are all local tests. The remote (SSH) tests need the remote server binary, which takes long to build, so they live outside the `test_*.py` pattern: the basic SSH set in `remote_24.py` (open an SSH project at start, edit and save a file there, and remote plus local workspaces coming back after a restart) and the multi-workspace lifecycle cases in `remote_tracking_24.py`. Run them with `script/e2e remote_24` and `script/e2e remote_tracking_24` (see `COD_E2E_REMOTE_SERVER` and `COD_E2E_SSH_USER` in `script/e2e`), or start the optional workflow "E2E remote (optional)" (`.github/workflows/e2e-remote.yml`) by hand; it also runs on every push to master, never on pull requests, and its tracking step never fails the run.
 
-`script/e2e` is the same command CI runs. It builds Cod (`cargo build --profile release-fast -p zed -p cod_browser`), puts `cod`, `cod-browser` and `cod-wayland.sh` into `target/e2e-run/cod/` like the release tarball, starts its own headless sway (no window appears on your desktop) and runs `python3 -m unittest` over this folder. It exits with the test status.
+`script/e2e` is the same command CI runs. It builds Cod (`cargo build --profile release-fast -p zed -p cod_browser -p codctl`), puts `cod`, `cod-browser`, `codctl` and `cod-wayland.sh` into `target/e2e-run/cod/` like the release tarball, starts its own headless sway (no window appears on your desktop) and runs `python3 -m unittest` over this folder. It exits with the test status.
 
 Optional environment:
 
-- `COD_E2E_BIN`: a prebuilt `zed` binary with `cod-browser` next to it. Skips the build.
+- `COD_E2E_BIN`: a prebuilt `zed` binary with `cod-browser` and `codctl` next to it. Skips the build.
 - `COD_CEF_DIR`: the folder with `libcef.so`. By default `script/e2e` looks in `$CEF_PATH/<CEF_VERSION>/cef_linux_x86_64` (the version is read from `.github/workflows/linux-release.yml`), then in the cargo build folder, then in the preview data folder `~/.local/share/cod-preview/cef-<CEF_VERSION>`.
 - `COD_E2E_ARTIFACTS`: where the tests save screenshots and logs. Default `target/e2e-artifacts`.
 
@@ -41,7 +41,7 @@ The build dependencies of Cod (`script/linux`), plus:
 
 ### Run with a prebuilt binary
 
-A machine without the Rust toolchain can run the tests against a `zed` binary with `cod-browser` next to it, for example the `target/release-fast/` folder of a build made elsewhere with `cargo build --profile release-fast -p zed -p cod_browser`. These steps start from a clean Ubuntu 24.04 with this repo checked out, and run from the repo root.
+A machine without the Rust toolchain can run the tests against a `zed` binary with `cod-browser` and `codctl` next to it, for example the `target/release-fast/` folder of a build made elsewhere with `cargo build --profile release-fast -p zed -p cod_browser -p codctl`. These steps start from a clean Ubuntu 24.04 with this repo checked out, and run from the repo root.
 
 1. Install the runtime libraries and the tools:
 
@@ -147,3 +147,14 @@ Cod started with `COD_E2E_SOCKET=<path>` listens on that Unix socket. Each reque
 - Errors reply `{"ok":false,"error":"..."}`.
 
 The unit tests of the library are in `unit/` and need no running Cod: `python3 -m unittest discover -s tests/e2e -t tests/e2e -p 'test_cod_e2e.py'`.
+
+## codctl
+
+`test_37_codctl.py` runs the shipped `codctl` from the run folder as a separate process, with the test's HOME and without the caller's `COD_WORKSPACE` and `COD_SOCKET`, so it reaches the Cod of the test the way a user's shell does.
+
+| What                   | Where                                                                                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `codctl` binary        | `target/e2e-run/cod/codctl`, next to `cod`; `COD_E2E_RUN_DIR` names the folder                                                                                                                          |
+| Command socket         | `$XDG_RUNTIME_DIR/cod/codctl.sock`, the private runtime folder of the run; tests run one after the other and `stop()` waits until the Cod of a test is gone, so the next Cod replaces its stale socket |
+| `COD_WORKSPACE`        | set by Cod in every terminal of a workspace to the workspace ID; codctl uses it when a command names no workspace                                                                                       |
+| Commands under test    | `workspace new`, `list`, `focus`, `rename`, `close`, `add-folder`                                                                                                                                      |
