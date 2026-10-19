@@ -614,6 +614,9 @@ impl MultiWorkspace {
         if self.cod_materializing {
             // Another member is loading: wait for it, then load or show this one by its id.
             // Success is never reported for a member that was not shown.
+            // Cod (#25 review): the window's active workspace right now, so that waking up does
+            // not switch to this one's workspace if a newer activation ran while it waited.
+            let activation_intent = self.active_workspace_id.get();
             let (done_tx, done_rx) = futures::channel::oneshot::channel();
             self.cod_materialize_waiters.push(done_tx);
             return cx.spawn_in(window, async move |this, cx| {
@@ -629,7 +632,9 @@ impl MultiWorkspace {
                         .find(|workspace| workspace.read(cx).database_id() == Some(id));
                     match loaded {
                         Some(workspace) => {
-                            if *this.workspace() != workspace {
+                            if this.active_workspace_id.get() == activation_intent
+                                && *this.workspace() != workspace
+                            {
                                 this.activate(workspace, None, window, cx);
                             }
                             Task::ready(Ok(()))
