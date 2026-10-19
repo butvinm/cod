@@ -1562,15 +1562,16 @@ impl SerializableItem for Editor {
                 mtime,
             };
             log::debug!("Serializing editor {item_id:?} in workspace {workspace_id:?}");
-            db.save_serialized_editor(item_id, workspace_id, editor)
-                .await
-                .context("failed to save serialized editor")?;
-            if let Some(db_selections) = db_selections {
-                db.save_editor_selections(item_id, workspace_id, db_selections)
-                    .await
-                    .context("failed to save editor selections")?;
-            }
-            Ok(())
+            // Cod (#24): one transaction for the record and its selections, so a kill never
+            // leaves the record without its cursor.
+            db.cod_save_serialized_editor_with_selections(
+                item_id,
+                workspace_id,
+                editor,
+                db_selections,
+            )
+            .await
+            .context("failed to save serialized editor")
         }))
     }
 
