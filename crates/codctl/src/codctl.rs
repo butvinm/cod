@@ -63,7 +63,8 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 /// One request to Cod.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Only `PartialEq`, not `Eq`: `SessionWait`'s `timeout` is an `f64` (#39 AC4).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Make a workspace in the window, with an optional name and folders. It takes focus only with `focus`.
     WorkspaceNew {
@@ -648,7 +649,8 @@ Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace
 ";
 
 /// What the command line asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Only `PartialEq`, not `Eq`: `Request::SessionWait`'s `timeout` is an `f64` (#39 AC4).
+#[derive(Debug, Clone, PartialEq)]
 pub enum Cli {
     /// Print the help text.
     Help,
