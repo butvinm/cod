@@ -6,6 +6,8 @@
 //! Issue #16 adds a second Linux backend, chosen with `COD_WEBVIEW_BACKEND=offscreen`: an off-screen browser (CEF, in the `cod-browser` helper process) whose frames GPUI paints as images, which works on native Wayland.
 
 #[cfg(target_os = "linux")]
+mod agent_bridge;
+#[cfg(target_os = "linux")]
 mod browser_client;
 #[cfg(target_os = "linux")]
 mod linux;

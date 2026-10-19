@@ -1,6 +1,6 @@
 //! Read-only state of page tabs for the end-to-end tests of #31 and #32, under the `pages` key of the driver's state.
 //!
-//! `open` lists every open page tab of the window: its page ID, URL, title, whether it is loading, its state (`loading`, `loaded` or `failed`), its kind, the index of its workspace (as in `workspaces`), the index of its pane in layout order (as in `panes`), whether it is its pane's active tab, whether it is hidden, whether its browser was started, and whether it holds the keyboard focus.
+//! `open` lists every open page tab of the window: its page ID, URL, title, whether it is loading, its state (`loading`, `loaded` or `failed`), its kind, the index of its workspace (as in `workspaces`), the index of its pane in layout order (as in `panes`), whether it is its pane's active tab, whether it is hidden, whether its browser was started, whether it holds the keyboard focus, and its drawn pixel bounds in the window (`bounds`, #43: for a test that clicks inside the page's own HTML content).
 //! `saved` lists the saved page rows (page ID and URL), including those of workspaces not loaded yet.
 //! `prompt` is the "web: open url" prompt: its text and its error, or null while it is closed.
 
@@ -50,6 +50,7 @@ pub(crate) fn state(multi: &MultiWorkspace, window: &Window, cx: &App) -> Value 
                 }
                 None => (None, None, false),
             };
+            let bounds = page.pane_bounds();
             json!({
                 "id": page.page_id().to_string(),
                 "url": page.current_url(),
@@ -63,6 +64,14 @@ pub(crate) fn state(multi: &MultiWorkspace, window: &Window, cx: &App) -> Value 
                 "hidden": page.is_hidden(),
                 "browser_started": page.browser_started(),
                 "focused": page.focus_handle(cx).contains_focused(window, cx),
+                // The page's drawn pixel bounds in the window (#43): lets a test compute a real
+                // mouse click point inside its own, deterministically laid out HTML content.
+                "bounds": {
+                    "left": f32::from(bounds.origin.x),
+                    "top": f32::from(bounds.origin.y),
+                    "width": f32::from(bounds.size.width),
+                    "height": f32::from(bounds.size.height),
+                },
             })
         })
         .collect();

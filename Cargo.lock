@@ -21620,6 +21620,7 @@ name = "web_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2 0.6.2",
  "command_palette",
  "db",
@@ -21641,7 +21642,10 @@ dependencies = [
  "paths",
  "project",
  "serde_json",
+ "settings",
  "smallvec",
+ "theme",
+ "theme_settings",
  "ui",
  "url",
  "util",

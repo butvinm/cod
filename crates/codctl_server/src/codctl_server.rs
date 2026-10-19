@@ -8,6 +8,7 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+mod cod_agent_pages;
 mod cod_sessions;
 
 use std::path::{Path, PathBuf};
@@ -117,6 +118,9 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
             pane,
         } => open_file(workspace.as_deref(), path, line, column, pane, cx).await,
         Request::OpenPage { workspace, url } => open_page(workspace.as_deref(), url, cx).await,
+        Request::OpenAgentPage { workspace, html, wait, js } => {
+            cod_agent_pages::open_agent_page(workspace.as_deref(), html, wait, js, cx).await
+        }
         Request::Diff {
             workspace,
             old,
@@ -825,6 +829,7 @@ async fn close_page(page: String, cx: &mut AsyncApp) -> Result<Value> {
 fn files_of(request: &Request) -> Vec<&PathBuf> {
     match request {
         Request::Open { path, .. } => vec![path],
+        Request::OpenAgentPage { html, .. } => vec![html],
         Request::Diff { old, new, .. } => vec![old, new],
         _ => Vec::new(),
     }

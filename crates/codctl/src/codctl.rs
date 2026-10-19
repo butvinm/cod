@@ -113,6 +113,15 @@ pub enum Request {
     },
     /// Opens a URL as a page tab (#31) in the active pane and returns its page ID.
     OpenPage { workspace: Option<String>, url: String },
+    /// Opens local HTML as an agent-made page tab (#43): prints its page ID and exits at once,
+    /// unless `wait`, which instead waits for the page to be submitted or its tab closed.
+    /// `js` lets the page's own inline scripts run.
+    OpenAgentPage {
+        workspace: Option<String>,
+        html: PathBuf,
+        wait: bool,
+        js: bool,
+    },
     /// Show Zed's diff view of two files in a tab.
     Diff {
         workspace: Option<String>,
@@ -188,6 +197,7 @@ impl Request {
             Request::PaneResize { .. } => "pane.resize",
             Request::Open { .. } => "open",
             Request::OpenPage { .. } => "open",
+            Request::OpenAgentPage { .. } => "open",
             Request::Diff { .. } => "diff",
             Request::DiffRevisions { .. } => "diff",
             Request::PageGet { .. } => "page.get",
@@ -250,6 +260,12 @@ impl Request {
                 "pane": pane,
             }),
             Request::OpenPage { workspace, url } => json!({ "workspace": workspace, "url": url }),
+            Request::OpenAgentPage { workspace, html, wait, js } => json!({
+                "workspace": workspace,
+                "html": html.to_string_lossy(),
+                "wait": wait,
+                "js": js,
+            }),
             Request::Diff {
                 workspace,
                 old,
@@ -465,12 +481,18 @@ pub fn parse_request_line(line: &str) -> Result<Envelope, (Value, String)> {
                     .ok_or_else(|| fail("size must be a whole percentage from 1 to 99".to_owned()))?
             },
         },
-        "open" => match args.get("url") {
-            Some(_) => Request::OpenPage {
+        "open" => match (args.get("html"), args.get("url")) {
+            (Some(_), _) => Request::OpenAgentPage {
+                workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+                html: arg_file(args, "html").map_err(&fail)?,
+                wait: arg_bool(args, "wait").map_err(&fail)?,
+                js: arg_bool(args, "js").map_err(&fail)?,
+            },
+            (None, Some(_)) => Request::OpenPage {
                 workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
                 url: arg_string(args, "url").map_err(&fail)?,
             },
-            None => Request::Open {
+            (None, None) => Request::Open {
                 workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
                 path: arg_file(args, "path").map_err(&fail)?,
                 line: arg_position(args, "line").map_err(&fail)?,
@@ -607,6 +629,10 @@ Pane, file and diff commands:
       Open the file in the active pane (or the pane), with the cursor at the line and column.
   open <url>
       Open the URL as a page tab in the active pane and print its page ID, such as page-3.
+  open --html <file> [--wait] [--js]
+      Open the local HTML file as an agent-made page tab and print its page ID, at once.
+      --wait instead waits for the page to be submitted (prints the value and exits 0) or its
+      tab closed instead (exits 2); --js lets the page's own inline scripts run.
   diff <old file> <new file>
       Show the diff of two files in a tab.
   diff <old revision> <new revision>
@@ -666,6 +692,8 @@ struct Options {
     force: bool,
     right: bool,
     down: bool,
+    wait: bool,
+    js: bool,
     name: Option<String>,
     folders: Vec<String>,
     workspace: Option<String>,
@@ -675,6 +703,7 @@ struct Options {
     until: Option<String>,
     timeout: Option<String>,
     line: Option<String>,
+    html: Option<String>,
     seen: Vec<&'static str>,
     positionals: Vec<String>,
 }
@@ -722,6 +751,21 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--down" => {
                 options.down = true;
                 "--down"
+            }
+            "--wait" => {
+                options.wait = true;
+                "--wait"
+            }
+            "--js" => {
+                options.js = true;
+                "--js"
+            }
+            "--html" => {
+                if options.html.is_some() {
+                    return Err("--html is given twice".to_owned());
+                }
+                options.html = Some(take_value("--html", &mut rest)?);
+                "--html"
             }
             "--pane" => {
                 if options.pane.is_some() {
@@ -1017,7 +1061,7 @@ fn parse_layout_cli(
         "pane list" | "pane focus" | "pane close" | "diff" => &["--json", "--workspace"],
         "pane split" => &["--json", "--workspace", "--right", "--down"],
         "pane resize" => &["--json", "--workspace", "--size"],
-        "open" => &["--json", "--workspace", "--pane"],
+        "open" => &["--json", "--workspace", "--pane", "--html", "--wait", "--js"],
         "page get" | "page reload" | "page back" | "page forward" | "page close" => &["--json"],
         _ => return Err(format!("unknown command {command}: run codctl --help")),
     };
@@ -1075,6 +1119,23 @@ fn parse_layout_cli(
                 pane: pane_id(pane)?,
                 size: parse_size_percent(size)?,
             }
+        }
+        "open" if options.html.is_some() => {
+            if !positionals.is_empty() {
+                return Err(takes("--html <file>, which takes no other positional argument"));
+            }
+            if options.pane.is_some() {
+                return Err(takes("--html <file>, which does not take --pane"));
+            }
+            Request::OpenAgentPage {
+                workspace,
+                html: absolute_folder(options.html.as_deref().unwrap_or_default(), env, cwd)?,
+                wait: options.wait,
+                js: options.js,
+            }
+        }
+        "open" if options.wait || options.js => {
+            return Err(takes("--wait or --js only together with --html"));
         }
         "open" => {
             let [target] = positionals else {
@@ -1394,6 +1455,21 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
             let state = result.get("state").and_then(Value::as_str).unwrap_or("-");
             let line = result.get("line").and_then(Value::as_str).unwrap_or("");
             (format!("{state}\t{line}\n"), EXIT_OK)
+        }
+        Request::OpenAgentPage { .. } => {
+            if json {
+                return (format!("{result}\n"), EXIT_OK);
+            }
+            // `--wait`: the page was submitted (prints the value) or its tab was closed instead
+            // (prints nothing; EXIT_KEPT is reused for the "closed instead" exit code, 2, #43 AC2).
+            if let Some(value) = result.get("value").and_then(Value::as_str) {
+                return (format!("{value}\n"), EXIT_OK);
+            }
+            if result.get("closed").and_then(Value::as_bool) == Some(true) {
+                return (String::new(), EXIT_KEPT);
+            }
+            let id = result.get("id").and_then(Value::as_str).unwrap_or_default();
+            (format!("{id}\n"), EXIT_OK)
         }
     }
 }
@@ -1740,6 +1816,78 @@ mod tests {
                 &json!({"id": "page-3"}),
             ),
             ("page-3\n".to_owned(), EXIT_OK)
+        );
+    }
+
+    #[test]
+    fn open_html_as_an_agent_page() {
+        let none: &[(&str, &str)] = &[];
+        assert_eq!(
+            parse(&["open", "--html", "ask.html"], none),
+            run(
+                Request::OpenAgentPage {
+                    workspace: None,
+                    html: PathBuf::from("/cwd/ask.html"),
+                    wait: false,
+                    js: false,
+                },
+                false
+            )
+        );
+        assert_eq!(
+            parse(&["open", "--html", "/tmp/ask.html", "--wait", "--js"], none),
+            run(
+                Request::OpenAgentPage {
+                    workspace: None,
+                    html: PathBuf::from("/tmp/ask.html"),
+                    wait: true,
+                    js: true,
+                },
+                false
+            )
+        );
+        assert!(parse(&["open", "--html", "ask.html", "ask.html"], none).is_err());
+        assert!(parse(&["open", "--html", "ask.html", "--pane", "7"], none).is_err());
+        assert!(parse(&["open", "a.rs", "--wait"], none).is_err());
+        assert!(parse(&["open", "http://example.com", "--js"], none).is_err());
+
+        let line = Request::OpenAgentPage {
+            workspace: Some("1".to_owned()),
+            html: PathBuf::from("/tmp/ask.html"),
+            wait: true,
+            js: false,
+        }
+        .to_line(1);
+        assert_eq!(
+            parse_request_line(&line),
+            Ok(Envelope {
+                id: json!(1),
+                request: Request::OpenAgentPage {
+                    workspace: Some("1".to_owned()),
+                    html: PathBuf::from("/tmp/ask.html"),
+                    wait: true,
+                    js: false,
+                },
+            })
+        );
+
+        let request = Request::OpenAgentPage {
+            workspace: None,
+            html: PathBuf::from("/tmp/ask.html"),
+            wait: false,
+            js: false,
+        };
+        assert_eq!(
+            render(&request, false, &json!({"id": "page-5"})),
+            ("page-5\n".to_owned(), EXIT_OK)
+        );
+        assert_eq!(
+            render(&request, false, &json!({"id": "page-5", "value": "half-even"})),
+            ("half-even\n".to_owned(), EXIT_OK)
+        );
+        assert_eq!(
+            render(&request, false, &json!({"id": "page-5", "closed": true})),
+            (String::new(), EXIT_KEPT)
         );
     }
 
