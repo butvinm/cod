@@ -128,6 +128,7 @@ By default Cod runs with `ZED_STATELESS=1`: Zed keeps its database in memory and
 | `prompt`            | `{"message", "detail", "answers", "highlighted"}` while a prompt is shown in the window, else null: message and detail as Zed passes them (Markdown source, so a file name is in backticks), the answer labels, and the index of the highlighted answer                                              |
 | `chat`              | `{"agent", "session_id", "title", "transcript", "reply_focused", "focused_link"}` for the active chat of the active workspace's agent panel, else null: the agent id (for example `claude-acp`), the provider's own session id, the thread title or null, the transcript as Markdown, whether an agent reply holds the focus, and `{"text", "url"}` of the reply's focused link or null |
 | `agent_panel_ready` | true once the agent panel has loaded and its commands (`agent: toggle focus`) are in the palette; Zed loads the panel a moment after the window |
+| `agent_panel_focused` | true when the keyboard focus is inside the active workspace's agent panel |
 
 The driver reads the palette, the prompt and the project panel through small read-only getters added to those crates for the tests (`CommandPaletteDelegate::highlighted_command_name` and `listed_query`, `ZedPromptRenderer::message`, `detail`, `answers` and `highlighted_answer`, `ProjectPanel::listed_entries`). A pane counts as drawn when its own element is in the dispatch tree of the last frame.
 

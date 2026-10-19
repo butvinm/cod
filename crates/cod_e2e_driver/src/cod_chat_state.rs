@@ -3,7 +3,7 @@
 //! It reads `AgentPanel::cod_chat_snapshot`, a read-only getter added to agent_ui for this driver.
 
 use agent_ui::AgentPanel;
-use gpui::{App, Window};
+use gpui::{App, Focusable as _, Window};
 use serde_json::{Value, json};
 use workspace::Workspace;
 
@@ -11,6 +11,13 @@ use workspace::Workspace;
 pub(crate) fn agent_panel_ready(window: &Window, cx: &App) -> bool {
     cx.build_action("agent::ToggleFocus", None)
         .is_ok_and(|action| window.is_action_available(action.as_ref(), cx))
+}
+
+/// Whether the keyboard focus is inside the agent panel of the workspace.
+pub(crate) fn agent_panel_focused(workspace: &Workspace, window: &Window, cx: &App) -> bool {
+    workspace
+        .panel::<AgentPanel>(cx)
+        .is_some_and(|panel| panel.read(cx).focus_handle(cx).contains_focused(window, cx))
 }
 
 /// `{"agent", "session_id", "title", "transcript", "reply_focused", "focused_link"}` for the active chat of the workspace's agent panel, or null when the panel shows no chat.

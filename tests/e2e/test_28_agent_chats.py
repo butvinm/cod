@@ -176,10 +176,12 @@ class WorkspaceChatsTest(CodTestCase):
         self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
         self.run_command("agent: toggle focus")
         self.run_command("agent: toggle new thread menu")
+        # A chat that was already open (for example the fresh chat of a new workspace) is not the new one.
+        known = [*other_sessions, *self.provider_sessions(), chat(self.state()).get("session_id")]
         # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
         self.keys("up up enter")
         self.wait_for(
-            lambda state: chat(state).get("agent") == AGENT_ID and chat(state).get("session_id") not in [None, "", *other_sessions],
+            lambda state: chat(state).get("agent") == AGENT_ID and chat(state).get("session_id") not in [None, "", *known],
             30,
             "a new chat with the fake agent",
         )
@@ -190,7 +192,60 @@ class WorkspaceChatsTest(CodTestCase):
 
     def provider_sessions(self) -> list[str]:
         """The session ids the fake agent itself made, from its state file."""
-        return sorted(json.loads((self.workdir / "agent-state.json").read_text())["sessions"])
+        path = self.workdir / "agent-state.json"
+        return sorted(json.loads(path.read_text())["sessions"]) if path.exists() else []
+
+    def start_fake_agent_cod(self, persistent: bool) -> Any:
+        """Creates billing-api and the agent script with two scripted replies, starts Cod on billing-api with the fake agent and returns the repo."""
+        repo = self.make_repo("billing-api", BILLING_API)
+        script = self.workdir / "agent-script.json"
+        script.write_text(
+            json.dumps(
+                {
+                    "session_ids": [PAY_SESSION, LEDGER_SESSION],
+                    "turns": [
+                        {"steps": [{"chunk": PAY_REPLY}, {"end": "end_turn"}]},
+                        {"steps": [{"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
+                    ],
+                }
+            )
+        )
+        agent_servers = {
+            AGENT_ID: fake_agent_settings(script, state=self.workdir / "agent-state.json", log=self.workdir / "agent.log")
+        }
+        self.start_cod(repo, persistent=persistent, extra_settings={"agent_servers": agent_servers})
+        self.wait_for(
+            lambda state: [real(path) for path in state["worktrees"]] == [real(repo)],
+            30,
+            "the billing-api folder to open",
+        )
+        return repo
+
+    def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
+        with self.step("start Cod on billing-api with the fake agent"):
+            self.start_fake_agent_cod(persistent=False)
+
+        with self.step("workspace A: chat with the fake agent, which makes it the default agent"):
+            a_session = self.start_chat("Where does the rounding happen?", PAY_REPLY, [])
+
+        with self.step(f"run {NEW_WORKSPACE!r}: the new workspace shows a fresh chat of the default agent with the focus in it"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] != before["active_workspace"]
+                and state["agent_panel_focused"] is True
+                and chat(state).get("agent") == AGENT_ID
+                and chat(state).get("session_id") not in [None, "", a_session],
+                30,
+                "a fresh chat of the fake agent in the new workspace, with the focus",
+            )
+            self.expect_equal("fresh chat is empty", False, PAY_REPLY in chat(state).get("transcript", ""))
+
+        with self.step("type a prompt right away and press enter: the fresh chat sends it"):
+            self.type("What does the ledger export read?")
+            self.keys("enter")
+            self.wait_for(lambda state: LEDGER_REPLY in chat(state).get("transcript", ""), 30, "the scripted reply in the fresh chat")
 
     def add_folder(self, folder: os.PathLike[str]) -> None:
         """Adds the folder to the active workspace with Zed's "add folder to project" and Zed's own path picker, as in test_24."""
@@ -213,31 +268,8 @@ class WorkspaceChatsTest(CodTestCase):
         )
 
     def test_ac1_ac4_two_workspaces_on_the_same_folder_keep_their_own_chat_across_a_restart(self) -> None:
-        with self.step("create the fixture repo billing-api and the agent script with two provider session ids"):
-            repo = self.make_repo("billing-api", BILLING_API)
-            script = self.workdir / "agent-script.json"
-            script.write_text(
-                json.dumps(
-                    {
-                        "session_ids": [PAY_SESSION, LEDGER_SESSION],
-                        "turns": [
-                            {"steps": [{"chunk": PAY_REPLY}, {"end": "end_turn"}]},
-                            {"steps": [{"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
-                        ],
-                    }
-                )
-            )
-            agent_servers = {
-                AGENT_ID: fake_agent_settings(script, state=self.workdir / "agent-state.json", log=self.workdir / "agent.log")
-            }
-
-        with self.step("start Cod on billing-api, keeping its session"):
-            self.start_cod(repo, persistent=True, extra_settings={"agent_servers": agent_servers})
-            self.wait_for(
-                lambda state: [real(path) for path in state["worktrees"]] == [real(repo)],
-                30,
-                "the billing-api folder to open",
-            )
+        with self.step("start Cod on billing-api with the fake agent, keeping its session"):
+            repo = self.start_fake_agent_cod(persistent=True)
 
         with self.step("workspace A: start a chat with the fake agent and wait for its reply"):
             a_index = self.state()["active_workspace"]
