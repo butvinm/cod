@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import loopback_ssh
-from cod_e2e import Cod, CodTestCase, cod_command, cod_environment
+from cod_e2e import Cod, CodTestCase, DriverError, cod_command, cod_environment
 
 NEW_WORKSPACE = "workspace: new workspace"
 RENAME_WORKSPACE = "workspace: rename workspace"
@@ -1398,6 +1398,88 @@ class WorkspacesTest(CodTestCase):
             self.switch_workspace(NEXT_WORKSPACE, c_index, "workspace C", c_expected)
             state = self.wait_for_title(DOCS_NAME)
             self.expect_equal("workspaces", before, workspace_list(state))
+
+    def quit_as_soon_as_a_window_is_up(self) -> None:
+        """Quits with ctrl-q right after the driver first reads a workspace window, while the restore of its workspaces is still under way."""
+        assert self.cod is not None
+        self.cod.connect()
+        deadline = time.monotonic() + RESTORE_TIMEOUT
+        while True:
+            try:
+                self.state()
+                break
+            except DriverError as error:
+                if time.monotonic() >= deadline:
+                    raise AssertionError(f"no workspace window within {RESTORE_TIMEOUT:g} s after the start: {error}") from error
+            time.sleep(0.02)
+        self.cod.quit()
+
+    def test_ac5_workspaces_come_back_after_a_folder_start_is_interrupted_while_it_restores_them(self) -> None:
+        """Two saved local workspaces A and B in one window come back as that one window, each once with its name, after Cod was started with a folder argument and quit (ctrl-q) or killed (SIGKILL) while it was still restoring A. Review 13 finding 1: the folder start restored windows without their saved identity, so a quit then split one window into two."""
+        with self.step("create the fixture repos billing-api and docs-site"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            docs_site = self.make_repo("docs-site", DOCS_SITE)
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for_worktrees([billing_api])
+
+        with self.step(f"workspace A on billing-api: open invoice.rs and rename it to {PAY_NAME!r}"):
+            self.open_file("invoice.rs")
+            self.rename_workspace(PAY_NAME)
+            a_index = self.state()["active_workspace"]
+
+        with self.step(f"workspace B: new workspace on docs-site, open README.md and rename it to {DOCS_NAME!r}"):
+            self.new_workspace()
+            self.add_folder(docs_site)
+            self.open_file("README.md")
+            self.rename_workspace(DOCS_NAME)
+            b_index = self.state()["active_workspace"]
+            if b_index == a_index:
+                raise AssertionError(f"expected workspace B at another index than A ({a_index}), actual {b_index}")
+
+        with self.step(f"make A the active workspace with {PREVIOUS_WORKSPACE!r}, so A is the one a start restores first"):
+            self.run_command(PREVIOUS_WORKSPACE)
+            state = self.wait_for(lambda state: state["active_workspace"] == a_index and state["modal"] is None, SHOW_TIMEOUT, "workspace A active")
+            before = workspace_list(state)
+            self.expect_equal(
+                "workspaces",
+                sorted([{"name": PAY_NAME, "worktrees": [real(billing_api)]}, {"name": DOCS_NAME, "worktrees": [real(docs_site)]}], key=str),
+                sorted(before, key=str),
+            )
+
+        def one_window_with_a_and_b(state: dict[str, Any]) -> dict[str, Any]:
+            return {"window_count": state["window_count"], "workspace_count": state["workspace_count"], "workspaces": workspace_list(state)}
+
+        expected = {"window_count": 1, "workspace_count": 2, "workspaces": before}
+
+        with self.step("quit with ctrl-q and start again plainly once, so the window and its two workspaces are saved"):
+            self.restart_cod()
+            self.wait_for_values("the restored window", expected, one_window_with_a_and_b, RESTORE_TIMEOUT)
+
+        with self.step("quit with ctrl-q"):
+            assert self.cod is not None
+            self.cod.quit()
+
+        for attempt in range(1, 4):
+            with self.step(f"start Cod with the folder argument billing-api and quit with ctrl-q as soon as its window is up, while A still restores (attempt {attempt})"):
+                assert self.cod is not None
+                self.cod.folder = billing_api
+                self.cod.start()
+                self.quit_as_soon_as_a_window_is_up()
+
+        for delay in KILL_DELAYS:
+            with self.step(f"start Cod with the folder argument billing-api and kill it with SIGKILL {delay:g} s after the launch"):
+                assert self.cod is not None
+                self.cod.folder = billing_api
+                self.cod.start()
+                time.sleep(delay)
+                self.kill_cod()
+
+        with self.step("start Cod plainly: exactly one window with A and B, each once, names kept"):
+            self.start_cod_again()
+            state = self.wait_for_values("the restored window", expected, one_window_with_a_and_b, RESTORE_TIMEOUT)
+            self.stays(lambda state: one_window_with_a_and_b(state) == expected, SETTLE_TIME, "one window with A and B")
 
     # Moving a named workspace to a new window (review new minor)
 
