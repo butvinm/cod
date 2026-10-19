@@ -735,6 +735,7 @@ fn main() {
         image_viewer::init(cx);
         web_view::init(cx);
         cod_e2e_driver::init(cx);
+        codctl_server::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 

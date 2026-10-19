@@ -88,6 +88,7 @@ cli.workspace = true
 client.workspace = true
 clock = { workspace = true, optional = true }
 cod_e2e_driver.workspace = true
+codctl_server.workspace = true
 codestral.workspace = true
 collab_ui.workspace = true
 collections.workspace = true
