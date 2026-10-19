@@ -32,6 +32,15 @@ PAGES: dict[str, tuple[str, str]] = {
         "Billing wiki - Home",
         "<h1>Billing wiki</h1><p>How the invented billing-api service issues invoices.</p>",
     ),
+    # Story #43 AC5: the same data-cod markup as an agent-made page, but served from a URL, so it
+    # never becomes an agent-made page and gets no bridge: clicking inside it must do nothing.
+    "/agent-like/ask": (
+        "External ask page",
+        '<h1 id="heading">External ask page</h1>'
+        '<a data-cod="open-file" data-cod-path="src/invoice.rs:18" '
+        'style="display:block;position:absolute;top:0;left:0;width:100%;height:100%;">'
+        "Open invoice.rs</a>",
+    ),
 }
 
 
