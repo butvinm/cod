@@ -182,7 +182,7 @@ pub fn open_html(
 #[cfg(target_os = "linux")]
 pub async fn wait_for_submit(page: &str, cx: &mut AsyncApp) -> Result<SubmitOutcome> {
     let id = crate::pages::PageId(page.to_owned().into());
-    let receiver = cx.update(|cx| crate::agent_bridge::wait_for_submit(id, cx))?;
+    let receiver = cx.update(|cx| crate::agent_bridge::wait_for_submit(id, cx));
     match receiver.await {
         Ok(crate::agent_bridge::SubmitOutcome::Submitted(value)) => Ok(SubmitOutcome::Submitted(value)),
         Ok(crate::agent_bridge::SubmitOutcome::Closed) => Ok(SubmitOutcome::Closed),

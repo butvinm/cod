@@ -10,7 +10,7 @@
 //! URL, so the page never gets file-system access of its own and a navigation away from it loses
 //! the bridge (it only ever existed in that one document).
 
-use gpui::{App, AppContext as _, Global};
+use gpui::{App, Global};
 use serde_json::Value;
 
 use crate::pages::PageId;
@@ -108,6 +108,7 @@ impl ThemeVars {
 
 /// Reads the colors and font the running Cod shows now, as `ThemeVars`.
 pub fn current_theme_vars(cx: &App) -> ThemeVars {
+    use settings::Settings as _;
     use theme::ActiveTheme as _;
 
     let colors = cx.theme().colors();
