@@ -20,6 +20,7 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 mod cod_chat_state;
+mod cod_markdown_preview_state;
 mod cod_overview_state;
 mod cod_tabs_state;
 
@@ -117,8 +118,9 @@ pub enum Request {
     Type(Vec<Keystroke>),
     /// Read what the window shows.
     State,
-    /// A left click at a window position (#25, see `cod_tabs_state`).
-    Click { x: f32, y: f32 },
+    /// A left click at a window position, with the control key held when `ctrl` is set (#25, see
+    /// `cod_tabs_state`; the control modifier was added for #32 AC3's Ctrl-click on a URL).
+    Click { x: f32, y: f32, ctrl: bool },
     /// The test fixture that sets a session or page status (#25, see `cod_tabs_state`).
     SetEntry(cod_tabs_state::SetEntry),
 }
@@ -129,7 +131,12 @@ enum WireRequest {
     Keys { keys: String },
     Type { text: String },
     State,
-    Click { x: f32, y: f32 },
+    Click {
+        x: f32,
+        y: f32,
+        #[serde(default)]
+        ctrl: bool,
+    },
     SetEntry(cod_tabs_state::SetEntry),
 }
 
@@ -141,9 +148,9 @@ pub fn parse_request(line: &str) -> Result<Request> {
         WireRequest::Keys { keys } => Request::Keys(parse_keys(&keys)?),
         WireRequest::Type { text } => Request::Type(typed_keystrokes(&text)?),
         WireRequest::State => Request::State,
-        WireRequest::Click { x, y } => {
+        WireRequest::Click { x, y, ctrl } => {
             cod_tabs_state::check_click(x, y)?;
-            Request::Click { x, y }
+            Request::Click { x, y, ctrl }
         }
         WireRequest::SetEntry(entry) => {
             cod_tabs_state::check_set_entry(&entry)?;
@@ -399,7 +406,9 @@ async fn run(
             }
             Ok(None)
         }
-        Request::Click { x, y } => cod_tabs_state::click(x, y, memory, cx).await.map(|()| None),
+        Request::Click { x, y, ctrl } => {
+            cod_tabs_state::click(x, y, ctrl, memory, cx).await.map(|()| None)
+        }
         Request::SetEntry(entry) => cod_tabs_state::set_entry(entry, memory, cx).map(|()| None),
         Request::State => {
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
@@ -718,6 +727,16 @@ fn read_state(
         let point = editor.selections.newest_anchor().head().to_point(&snapshot);
         json!({ "row": point.row + 1, "column": point.column + 1 })
     });
+    // Where the active pane's cursor was last drawn, in window pixels (#32 AC3): the end-to-end
+    // driver's Ctrl-click target for a URL in a code comment. The test moves the cursor there with
+    // the keyboard first (as "editor: open url" already does), then reads this field instead of
+    // computing text layout itself; `Pane::pixel_position_of_cursor` already exists for pane-split
+    // navigation (`pane_group.rs`), so this adds no new editor code.
+    let cursor_pixel_position = workspace
+        .active_pane()
+        .read(cx)
+        .pixel_position_of_cursor(cx)
+        .map(|point| json!({ "x": f32::from(point.x), "y": f32::from(point.y) }));
 
     // The command palette: its query, how many rows it lists, which row is highlighted, the query those rows belong to, and the command on the highlighted row.
     let palette_open = workspace
@@ -819,6 +838,7 @@ fn read_state(
         "panes": panes_json,
         "split": split,
         "cursor": cursor,
+        "cursor_pixel_position": cursor_pixel_position,
         "dirty_tabs": dirty_tabs,
         "unsaved_texts": unsaved_texts,
         "drawn_tabs": drawn_tabs,
@@ -838,6 +858,7 @@ fn read_state(
     state["overview"] = cod_overview_state::overview_state(workspace, window, cx);
     state["pages"] = cod_pages_state::state(multi_workspace, window, cx);
     state["chat"] = cod_chat_state::chat_state(workspace, window, cx);
+    state["markdown_preview"] = cod_markdown_preview_state::state(workspace, cx);
     state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
     state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
     Ok(state)
@@ -1164,6 +1185,18 @@ mod tests {
             ])
         );
         assert_eq!(parse_request(r#"{"cmd":"state"}"#).unwrap(), Request::State);
+    }
+
+    #[test]
+    fn click_defaults_ctrl_to_false() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"click","x":12.5,"y":4}"#).unwrap(),
+            Request::Click { x: 12.5, y: 4., ctrl: false }
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"click","x":12.5,"y":4,"ctrl":true}"#).unwrap(),
+            Request::Click { x: 12.5, y: 4., ctrl: true }
+        );
     }
 
     #[test]

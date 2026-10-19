@@ -86,7 +86,9 @@ pub(crate) fn member_status(member: &CodMember, cx: &App) -> &'static str {
         .name()
 }
 
-fn bounds_json(bounds: Option<Bounds<Pixels>>) -> Value {
+/// `{"x", "y", "width", "height"}` of a window rectangle, or null before it was drawn (shared with
+/// `cod_markdown_preview_state`, the other place that reports a `Bounds<Pixels>` to the driver).
+pub(crate) fn bounds_json(bounds: Option<Bounds<Pixels>>) -> Value {
     match bounds {
         Some(bounds) => json!({
             "x": f32::from(bounds.origin.x),
@@ -134,38 +136,55 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
     })
 }
 
-/// Moves the mouse to the position, then presses and releases the left button there.
+/// The extra settle time before a Ctrl-click's mouse down, on top of `CLICK_PAUSE`: a real Ctrl-click
+/// hovers with the modifier held before pressing, which lets the editor's hover-link lookup
+/// (`Editor::update_hovered_link`, an async task) finish and cache the link under the mouse before the
+/// down event arrives, the same as a person moving the mouse before clicking (#32 AC3).
+const CTRL_HOVER_SETTLE: Duration = Duration::from_millis(250);
+
+/// Moves the mouse to the position, then presses and releases the left button there, holding the
+/// control key for all three events when `ctrl` is set (#32 AC3: Ctrl-click a URL in a code comment).
 #[cfg(unix)]
 pub(crate) async fn click(
     x: f32,
     y: f32,
+    ctrl: bool,
     memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let position = point(px(x), px(y));
+    let modifiers = Modifiers {
+        control: ctrl,
+        ..Modifiers::default()
+    };
     let events = [
         PlatformInput::MouseMove(MouseMoveEvent {
             position,
             pressed_button: None,
-            modifiers: Modifiers::default(),
+            modifiers,
         }),
         PlatformInput::MouseDown(MouseDownEvent {
             button: MouseButton::Left,
             position,
-            modifiers: Modifiers::default(),
+            modifiers,
             click_count: 1,
             first_mouse: false,
         }),
         PlatformInput::MouseUp(MouseUpEvent {
             button: MouseButton::Left,
             position,
-            modifiers: Modifiers::default(),
+            modifiers,
             click_count: 1,
         }),
     ];
     for (index, event) in events.into_iter().enumerate() {
         if index > 0 {
-            cx.background_executor().timer(CLICK_PAUSE).await;
+            let pause = if ctrl && index == 1 {
+                CTRL_HOVER_SETTLE
+            } else {
+                CLICK_PAUSE
+            };
+            cx.background_executor().timer(pause).await;
         }
         let window = cx
             .update(|cx| super::workspace_window(cx, &memory.borrow()))
