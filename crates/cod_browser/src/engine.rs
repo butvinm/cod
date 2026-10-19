@@ -214,6 +214,30 @@ wrap_load_handler! {
             let state = &self.handler.state;
             state.update_meta(|meta| meta.loading = Some(is_loading != 0));
         }
+
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            // Only the page itself counts: a broken frame inside it is not a failed page. An aborted load is a navigation the user or the page replaced.
+            if error_code == Errorcode::ABORTED || frame.is_none_or(|frame| frame.is_main() != 1)
+            {
+                return;
+            }
+            let state = &self.handler.state;
+            let url = failed_url
+                .map(|url| limited(&url.to_string(), MAX_URL_BYTES))
+                .unwrap_or_default();
+            let error = error_text
+                .map(|text| limited(&text.to_string(), MAX_CONSOLE_BYTES))
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "the page could not be loaded".to_owned());
+            state.send(FromBrowser::LoadFailed { page: state.id, url, error });
+        }
     }
 }
 
@@ -272,6 +296,33 @@ wrap_life_span_handler! {
     }
 
     impl LifeSpanHandler {
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: ::std::os::raw::c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: ::std::os::raw::c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut ::std::os::raw::c_int>,
+        ) -> ::std::os::raw::c_int {
+            // No browser windows of its own: the helper cancels every popup and Cod opens the URL like a link.
+            let state = &self.handler.state;
+            if let Some(url) = target_url {
+                let url = limited(&url.to_string(), MAX_URL_BYTES);
+                if !url.is_empty() {
+                    state.send(FromBrowser::PopupRequested { page: state.id, url });
+                }
+            }
+            1
+        }
+
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser else { return };
             let state = &self.handler.state;
@@ -546,7 +597,8 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         | ToBrowser::MouseButton { page, .. }
         | ToBrowser::Wheel { page, .. }
         | ToBrowser::Key { page, .. }
-        | ToBrowser::Close { page } => *page,
+        | ToBrowser::Close { page }
+        | ToBrowser::Navigate { page, .. } => *page,
     };
     let Some(state) = pages.lock().ok().and_then(|table| table.get(&page).cloned()) else {
         return;
@@ -663,6 +715,19 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         ToBrowser::Close { .. } => {
             state.close_requested.store(true, Ordering::Release);
             state.with_host(|host| host.close_browser(1));
+        }
+        ToBrowser::Navigate { action, .. } => {
+            let Ok(slot) = state.browser.lock() else {
+                return;
+            };
+            let Some(handle) = slot.as_ref() else {
+                return;
+            };
+            match action {
+                protocol::NAVIGATE_BACK => handle.0.go_back(),
+                protocol::NAVIGATE_FORWARD => handle.0.go_forward(),
+                _ => handle.0.reload(),
+            }
         }
     }
 }

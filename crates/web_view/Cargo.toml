@@ -14,19 +14,24 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+db.workspace = true
+# The "web: open url" prompt is a one-line editor.
+editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+menu.workspace = true
+project.workspace = true
 serde_json.workspace = true
 ui.workspace = true
+url.workspace = true
 util.workspace = true
 workspace.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
-# The spike driver checks the editor buffer and which modal opened.
+# The spike driver checks which modal opened.
 command_palette.workspace = true
-editor.workspace = true
 file_finder.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [

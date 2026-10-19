@@ -10,6 +10,7 @@
 //! - A failed request replies `{"ok":false,"error":"..."}`.
 //!
 //! Keys enter the window the way the Linux platform layer delivers them: `Window::dispatch_event` with `PlatformInput::KeyDown` and `KeyUp`, and when the key down is not handled and carries text, the window's text input receives that text (`Window::dispatch_keystroke` does both).
+//! A keystroke with modifiers is wrapped in `PlatformInput::ModifiersChanged`: the modifiers go down before the key and up after it, so views that act when the modifiers are released (the ctrl-tab switcher) finish as they do for a user.
 //! So the keymap, the focus and the text input behave as they do for a user. The driver never dispatches actions and never calls into views; `state` only reads what the window shows.
 //! Keys go to the window the platform names active. Without a keyboard (the headless sway of the tests has none) the platform names none; then keys go to the newest open workspace window, the one the compositor focuses.
 //! The socket is served on background threads. Every request is handed to one foreground task through a channel, so the GPUI thread never waits for a client.
@@ -40,6 +41,8 @@ use ui_prompt::ZedPromptRenderer;
 use workspace::{
     CodMember, ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
 };
+
+mod cod_pages_state;
 
 /// The environment variable that names the driver socket.
 pub const SOCKET_ENV: &str = "COD_E2E_SOCKET";
@@ -440,12 +443,22 @@ fn workspace_window(cx: &App, memory: &Memory) -> Option<WindowHandle<MultiWorks
 /// Presses one key: key down, then key up, as the platform layer delivers them.
 #[cfg(unix)]
 fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) -> Result<()> {
-    use gpui::{KeyDownEvent, KeyUpEvent, PlatformInput};
+    use gpui::{Capslock, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, PlatformInput};
 
     let window = cx
         .update(|cx| workspace_window(cx, &memory.borrow()))
         .context("Cod has no workspace window")?;
     cx.update_window(window.into(), |_, window, cx| {
+        let modified = keystroke.modifiers.modified();
+        if modified {
+            window.dispatch_event(
+                PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers: keystroke.modifiers,
+                    capslock: Capslock::default(),
+                }),
+                cx,
+            );
+        }
         // The Linux platform layer gives unhandled text keys without modifiers other than shift to the text input.
         let types_text = keystroke.key_char.is_some()
             && keystroke.modifiers.is_subset_of(&Modifiers::shift());
@@ -462,6 +475,15 @@ fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) 
             );
         }
         window.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke }), cx);
+        if modified {
+            window.dispatch_event(
+                PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers: Modifiers::none(),
+                    capslock: Capslock::default(),
+                }),
+                cx,
+            );
+        }
     })
     .context("the workspace window closed")
 }
@@ -813,6 +835,7 @@ fn read_state(
     });
     // Set outside `json!` to keep the macro's recursion short.
     state["overview"] = cod_overview_state::overview_state(workspace, window, cx);
+    state["pages"] = cod_pages_state::state(multi_workspace, window, cx);
     Ok(state)
 }
 

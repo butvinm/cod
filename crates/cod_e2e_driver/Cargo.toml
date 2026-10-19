@@ -29,6 +29,7 @@ serde_json.workspace = true
 settings.workspace = true
 title_bar.workspace = true
 ui_prompt.workspace = true
+web_view.workspace = true
 workspace.workspace = true
 workspace_overview.workspace = true
 

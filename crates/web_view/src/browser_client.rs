@@ -40,6 +40,10 @@ pub(crate) enum PageEvent {
     Closed,
     /// The helper died or was cut off: the page is gone and will not paint again.
     Failed(String),
+    /// The main frame could not load a URL; the view stays usable.
+    LoadFailed { url: String, error: String },
+    /// The page wanted a new window for this URL; the helper cancelled it.
+    PopupRequested(String),
 }
 
 /// Console messages kept per page between two looks by the UI; later ones are counted and dropped.
@@ -351,6 +355,20 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
                     slot.record(|diagnostics| diagnostics.loading = Some(loading));
                 }
             }
+            FromBrowser::LoadFailed { page, url, error } => {
+                if let Some(slot) = slot(page) {
+                    slot.events
+                        .unbounded_send(PageEvent::LoadFailed { url, error })
+                        .ok();
+                }
+            }
+            FromBrowser::PopupRequested { page, url } => {
+                if let Some(slot) = slot(page) {
+                    slot.events
+                        .unbounded_send(PageEvent::PopupRequested(url))
+                        .ok();
+                }
+            }
             FromBrowser::Console { page, message } => {
                 if let Some(slot) = slot(page) {
                     slot.record(|diagnostics| {
@@ -622,6 +640,14 @@ impl Page {
             code,
             character,
             modifiers,
+        });
+    }
+
+    /// Back, forward or reload: one of `protocol::NAVIGATE_*`.
+    pub fn navigate(&self, action: u8) {
+        self.client.send(&ToBrowser::Navigate {
+            page: self.id,
+            action,
         });
     }
 

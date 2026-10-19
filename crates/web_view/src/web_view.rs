@@ -13,6 +13,13 @@ mod linux;
 mod offscreen;
 #[cfg(target_os = "linux")]
 mod offscreen_driver;
+#[cfg(target_os = "linux")]
+mod open_page_modal;
+#[cfg(target_os = "linux")]
+mod page_db;
+pub mod page_url;
+#[cfg(target_os = "linux")]
+pub mod pages;
 #[cfg(target_os = "macos")]
 mod spike_driver;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -20,6 +27,19 @@ mod web_view_item;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use web_view_item::*;
+
+#[cfg(target_os = "linux")]
+pub use offscreen::{OffscreenView, PageItemEvent, PageState, open_or_focus_page};
+#[cfg(target_os = "linux")]
+pub use open_page_modal::OpenPageModal;
+
+gpui::actions!(
+    web,
+    [
+        /// Asks for a URL and opens it as a page tab in the active pane.
+        OpenUrl,
+    ]
+);
 
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux")),
