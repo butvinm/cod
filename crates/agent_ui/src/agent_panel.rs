@@ -158,6 +158,9 @@ pub struct CodChatTab {
     pub thread_id: ThreadId,
     /// The provider's own session id of the chat.
     pub session_id: String,
+    /// The chat's raw agent id (for example `claude`), as `codctl session list` reports it
+    /// (Cod #39 AC2), unlike `title` below, which is a display label.
+    pub agent_id: String,
     /// The agent's label, then the thread's own title (`cod_chat_status::cod_chat_title`).
     pub title: String,
     pub status: crate::cod_chat_status::CodChatStatus,
@@ -4418,6 +4421,7 @@ impl AgentPanel {
                 Some(CodChatTab {
                     thread_id,
                     session_id: thread.session_id().0.to_string(),
+                    agent_id: view.read(cx).agent_key().id().0.to_string(),
                     title: crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref()),
                     status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
                     active: Some(thread_id) == active_id,
@@ -4497,15 +4501,26 @@ impl AgentPanel {
         let title = crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref());
         let session_id = thread.session_id().0.to_string();
         let thread_id = view.read(cx).thread_id;
+        // An operator's status line (`codctl session status --line`, Cod #39 AC5) overrides the
+        // chat's own status words until it is changed or cleared.
+        let context = crate::cod_sessions::line_override(&session_id, cx)
+            .unwrap_or_else(|| SharedString::from(status.cod_context()));
         Some(CodEntry {
             key: SharedString::from(session_id),
             kind: CodEntryKind::Session,
             title: SharedString::from(title),
             status: status.cod_status(),
-            context: SharedString::from(status.cod_context()),
+            context,
             updated_at: std::time::SystemTime::now(),
             open: Some(self.cod_entry_open(thread_id)),
         })
+    }
+
+    /// Re-publishes this panel's chat statuses right away, for `codctl session status --line`
+    /// (Cod #39 AC5), which must show its change in the overview at once rather than wait for the
+    /// next status-changing event.
+    pub(crate) fn cod_republish_chat_statuses(&self, cx: &mut App) {
+        self.cod_publish_chat_statuses(cx);
     }
 
     /// Publishes every chat of this panel (the active one and every retained one) into its

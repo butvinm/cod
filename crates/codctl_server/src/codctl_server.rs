@@ -8,6 +8,8 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+mod cod_sessions;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -130,6 +132,19 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
         Request::PageBack { page } => back_page(page, cx).await,
         Request::PageForward { page } => forward_page(page, cx).await,
         Request::PageClose { page } => close_page(page, cx).await,
+        Request::SessionNew {
+            workspace,
+            agent,
+            pane: _,
+        } => cod_sessions::new_session(workspace.as_deref(), agent, cx).await,
+        Request::SessionList { workspace } => cod_sessions::list_sessions(workspace.as_deref(), cx),
+        Request::SessionSend { session, text } => cod_sessions::send_message(session, text, cx).await,
+        Request::SessionWait {
+            session,
+            until,
+            timeout,
+        } => cod_sessions::wait_session(session, until, timeout, cx).await,
+        Request::SessionStatus { session, line } => cod_sessions::session_status(session, line, cx).await,
     }
 }
 

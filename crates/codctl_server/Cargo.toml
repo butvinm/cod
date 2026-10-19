@@ -14,6 +14,7 @@ path = "src/codctl_server.rs"
 doctest = false
 
 [dependencies]
+agent_ui.workspace = true
 anyhow.workspace = true
 codctl.workspace = true
 editor.workspace = true

@@ -6,6 +6,7 @@ mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
 pub mod cod_chat_status;
+pub mod cod_sessions;
 mod completion_provider;
 mod config_options;
 mod context;
