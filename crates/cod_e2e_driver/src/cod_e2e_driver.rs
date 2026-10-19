@@ -859,6 +859,7 @@ fn read_state(
     state["pages"] = cod_pages_state::state(multi_workspace, window, cx);
     state["chat"] = cod_chat_state::chat_state(workspace, window, cx);
     state["markdown_preview"] = cod_markdown_preview_state::state(workspace, cx);
+    state["chat_tabs"] = cod_chat_state::chat_tabs_state(workspace, cx);
     state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
     state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
     Ok(state)

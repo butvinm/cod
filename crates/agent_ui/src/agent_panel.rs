@@ -93,13 +93,14 @@ use terminal_view::TerminalView;
 use text::OffsetRangeExt;
 use theme_settings::ThemeSettings;
 use ui::{
-    ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
+    ContextMenu, ContextMenuEntry, GradientFade, IconButton, Indicator, KeyBinding, PopoverMenu,
     PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
-    CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, PathList, SerializedPathList,
-    ToggleWorkspaceSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
+    CodEntry, CodEntryKind, CodEntryOpen, CodStatusStore, CollaboratorId, DraggedSelection,
+    DraggedTab, MultiWorkspace, PathList, SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom,
+    ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
 };
@@ -148,6 +149,20 @@ pub struct CodChatLinkBounds {
     pub url: String,
     /// `(x, y, width, height)` in window pixels, None before the reply painted.
     pub bounds: Option<(f32, f32, f32, f32)>,
+}
+
+/// One chat of this panel's workspace, shown as a tab in the panel header (Cod #28 AC1): the
+/// active chat and every chat the panel still holds in the background (`retained_threads`).
+#[derive(Debug, Clone)]
+pub struct CodChatTab {
+    pub thread_id: ThreadId,
+    /// The provider's own session id of the chat.
+    pub session_id: String,
+    /// The agent's label, then the thread's own title (`cod_chat_status::cod_chat_title`).
+    pub title: String,
+    pub status: crate::cod_chat_status::CodChatStatus,
+    /// Whether this is the chat the panel shows now.
+    pub active: bool,
 }
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
@@ -1417,6 +1432,11 @@ impl AgentPanel {
                 None
             };
 
+            // Captured before thread_to_restore moves into the closure below, so the background
+            // restore pass after it can still tell which chat not to resume a second time.
+            let active_thread_id_to_skip =
+                thread_to_restore.as_ref().map(|(_, thread_id)| *thread_id);
+
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, window, cx));
 
@@ -1502,6 +1522,64 @@ impl AgentPanel {
 
                 panel
             })?;
+
+            // create_agent_thread_inner (via cod_restore_background_chat below) always persists
+            // its agent as the global "last used agent", which is right for the active thread
+            // restored above but wrong for a background one; put back below once every
+            // background chat is resumed.
+            let original_selected_agent =
+                panel.read_with(cx, |panel, _cx| panel.selected_agent.clone());
+
+            // Cod (#28 AC4): every other chat this workspace held before quitting also comes
+            // back, not only the one just restored as active, each resumed in the background
+            // (`retained_threads`) by the provider's own session id, never a made-up one. The
+            // selected agent is left exactly as the restore above set it.
+            if has_open_project && let Some(workspace_id) = workspace_id {
+                match cx.update(|_window, cx| {
+                    ThreadMetadataStore::try_global(cx).map(|store| {
+                        let reload_task = store.read(cx).reload_task();
+                        (store, reload_task)
+                    })
+                }) {
+                    Ok(Some((store, reload_task))) => {
+                        reload_task.await;
+                        let sessions = store.read_with(cx, |store, cx| {
+                            store.cod_workspace_sessions(i64::from(workspace_id), cx)
+                        });
+                        if let Ok(session_ids) = sessions.await {
+                            for session_id in session_ids {
+                                let entry = store.read_with(cx, |store, _cx| {
+                                    store.entry_by_session(&session_id).cloned()
+                                });
+                                let Some(entry) = entry else {
+                                    continue;
+                                };
+                                if Some(entry.thread_id) == active_thread_id_to_skip
+                                    || entry.archived
+                                {
+                                    continue;
+                                }
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.cod_restore_background_chat(entry, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        log::warn!("failed to restore background chats: metadata store missing");
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "failed to access thread metadata store for background chats: {err}"
+                        );
+                    }
+                }
+            }
+            panel.update(cx, |panel, cx| {
+                panel.set_selected_agent_and_persist(original_selected_agent, cx);
+            });
 
             // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
             // the default agent in its agent panel, so opening the panel lands in it ready for
@@ -4312,6 +4390,153 @@ impl AgentPanel {
         })
     }
 
+    /// The label an agent shows in a chat tab, the panel header and the status contract: its
+    /// configured display name when it has one (`project::AgentServerStore`), else its own
+    /// label (for example the custom agent's id, or "Zed Agent").
+    fn cod_agent_label(&self, agent: &Agent, cx: &App) -> SharedString {
+        if let Agent::Custom { id, .. } = agent {
+            let store = self.project.read(cx).agent_server_store();
+            if let Some(name) = store.read(cx).agent_display_name(id) {
+                return name;
+            }
+        }
+        agent.label()
+    }
+
+    /// Every chat tab of this panel's workspace, read only, for the panel header (Cod #28 AC1)
+    /// and Cod's end-to-end driver: the active chat, then every chat the panel still holds in
+    /// the background, each with its own agent's label, its status and whether it is shown now.
+    pub fn cod_chat_tabs(&self, cx: &App) -> Vec<CodChatTab> {
+        let active_id = self.active_thread_id(cx);
+        self.conversation_views()
+            .into_iter()
+            .filter_map(|view| {
+                let thread = view.read(cx).root_thread(cx)?;
+                let thread = thread.read(cx);
+                let label = self.cod_agent_label(view.read(cx).agent_key(), cx);
+                let thread_id = view.read(cx).thread_id;
+                Some(CodChatTab {
+                    thread_id,
+                    session_id: thread.session_id().0.to_string(),
+                    title: crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref()),
+                    status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
+                    active: Some(thread_id) == active_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Resumes one chat this workspace held before quitting into the background
+    /// (`retained_threads`), as part of restoring every chat of the workspace, not only the one
+    /// that was active (Cod #28 AC4). Leaves the active chat, the focus and the selected agent
+    /// exactly as they were; does nothing when the chat is already in memory.
+    fn cod_restore_background_chat(
+        &mut self,
+        entry: crate::thread_metadata_store::ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.retained_threads.contains_key(&entry.thread_id) {
+            return;
+        }
+        let selected_agent = self.selected_agent.clone();
+        let agent: Agent = entry.agent_id.clone().into();
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(entry.thread_id),
+            Some(entry.folder_paths().clone()),
+            entry.title(),
+            None,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        self.retained_threads
+            .insert(entry.thread_id, thread.conversation_view);
+        self.selected_agent = selected_agent;
+    }
+
+    /// Shows this chat in the panel, promoting it from the background when it is only
+    /// retained there (`activate_retained_thread`), and focuses it. Used to switch tabs and as
+    /// the overview's open callback (Cod #28 AC1, #26 AC6).
+    fn cod_focus_chat(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_thread_id(cx) == Some(thread_id) {
+            self.activation_focus_handle(cx).focus(window, cx);
+            return;
+        }
+        self.activate_retained_thread(thread_id, true, window, cx);
+    }
+
+    /// The callback a `CodEntry` of this chat runs when the overview opens it (Cod #26 AC6):
+    /// focuses this panel's workspace (already shown by the overview by then) and this chat.
+    fn cod_entry_open(&self, thread_id: ThreadId) -> CodEntryOpen {
+        let workspace = self.workspace.clone();
+        Rc::new(move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.focus_panel::<AgentPanel>(window, cx);
+                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                    panel.update(cx, |panel, cx| panel.cod_focus_chat(thread_id, window, cx));
+                }
+            });
+        })
+    }
+
+    /// The `CodEntry` of one chat, for the status contract (Cod #28 AC3): its title, status and
+    /// context from `cod_chat_status`, keyed by the provider's own session id, with an open
+    /// callback that focuses it.
+    fn cod_chat_entry(&self, view: &Entity<ConversationView>, cx: &App) -> Option<CodEntry> {
+        let thread = view.read(cx).root_thread(cx)?;
+        let thread = thread.read(cx);
+        let status = crate::cod_chat_status::CodChatStatus::of_thread(thread);
+        let label = self.cod_agent_label(view.read(cx).agent_key(), cx);
+        let title = crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref());
+        let session_id = thread.session_id().0.to_string();
+        let thread_id = view.read(cx).thread_id;
+        Some(CodEntry {
+            key: SharedString::from(session_id),
+            kind: CodEntryKind::Session,
+            title: SharedString::from(title),
+            status: status.cod_status(),
+            context: SharedString::from(status.cod_context()),
+            updated_at: std::time::SystemTime::now(),
+            open: Some(self.cod_entry_open(thread_id)),
+        })
+    }
+
+    /// Publishes every chat of this panel (the active one and every retained one) into its
+    /// workspace's status store, so the chat tab dot, the workspace tab dot (#25) and the
+    /// overview row (#26) follow a chat's state (Cod #28 AC3). Called whenever a chat's status
+    /// or the active chat itself may have changed.
+    fn cod_publish_chat_statuses(&self, cx: &mut App) {
+        let Some(workspace_id) = self.workspace_id else {
+            return;
+        };
+        let views = self.conversation_views();
+        if views.is_empty() {
+            return;
+        }
+        let mut entries: Vec<CodEntry> = Vec::new();
+        for view in &views {
+            if let Some(entry) = self.cod_chat_entry(view, cx) {
+                entries.push(entry);
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        let store = CodStatusStore::global(cx);
+        store.update(cx, |store, cx| {
+            for entry in entries {
+                store.set_entry(workspace_id, entry, cx);
+            }
+        });
+    }
+
     pub fn is_retained_thread(&self, id: &ThreadId) -> bool {
         self.retained_threads.contains_key(id)
     }
@@ -4423,9 +4648,13 @@ impl AgentPanel {
                         | AcpThreadEvent::SubmissionUpdated(_)
                         | AcpThreadEvent::ToolAuthorizationReceived(_)
                         | AcpThreadEvent::ElicitationResponded(_)
-                ) && acp_thread.read(cx).is_idle_for_retention()
-                {
-                    this.cleanup_retained_threads(cx);
+                ) {
+                    // Cod (#28 AC3): a background chat's status also reaches the status
+                    // contract, within the same event that already redraws its own view.
+                    this.cod_publish_chat_statuses(cx);
+                    if acp_thread.read(cx).is_idle_for_retention() {
+                        this.cleanup_retained_threads(cx);
+                    }
                 }
             });
             subscription
@@ -4527,6 +4756,10 @@ impl AgentPanel {
                     this.observe_active_draft_for_empty_editor(&server_view, cx);
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
+                    // Cod (#28 AC3): the active chat's status reaches the status contract on
+                    // every redraw-worthy change of its own view (streaming, permissions, the
+                    // turn ending or failing), the same event this already serializes on.
+                    this.cod_publish_chat_statuses(cx);
                     cx.notify();
                 }))
             }
@@ -4557,6 +4790,9 @@ impl AgentPanel {
             }
         };
         self.serialize(cx);
+        // Cod (#28 AC3): a chat that just became active, or just started existing, shows up
+        // right away, not only on its first later status change.
+        self.cod_publish_chat_statuses(cx);
     }
 
     fn visible_surface(&self) -> VisibleSurface<'_> {
@@ -6023,6 +6259,48 @@ impl AgentPanel {
         })
     }
 
+    /// The panel's chat tabs (Cod #28 AC1): one per chat of this workspace, each with its name
+    /// and status dot, the active one highlighted. Clicking a tab switches to it. Empty (and
+    /// drawn as nothing) before the panel holds any chat.
+    fn render_cod_chat_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let tabs = self.cod_chat_tabs(cx);
+        let mut row = h_flex().id("cod-chat-tabs").w_full();
+        if tabs.is_empty() {
+            return row;
+        }
+        row = row
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant);
+        for (ix, tab) in tabs.into_iter().enumerate() {
+            let thread_id = tab.thread_id;
+            let mut item = h_flex()
+                .id(("cod-chat-tab", ix))
+                .gap_1()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .tooltip(Tooltip::text(tab.title.clone()))
+                .child(Label::new(tab.title.clone()).size(LabelSize::Small).truncate());
+            if tab.active {
+                item = item.bg(cx.theme().colors().element_selected);
+            } else {
+                item = item.hover(|style| style.bg(cx.theme().colors().element_hover));
+            }
+            if let Some(color) = tab.status.cod_status().color() {
+                item = item.child(div().flex_none().child(Indicator::dot().color(color)));
+            }
+            item = item.on_click(cx.listener(move |this, _event, window, cx| {
+                this.cod_focus_chat(thread_id, window, cx);
+            }));
+            row = row.child(item);
+        }
+        row
+    }
+
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
 
@@ -6731,6 +7009,7 @@ impl Render for AgentPanel {
                     })
                 }
             }))
+            .child(self.render_cod_chat_tabs(cx))
             .child(self.render_toolbar(window, cx))
             .children(self.render_new_user_onboarding(window, cx))
             .map(|parent| match self.visible_surface() {
