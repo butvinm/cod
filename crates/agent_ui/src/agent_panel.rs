@@ -111,7 +111,7 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 /// What the active chat of a panel shows (`AgentPanel::cod_chat_snapshot`), for Cod's end-to-end driver (Cod #28).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodChatSnapshot {
-    /// The id of the selected agent, for example `claude-acp`.
+    /// The id of the chat's agent, for example `claude-acp`.
     pub agent: String,
     /// The thread title, once there is one.
     pub title: Option<String>,
@@ -4178,8 +4178,12 @@ impl AgentPanel {
                 url: markdown.focused_link_url()?.to_string(),
             })
         });
+        let agent = self
+            .active_conversation_view()
+            .map(|conversation| conversation.read(cx).agent_key().id().0.to_string())
+            .unwrap_or_default();
         Some(CodChatSnapshot {
-            agent: self.selected_agent(cx).id().0.to_string(),
+            agent,
             title: thread.title().map(|title| title.to_string()),
             transcript: thread.to_markdown(cx),
             reply_focused: focused_markdown.is_some(),
