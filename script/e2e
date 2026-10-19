@@ -10,6 +10,7 @@
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
 #   COD_E2E_REMOTE_SERVER  the remote_server binary for the loopback SSH tests (cargo build --profile release-fast -p remote_server); default the one next to the zed binary when it exists.
 #                      Those tests run their own sshd on 127.0.0.1 as you, and copy the binary to ~/.zed_server/ in your passwd home. Without sshd or the binary they report skipped with the reason.
+#   COD_E2E_REQUIRE_SSH    1 (set in CI): the loopback SSH tests must run; a missing ssh, sshd or remote server binary, or an sshd that does not start, fails them instead of skipping.
 # Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
 set -euo pipefail
 
@@ -66,6 +67,9 @@ fi
 if [ -n "${COD_E2E_REMOTE_SERVER:-}" ]; then
     export COD_E2E_REMOTE_SERVER
     say "remote server for the loopback SSH tests: $COD_E2E_REMOTE_SERVER"
+elif [ "${COD_E2E_REQUIRE_SSH:-}" = 1 ]; then
+    say "COD_E2E_REQUIRE_SSH=1 but no remote server binary: set COD_E2E_REMOTE_SERVER (cargo build --profile release-fast -p remote_server)"
+    exit 2
 else
     say "no remote server binary: the loopback SSH tests will report skipped"
 fi

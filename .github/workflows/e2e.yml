@@ -148,10 +148,9 @@ jobs:
           echo "build finished at $(date -u '+%H:%M:%S')"
 
       # The remote server for the loopback SSH tests, so Cod never downloads one. A separate cargo command, so the zed build above keeps its own feature set and cache hits.
-      # A failure here does not stop the job: the remote tests then report skipped with the reason.
+      # A failure here fails the job: CI is never green without the loopback SSH tests.
       - name: Build the remote server for the loopback SSH tests
         if: steps.changes.outputs.code == 'true'
-        continue-on-error: true
         env:
           SCCACHE_GHA_ENABLED: "true"
           SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
@@ -169,7 +168,7 @@ jobs:
           path: ${{ env.CEF_PATH }}
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
-      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. COD_E2E_REMOTE_SERVER names the remote server built above for the loopback SSH tests; when it is missing they report skipped.
+      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. COD_E2E_REMOTE_SERVER names the remote server built above for the loopback SSH tests. COD_E2E_REQUIRE_SSH=1 makes script/e2e fail without that binary and makes every loopback SSH test fail, not skip, when ssh, sshd or the binary is missing or sshd does not start.
       - name: Run end-to-end tests
         if: steps.changes.outputs.code == 'true'
         env:
@@ -178,6 +177,7 @@ jobs:
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
           COD_E2E_REMOTE_SERVER: ${{ github.workspace }}/target/release-fast/remote_server
+          COD_E2E_REQUIRE_SSH: "1"
         run: script/e2e
 
       # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.

@@ -37,6 +37,11 @@ def remote_server_name() -> str:
     return f"zed-remote-server-{channel}-{match.group(1)}"
 
 
+def required() -> bool:
+    """Whether these tests must run (COD_E2E_REQUIRE_SSH=1, set in CI): then every reason they cannot run is a failure, not a skip."""
+    return os.environ.get("COD_E2E_REQUIRE_SSH") == "1"
+
+
 def missing_reason() -> str | None:
     """Why the loopback SSH tests cannot run here, or None when they can."""
     if shutil.which("ssh") is None:
@@ -178,6 +183,17 @@ class LoopbackSsh:
         source = Path(os.environ["COD_E2E_REMOTE_SERVER"])
         target = self.home / ".zed_server" / remote_server_name()
         target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
         shutil.copyfile(source, target)
+        target.chmod(0o755)
+        return target
+
+    def install_slow_remote_server(self, delay: float) -> Path:
+        """Puts a wrapper at the path Zed checks on the remote host that sleeps `delay` seconds on every run, then runs COD_E2E_REMOTE_SERVER, so the remote client stays in its startup while sshd is up. install_remote_server() puts the real binary back."""
+        source = Path(os.environ["COD_E2E_REMOTE_SERVER"]).resolve()
+        target = self.home / ".zed_server" / remote_server_name()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        target.write_text(f'#!/bin/sh\nsleep {delay:g}\nexec "{source}" "$@"\n')
         target.chmod(0o755)
         return target
