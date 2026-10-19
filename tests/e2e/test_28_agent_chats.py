@@ -92,6 +92,8 @@ class AgentChatLinksTest(CodTestCase):
             self.expect_equal("tabs", [], start["tabs"])
 
         with self.step("open the agent panel and start a chat with the fake agent from the new thread menu"):
+            # The agent commands join the palette once the panel has loaded, a moment after the window.
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
             self.run_command("agent: toggle focus")
             self.run_command("agent: toggle new thread menu")
             # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.

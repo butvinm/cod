@@ -7,6 +7,12 @@ use gpui::{App, Window};
 use serde_json::{Value, json};
 use workspace::Workspace;
 
+/// Whether the agent panel's commands are in the command palette: Zed registers `agent::ToggleFocus` only once the panel has loaded, a moment after the window, and the palette lists only the commands of the frame it opens on.
+pub(crate) fn agent_panel_ready(window: &Window, cx: &App) -> bool {
+    cx.build_action("agent::ToggleFocus", None)
+        .is_ok_and(|action| window.is_action_available(action.as_ref(), cx))
+}
+
 /// `{"agent", "title", "transcript", "reply_focused", "focused_link"}` for the active chat of the workspace's agent panel, or null when the panel shows no chat.
 /// `focused_link` is `{"text", "url"}` for the link of an agent reply that has the keyboard focus, else null.
 pub(crate) fn chat_state(workspace: &Workspace, window: &Window, cx: &App) -> Value {

@@ -791,6 +791,7 @@ fn read_state(
         "focus": focus,
         "prompt": prompt,
         "chat": cod_chat_state::chat_state(workspace, window, cx),
+        "agent_panel_ready": cod_chat_state::agent_panel_ready(window, cx),
     }))
 }
 
