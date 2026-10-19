@@ -436,7 +436,7 @@ pub fn parse_cli(
         "add-folder" => &["--json", "--workspace"],
         other => return Err(format!("unknown command workspace {other}: run codctl --help")),
     };
-    if let Some(flag) = options.seen.iter().find(|flag| !allowed.contains(flag)) {
+    if let Some(flag) = options.seen.iter().find(|flag| !allowed.contains(*flag)) {
         return Err(format!("workspace {command} does not take {flag}"));
     }
     let from_env = || {
