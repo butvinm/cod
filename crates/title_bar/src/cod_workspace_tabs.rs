@@ -49,13 +49,13 @@ pub struct CodTabsLayout {
 /// Splits a name into its leading "[ID]" and the rest (D27). Names without a leading
 /// "[...]" have no ID.
 pub fn split_workspace_name(name: &str) -> (Option<&str>, &str) {
-    if name.starts_with('[') {
-        if let Some(end) = name.find(']') {
+    match name.find(']').filter(|_| name.starts_with('[')) {
+        Some(end) => {
             let (id, rest) = name.split_at(end + 1);
-            return (Some(id), rest.trim_start());
+            (Some(id), rest.trim_start())
         }
+        None => (None, name),
     }
-    (None, name)
 }
 
 /// The name a tab shows: the user's name, else the folder names joined by ", ", else
