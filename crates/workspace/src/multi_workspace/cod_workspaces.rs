@@ -614,6 +614,9 @@ impl MultiWorkspace {
         if self.cod_materializing {
             // Another member is loading: wait for it, then load or show this one by its id.
             // Success is never reported for a member that was not shown.
+            // Cod (#25 review): the window's active workspace right now, so that waking up does
+            // not switch to this one's workspace if a newer activation ran while it waited.
+            let activation_intent = self.active_workspace_id.get();
             let (done_tx, done_rx) = futures::channel::oneshot::channel();
             self.cod_materialize_waiters.push(done_tx);
             return cx.spawn_in(window, async move |this, cx| {
@@ -629,7 +632,9 @@ impl MultiWorkspace {
                         .find(|workspace| workspace.read(cx).database_id() == Some(id));
                     match loaded {
                         Some(workspace) => {
-                            if *this.workspace() != workspace {
+                            if this.active_workspace_id.get() == activation_intent
+                                && *this.workspace() != workspace
+                            {
                                 this.activate(workspace, None, window, cx);
                             }
                             Task::ready(Ok(()))
@@ -649,6 +654,10 @@ impl MultiWorkspace {
         };
         let order: Vec<WorkspaceId> = self.cod_saved_workspace_ids(cx);
         let app_state = self.workspace().read(cx).app_state().clone();
+        // Cod (#25 review): the window's active workspace right now, so the load's completion
+        // can tell whether a newer user intent (a click on another, already loaded workspace)
+        // arrived while this one was loading.
+        let activation_intent = self.active_workspace_id.get();
         self.cod_materializing = true;
         cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = if let Some(connection) = remote {
@@ -702,14 +711,18 @@ impl MultiWorkspace {
                         this.cod_unrestored_workspace_ids
                             .retain(|other| *other != id);
                         this.cod_order_workspaces(&order, cx);
-                        if *this.workspace() != workspace {
-                            this.activate(workspace, None, window, cx);
+                        // Cod (#25 review): keep the newest user intent. A click on another,
+                        // already loaded workspace may have run while this one was loading; stay
+                        // there instead of switching back to the one that just finished loading.
+                        if this.active_workspace_id.get() == activation_intent {
+                            if *this.workspace() != workspace {
+                                this.activate(workspace.clone(), None, window, cx);
+                            }
+                            // The items are loaded now: the shown workspace's active item takes
+                            // the keys, unless the user opened a modal in it meanwhile. Focusing
+                            // only the pane is not enough while the platform window is inactive.
+                            workspace.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                         }
-                        // The items are loaded now: the shown workspace's active item takes the
-                        // keys, unless the user opened a modal in it meanwhile. Focusing only the
-                        // pane is not enough while the platform window is inactive.
-                        let shown = this.workspace().clone();
-                        shown.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                     }
                     (Ok(()), None) => {
                         log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
