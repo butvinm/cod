@@ -251,16 +251,18 @@ class WorkspaceChatsTest(CodTestCase):
         with self.step("send a prompt: the chat is working while the reply streams"):
             self.type("Fix the rounding.")
             self.keys("enter")
+            # #28 AC3: the chat's state must reach the tab dot within one second of the agent
+            # streaming, not whenever a lenient poll happens to notice it.
             self.wait_for_values(
                 "chat status",
                 {"status": "working", "streamed": True},
                 lambda state: {"status": chat(state).get("status"), "streamed": "Reading src/invoice.rs." in chat(state).get("transcript", "")},
-                10,
+                2,
             )
 
         with self.step(f"let the agent ask {permission!r}: the chat needs input"):
             (self.workdir / "streamed").touch()
-            self.wait_for_values("chat status", {"status": "needs_input"}, lambda state: {"status": chat(state).get("status")}, 10)
+            self.wait_for_values("chat status", {"status": "needs_input"}, lambda state: {"status": chat(state).get("status")}, 2)
 
         # Zed 1.23.2's Linux keymap binds shift-alt-a to "editor: toggle block comments" in the message editor, which wins over "agent: allow once" there, so the test allows from the command palette.
         with self.step("allow it once with 'agent: allow once' from the command palette: the turn ends and the chat is done"):
@@ -269,13 +271,13 @@ class WorkspaceChatsTest(CodTestCase):
                 "chat status",
                 {"status": "done", "reply": True},
                 lambda state: {"status": chat(state).get("status"), "reply": PAY_REPLY in chat(state).get("transcript", "")},
-                10,
+                2,
             )
 
         with self.step("send another prompt that the agent fails: the chat shows an error"):
             self.type("And the tax lines?")
             self.keys("enter")
-            self.wait_for_values("chat status", {"status": "error"}, lambda state: {"status": chat(state).get("status")}, 10)
+            self.wait_for_values("chat status", {"status": "error"}, lambda state: {"status": chat(state).get("status")}, 2)
 
     def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
         with self.step("start Cod on billing-api with the fake agent"):
@@ -465,7 +467,8 @@ class WorkspaceChatsTest(CodTestCase):
             self.open_chat([])
             self.type("Fix the rounding.")
             self.keys("enter")
-            state = self.wait_for(lambda state: chat(state).get("status") == "needs_input", 10, "the chat to need input")
+            # #28 AC3: within one second of the agent asking, not a lenient 10 s poll.
+            state = self.wait_for(lambda state: chat(state).get("status") == "needs_input", 2, "the chat to need input")
 
         with self.step("the workspace tab dot and the overview's session row both show needs_input too"):
             active = state["active_workspace"]
@@ -483,7 +486,7 @@ class WorkspaceChatsTest(CodTestCase):
 
         with self.step("allow it once: the turn ends and the workspace tab dot follows to done"):
             self.run_command("agent: allow once")
-            state = self.wait_for(lambda state: chat(state).get("status") == "done", 10, "the chat to be done")
+            state = self.wait_for(lambda state: chat(state).get("status") == "done", 2, "the chat to be done")
             active = state["active_workspace"]
             self.expect_equal("workspace status", "done", state["workspaces"][active]["status"])
             self.expect_equal("title bar dot", "green", state["title_bar"]["tabs"][active]["dot"])
