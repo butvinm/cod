@@ -12,11 +12,13 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use codctl::Request;
-use gpui::{App, AsyncApp, Entity, EntityId, WindowHandle};
+use editor::Editor;
+use git_ui_core::file_diff_view::FileDiffView;
+use gpui::{App, AsyncApp, Entity, EntityId, Focusable as _, WindowHandle};
 use serde_json::{Value, json};
 use workspace::{
-    CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RemovalIntent, SaveIntent,
-    Workspace, WorkspaceId,
+    CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Pane, RemovalIntent,
+    SaveIntent, SplitDirection, Workspace, WorkspaceId,
 };
 
 /// The rolled-up status of a workspace until workspace statuses exist (#25, #26).
@@ -88,6 +90,29 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
         Request::WorkspaceClose { workspace, force } => {
             close_workspace(&workspace, force, cx).await
         }
+        Request::PaneList { workspace } => {
+            let (_, workspace) = cx.update(|cx| target_workspace(workspace.as_deref(), cx))?;
+            Ok(cx.update(|cx| list_panes(&workspace, cx)))
+        }
+        Request::PaneSplit {
+            workspace,
+            pane,
+            direction,
+        } => split_pane(workspace.as_deref(), pane, &direction, cx).await,
+        Request::PaneFocus { workspace, pane } => focus_pane(workspace.as_deref(), pane, cx).await,
+        Request::PaneClose { workspace, pane } => close_pane(workspace.as_deref(), pane, cx).await,
+        Request::Open {
+            workspace,
+            path,
+            line,
+            column,
+            pane,
+        } => open_file(workspace.as_deref(), path, line, column, pane, cx).await,
+        Request::Diff {
+            workspace,
+            old,
+            new,
+        } => open_diff(workspace.as_deref(), old, new, cx).await,
     }
 }
 
@@ -364,8 +389,227 @@ async fn close_workspace(reference: &str, force: bool, cx: &mut AsyncApp) -> Res
     Ok(json!({ "closed": removed }))
 }
 
-/// Checks on the client thread, before anything reaches the window, that every folder of the request is a folder.
+/// The workspace a pane, open or diff command acts on (#38): the named one, else the workspace shown in the active window. It must be loaded.
+fn target_workspace(
+    reference: Option<&str>,
+    cx: &App,
+) -> Result<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    match reference {
+        Some(reference) => {
+            let member = resolve(reference, cx)?;
+            let id = i64::from(id_of(&member)?);
+            let workspace = member.live.with_context(|| {
+                format!(
+                    "workspace {id} is not loaded yet: show it first with codctl workspace focus {id}"
+                )
+            })?;
+            Ok((member.window, workspace))
+        }
+        None => {
+            let window = target_window(cx).context("Cod has no workspace window")?;
+            let workspace = window.read(cx)?.workspace().clone();
+            Ok((window, workspace))
+        }
+    }
+}
+
+/// The ID codctl shows for a pane: its entity ID, stable while the pane lives.
+fn pane_id(pane: &Entity<Pane>) -> u64 {
+    pane.entity_id().as_u64()
+}
+
+/// The center pane of the workspace with this ID.
+fn find_pane(workspace: &Entity<Workspace>, id: u64, cx: &App) -> Result<Entity<Pane>> {
+    workspace
+        .read(cx)
+        .panes()
+        .iter()
+        .find(|pane| pane_id(pane) == id)
+        .cloned()
+        .with_context(|| format!("unknown pane {id}: see codctl pane list"))
+}
+
+/// What `pane list` reports: every center pane with its ID, whether it is the active one and its tab titles.
+fn list_panes(workspace: &Entity<Workspace>, cx: &App) -> Value {
+    let read = workspace.read(cx);
+    let active = read.active_pane().clone();
+    Value::Array(
+        read.panes()
+            .iter()
+            .map(|pane| {
+                let tabs: Vec<String> = pane
+                    .read(cx)
+                    .items()
+                    .map(|item| item.tab_content_text(0, cx).to_string())
+                    .collect();
+                json!({ "id": pane_id(pane), "active": *pane == active, "tabs": tabs })
+            })
+            .collect(),
+    )
+}
+
+/// Splits the pane like Zed's split does (`Workspace::split_pane`), making a new empty pane.
+async fn split_pane(
+    reference: Option<&str>,
+    pane: u64,
+    direction: &str,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let pane = cx.update(|cx| find_pane(&workspace, pane, cx))?;
+    let direction = if direction == "down" {
+        SplitDirection::Down
+    } else {
+        SplitDirection::Right
+    };
+    let new_pane = window.update(cx, |_, window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.split_pane(pane, direction, window, cx)
+        })
+    })?;
+    Ok(json!({ "id": pane_id(&new_pane) }))
+}
+
+/// Focuses the pane, which makes it the active pane of its workspace.
+async fn focus_pane(reference: Option<&str>, pane: u64, cx: &mut AsyncApp) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let pane = cx.update(|cx| find_pane(&workspace, pane, cx))?;
+    window.update(cx, |_, window, cx| {
+        let handle = pane.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    })?;
+    Ok(json!({ "id": pane_id(&pane) }))
+}
+
+/// Closes the tabs of the pane the way Zed's "pane: close all items" does (the same save prompt), then the pane itself. The only pane of a workspace stays.
+/// When a tab is still open after that, the user kept it: `{"closed": false}`.
+async fn close_pane(reference: Option<&str>, pane: u64, cx: &mut AsyncApp) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let id = pane;
+    let pane = cx.update(|cx| find_pane(&workspace, id, cx))?;
+    if cx.update(|cx| workspace.read(cx).panes().len()) < 2 {
+        bail!("pane {id} is the only pane of the workspace");
+    }
+    let closing = window.update(cx, |_, window, cx| {
+        pane.update(cx, |pane, cx| {
+            pane.close_all_items(
+                &workspace::pane::CloseAllItems {
+                    save_intent: Some(SaveIntent::Close),
+                    close_pinned: true,
+                },
+                window,
+                cx,
+            )
+        })
+    })?;
+    closing.await?;
+    let (still_listed, empty) = cx.update(|cx| {
+        (
+            workspace.read(cx).panes().contains(&pane),
+            pane.read(cx).items().next().is_none(),
+        )
+    });
+    if still_listed {
+        if !empty {
+            return Ok(json!({ "closed": false }));
+        }
+        // An empty pane leaves the split the way a pane whose last tab closed does.
+        window.update(cx, |_, _, cx| {
+            pane.update(cx, |_, cx| {
+                cx.emit(workspace::pane::Event::Remove {
+                    focus_on_pane: None,
+                })
+            })
+        })?;
+    }
+    Ok(json!({ "closed": true }))
+}
+
+/// Opens the file in the pane (else the active pane) like Zed's file finder does, then puts the cursor at the 1-based line and column like `zed <file>:<line>:<column>`.
+async fn open_file(
+    reference: Option<&str>,
+    path: PathBuf,
+    line: Option<u32>,
+    column: Option<u32>,
+    pane: Option<u64>,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let pane = match pane {
+        Some(id) => Some(cx.update(|cx| find_pane(&workspace, id, cx))?),
+        None => None,
+    };
+    let project = cx.update(|cx| workspace.read(cx).project().clone());
+    let (_, project_path) = cx
+        .update(|cx| Workspace::project_path_for_path(project, &path, false, cx))
+        .await?;
+    let item = window
+        .update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_path(
+                    project_path,
+                    pane.as_ref().map(|pane| pane.downgrade()),
+                    true,
+                    window,
+                    cx,
+                )
+            })
+        })?
+        .await?;
+    if let Some(line) = line
+        && let Some(editor) = item.downcast::<Editor>()
+    {
+        window.update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+                    return;
+                };
+                let snapshot = buffer.read(cx).snapshot();
+                let point = snapshot.point_from_external_input(
+                    line.saturating_sub(1),
+                    column.unwrap_or(1).saturating_sub(1),
+                );
+                editor.go_to_singleton_buffer_point(point, window, cx);
+            })
+        })?;
+    }
+    let pane = cx.update(|cx| workspace.read(cx).active_pane().clone());
+    Ok(json!({ "pane": pane_id(&pane) }))
+}
+
+/// Opens Zed's diff view of two files (`FileDiffView`, as `zed --diff <old> <new>` does) in the active pane.
+async fn open_diff(
+    reference: Option<&str>,
+    old: PathBuf,
+    new: PathBuf,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    let (window, workspace) = cx.update(|cx| target_workspace(reference, cx))?;
+    let weak = workspace.downgrade();
+    window
+        .update(cx, |_, window, cx| {
+            FileDiffView::open(old, new, None, weak, window, cx)
+        })?
+        .await?;
+    Ok(json!({}))
+}
+
+/// The path of the request that must be a file, if any.
+fn files_of(request: &Request) -> Vec<&PathBuf> {
+    match request {
+        Request::Open { path, .. } => vec![path],
+        Request::Diff { old, new, .. } => vec![old, new],
+        _ => Vec::new(),
+    }
+}
+
+/// Checks on the client thread, before anything reaches the window, that every folder of the request is a folder and every file a file.
 pub fn check_folders(request: &Request) -> Result<(), String> {
+    for file in files_of(request) {
+        if !file.is_file() {
+            return Err(format!("not a file: {}", file.display()));
+        }
+    }
     let folders = match request {
         Request::WorkspaceNew { folders, .. } | Request::WorkspaceAddFolder { folders, .. } => {
             folders

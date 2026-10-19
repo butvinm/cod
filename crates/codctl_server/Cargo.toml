@@ -16,7 +16,9 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 codctl.workspace = true
+editor.workspace = true
 futures.workspace = true
+git_ui_core.workspace = true
 gpui.workspace = true
 log.workspace = true
 serde_json.workspace = true
