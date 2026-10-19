@@ -95,7 +95,8 @@ use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
+    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, FocusLastReply,
+    FocusMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
@@ -3595,7 +3596,10 @@ fn render_agent_markdown(
     let workspace = workspace.clone();
     let worktree_roots = code_span_resolver.worktree_roots(cx);
     let resolver = code_span_resolver.clone();
+    let mention_resolver = code_span_resolver.clone();
     MarkdownElement::new(markdown, style)
+        .keyboard_links()
+        .on_text_mention_link(move |text, cx| mention_resolver.try_resolve(text, cx))
         .code_block_renderer(markdown::CodeBlockRenderer::Default {
             copy_button_visibility: markdown::CopyButtonVisibility::VisibleOnHover,
             wrap_button_visibility: markdown::WrapButtonVisibility::VisibleOnHover,

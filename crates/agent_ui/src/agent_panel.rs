@@ -107,6 +107,30 @@ use workspace::{
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
+
+/// What the active chat of a panel shows (`AgentPanel::cod_chat_snapshot`), for Cod's end-to-end driver (Cod #28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodChatSnapshot {
+    /// The id of the selected agent, for example `claude-acp`.
+    pub agent: String,
+    /// The thread title, once there is one.
+    pub title: Option<String>,
+    /// The whole transcript as markdown.
+    pub transcript: String,
+    /// Whether an agent reply holds the keyboard focus.
+    pub reply_focused: bool,
+    /// The link of that reply that has the keyboard focus.
+    pub focused_link: Option<CodFocusedLink>,
+}
+
+/// The link of an agent reply that has the keyboard focus (Cod #28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodFocusedLink {
+    /// The link as the reply's markdown source writes it, for example `src/invoice.rs:18`.
+    pub text: String,
+    /// Where it leads, for example a `file://` url with the line.
+    pub url: String,
+}
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -4124,6 +4148,43 @@ impl AgentPanel {
             }
             _ => None,
         }
+    }
+
+    /// What the active chat shows, read only, for Cod's end-to-end driver (Cod #28).
+    pub fn cod_chat_snapshot(&self, window: &Window, cx: &App) -> Option<CodChatSnapshot> {
+        let thread = self.active_agent_thread(cx)?;
+        let thread = thread.read(cx);
+        let focused_markdown = thread
+            .entries()
+            .iter()
+            .flat_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::AssistantMessage(message) => message
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| match chunk {
+                        acp_thread::AssistantMessageChunk::Message { block, .. }
+                        | acp_thread::AssistantMessageChunk::Thought { block, .. } => {
+                            block.markdowns().cloned().collect::<Vec<_>>()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .find(|markdown| markdown.read(cx).focus_handle(cx).is_focused(window));
+        let focused_link = focused_markdown.as_ref().and_then(|markdown| {
+            let markdown = markdown.read(cx);
+            Some(CodFocusedLink {
+                text: markdown.focused_link_text()?.to_string(),
+                url: markdown.focused_link_url()?.to_string(),
+            })
+        });
+        Some(CodChatSnapshot {
+            agent: self.selected_agent(cx).id().0.to_string(),
+            title: thread.title().map(|title| title.to_string()),
+            transcript: thread.to_markdown(cx),
+            reply_focused: focused_markdown.is_some(),
+            focused_link,
+        })
     }
 
     pub fn is_retained_thread(&self, id: &ThreadId) -> bool {

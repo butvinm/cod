@@ -71,7 +71,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CodChatSnapshot, CodFocusedLink,
+    TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -307,6 +308,10 @@ actions!(
         ScrollOutputPageUp,
         /// Scroll the output by one page down.
         ScrollOutputPageDown,
+        /// Moves the keyboard focus from the message box into the newest agent reply, where Tab and Shift-Tab move between its links (Cod #28).
+        FocusLastReply,
+        /// Moves the keyboard focus back to the message box.
+        FocusMessageEditor,
         /// Scroll the output up by three lines.
         ScrollOutputLineUp,
         /// Scroll the output down by three lines.
