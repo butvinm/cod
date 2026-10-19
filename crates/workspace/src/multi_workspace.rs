@@ -25,6 +25,11 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+mod cod_status;
+pub use cod_status::{
+    CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, cod_rollup,
+    cod_workspace_status,
+};
 mod cod_workspaces;
 pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
@@ -1723,6 +1728,7 @@ impl MultiWorkspace {
             let kvp = db::kvp::KeyValueStore::global(cx);
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
+                cod_status::cod_forget_workspace_status(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);

@@ -875,6 +875,52 @@ impl MultiWorkspace {
         self.serialize(cx);
         cx.notify();
     }
+
+    /// Cod (#25, #26): the members the window shows (tabs, overview), in window order: the
+    /// loaded workspaces and the pending ones that have saved data. A listed member whose saved
+    /// data was not found is left out, as it cannot be shown.
+    pub fn cod_shown_members(&self, cx: &App) -> Vec<CodMember> {
+        self.cod_members(cx)
+            .into_iter()
+            .filter(|member| match member {
+                CodMember::Live(_) => true,
+                CodMember::Pending(id) => self.cod_pending.contains_key(id),
+            })
+            .collect()
+    }
+
+    /// Cod (#25, #26): the workspace id of a member, None for a loaded workspace that has none
+    /// yet.
+    pub fn cod_member_id(member: &CodMember, cx: &App) -> Option<WorkspaceId> {
+        match member {
+            CodMember::Live(workspace) => workspace.read(cx).database_id(),
+            CodMember::Pending(id) => Some(*id),
+        }
+    }
+
+    /// Cod (#26): when the loaded member with this id was last shown in this window, as a
+    /// stamp that grows with each switch; None for pending members and members never shown.
+    pub fn cod_last_activated(&self, id: WorkspaceId, cx: &App) -> Option<u64> {
+        self.held
+            .iter()
+            .find(|held| held.workspace.read(cx).database_id() == Some(id))
+            .and_then(|held| held.activated_at)
+    }
+
+    /// Cod (#25): shows the member, loading it first when it is pending.
+    pub fn cod_show_member(
+        &mut self,
+        member: CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match member {
+            CodMember::Live(workspace) => self.activate(workspace, None, window, cx),
+            CodMember::Pending(id) => self
+                .cod_show_pending(id, window, cx)
+                .detach_and_log_err(cx),
+        }
+    }
 }
 
 /// Cod (#24): the main repository folder of a linked git worktree, read from its `.git` file
