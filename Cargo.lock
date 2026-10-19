@@ -3442,6 +3442,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "title_bar",
  "ui_prompt",
  "workspace",
 ]

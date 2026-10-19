@@ -573,6 +573,34 @@ impl TitleBar {
         self.cod_tabs.borrow().clone()
     }
 
+    /// Cod (#25): which of Zed's own title bar items the title bar renders now, by the same
+    /// conditions `render` uses (read by the end-to-end driver). "application_menu" is the
+    /// Linux and Windows menu button.
+    pub fn cod_visible_items(&self, cx: &App) -> Vec<&'static str> {
+        let settings = TitleBarSettings::get_global(cx);
+        let signed_out = self.user_store.read(cx).current_user().is_none();
+        let mut items = Vec::new();
+        if self.application_menu.is_some() {
+            items.push("application_menu");
+        }
+        if COD_SHOW_ZED_ITEMS && settings.show_project_items {
+            items.push("project_name");
+        }
+        if COD_SHOW_ZED_ITEMS
+            && settings.show_branch_name
+            && ProjectSettings::get_global(cx).git.enabled.status
+        {
+            items.push("branch_picker");
+        }
+        if COD_SHOW_ZED_ITEMS && signed_out && settings.show_sign_in {
+            items.push("sign_in");
+        }
+        if COD_SHOW_ZED_ITEMS && settings.show_user_menu {
+            items.push("user_menu");
+        }
+        items
+    }
+
     fn worktree_count(&self, cx: &App) -> usize {
         self.project.read(cx).visible_worktrees(cx).count()
     }
