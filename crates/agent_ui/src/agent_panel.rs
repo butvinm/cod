@@ -4316,7 +4316,7 @@ impl AgentPanel {
                 Some(CodChatTab {
                     thread_id,
                     session_id: thread.session_id().0.to_string(),
-                    title: crate::cod_chat_status::cod_chat_title(&label, thread.title()),
+                    title: crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref()),
                     status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
                     active: Some(thread_id) == active_id,
                 })
@@ -4360,7 +4360,7 @@ impl AgentPanel {
         let thread = thread.read(cx);
         let status = crate::cod_chat_status::CodChatStatus::of_thread(thread);
         let label = self.cod_agent_label(view.read(cx).agent_key(), cx);
-        let title = crate::cod_chat_status::cod_chat_title(&label, thread.title());
+        let title = crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref());
         let session_id = thread.session_id().0.to_string();
         let thread_id = view.read(cx).thread_id;
         Some(CodEntry {
