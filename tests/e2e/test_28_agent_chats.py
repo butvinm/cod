@@ -141,5 +141,152 @@ class AgentChatLinksTest(CodTestCase):
             self.expect_equal("window count", 1, state["window_count"])
 
 
+PAY_SESSION = "claude-session-pay-1234"
+LEDGER_SESSION = "claude-session-ledger-1300"
+PAY_REPLY = "The rounding happens in src/invoice.rs:18."
+LEDGER_REPLY = "The ledger export reads src/main.rs first."
+
+NEW_WORKSPACE = "workspace: new workspace"
+PREVIOUS_WORKSPACE = "workspace: previous workspace"
+ADD_FOLDER = "workspace: add folder to project"
+SHOW_TIMEOUT = 15.0
+RESTORE_TIMEOUT = 45.0
+
+
+def real(path: str | os.PathLike[str]) -> str:
+    return os.path.realpath(path)
+
+
+def chat_of(state: dict[str, Any]) -> dict[str, Any]:
+    """The active workspace and what its active chat shows: agent, provider session id and which scripted replies its transcript holds."""
+    transcript = chat(state).get("transcript", "")
+    return {
+        "active_workspace": state["active_workspace"],
+        "agent": chat(state).get("agent"),
+        "session_id": chat(state).get("session_id"),
+        "pay_reply": PAY_REPLY in transcript,
+        "ledger_reply": LEDGER_REPLY in transcript,
+    }
+
+
+class WorkspaceChatsTest(CodTestCase):
+    def start_chat(self, prompt: str, reply: str, other_sessions: list[str]) -> str:
+        """Opens the agent panel of the active workspace, starts a chat with the fake agent from the new thread menu, sends the prompt, waits for the reply and returns the chat's session id."""
+        # The agent commands join the palette once the panel has loaded, a moment after the workspace.
+        self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
+        self.run_command("agent: toggle focus")
+        self.run_command("agent: toggle new thread menu")
+        # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
+        self.keys("up up enter")
+        self.wait_for(
+            lambda state: chat(state).get("agent") == AGENT_ID and chat(state).get("session_id") not in [None, "", *other_sessions],
+            30,
+            "a new chat with the fake agent",
+        )
+        self.type(prompt)
+        self.keys("enter")
+        state = self.wait_for(lambda state: reply in chat(state).get("transcript", ""), 30, "the scripted reply in the transcript")
+        return chat(state)["session_id"]
+
+    def provider_sessions(self) -> list[str]:
+        """The session ids the fake agent itself made, from its state file."""
+        return sorted(json.loads((self.workdir / "agent-state.json").read_text())["sessions"])
+
+    def add_folder(self, folder: os.PathLike[str]) -> None:
+        """Adds the folder to the active workspace with Zed's "add folder to project" and Zed's own path picker, as in test_24."""
+        self.run_command(ADD_FOLDER)
+        self.wait_for(lambda state: state["path_prompt"] is not None, 10, "the path picker to open")
+        self.keys("ctrl-a")
+        self.type(str(folder))
+        self.wait_for(
+            lambda state: state["path_prompt"] is not None
+            and state["path_prompt"]["query"] == str(folder)
+            and state["path_prompt"]["match_count"] == 1,
+            10,
+            "the path picker to list exactly the folder",
+        )
+        self.keys("enter")
+        self.wait_for(
+            lambda state: [real(path) for path in state["worktrees"]] == [real(folder)] and state["path_prompt"] is None,
+            SHOW_TIMEOUT,
+            "the folder to be added",
+        )
+
+    def test_ac1_ac4_two_workspaces_on_the_same_folder_keep_their_own_chat_across_a_restart(self) -> None:
+        with self.step("create the fixture repo billing-api and the agent script with two provider session ids"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            script = self.workdir / "agent-script.json"
+            script.write_text(
+                json.dumps(
+                    {
+                        "session_ids": [PAY_SESSION, LEDGER_SESSION],
+                        "turns": [
+                            {"steps": [{"chunk": PAY_REPLY}, {"end": "end_turn"}]},
+                            {"steps": [{"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
+                        ],
+                    }
+                )
+            )
+            agent_servers = {
+                AGENT_ID: fake_agent_settings(script, state=self.workdir / "agent-state.json", log=self.workdir / "agent.log")
+            }
+
+        with self.step("start Cod on billing-api, keeping its session"):
+            self.start_cod(repo, persistent=True, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: [real(path) for path in state["worktrees"]] == [real(repo)],
+                30,
+                "the billing-api folder to open",
+            )
+
+        with self.step("workspace A: start a chat with the fake agent and wait for its reply"):
+            a_index = self.state()["active_workspace"]
+            a_session = self.start_chat("Where does the rounding happen?", PAY_REPLY, [])
+            a_chat = {"active_workspace": a_index, "agent": AGENT_ID, "session_id": a_session, "pay_reply": True, "ledger_reply": False}
+            self.wait_for_values("workspace A's chat", a_chat, chat_of, 30)
+            self.expect_equal("A's session id is the provider's own", True, a_session in self.provider_sessions())
+
+        with self.step(f"workspace B: run {NEW_WORKSPACE!r}, add billing-api too, start a chat and wait for its reply"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1 and state["modal"] is None,
+                SHOW_TIMEOUT,
+                "the new workspace",
+            )
+            b_index = state["active_workspace"]
+            if b_index == a_index:
+                raise AssertionError(f"expected workspace B at another index than A ({a_index}), actual {b_index}")
+            self.add_folder(repo)
+            b_session = self.start_chat("What does the ledger export read?", LEDGER_REPLY, [a_session])
+            b_chat = {"active_workspace": b_index, "agent": AGENT_ID, "session_id": b_session, "pay_reply": False, "ledger_reply": True}
+            self.wait_for_values("workspace B's chat", b_chat, chat_of, 30)
+            self.expect_equal("B's session id is the provider's own", True, b_session in self.provider_sessions())
+
+        with self.step(f"switch to workspace A with {PREVIOUS_WORKSPACE!r}: the panel shows A's chat only"):
+            self.run_command(PREVIOUS_WORKSPACE)
+            self.wait_for_values("workspace A's chat", a_chat, chat_of, SHOW_TIMEOUT)
+
+        with self.step("go back to workspace B, quit Cod with ctrl-q and start it again"):
+            self.run_command("workspace: next workspace")
+            self.wait_for_values("workspace B's chat", b_chat, chat_of, SHOW_TIMEOUT)
+            self.restart_cod()
+
+        with self.step("check that workspace B is back with its own chat, loaded by its provider session id"):
+            self.wait_for_values("workspace B's restored chat", b_chat, chat_of, RESTORE_TIMEOUT)
+
+        with self.step(f"switch to workspace A with {PREVIOUS_WORKSPACE!r} and check that its own chat is back"):
+            self.run_command(PREVIOUS_WORKSPACE)
+            self.wait_for_values("workspace A's restored chat", a_chat, chat_of, RESTORE_TIMEOUT)
+
+        with self.step("check that the fake agent was asked to load both sessions by their own ids"):
+            loaded = set()
+            for line in (self.workdir / "agent.log").read_text().splitlines():
+                direction, _, message = line.partition(" ")
+                if direction == "in" and json.loads(message).get("method") == "session/load":
+                    loaded.add(json.loads(message)["params"]["sessionId"])
+            self.expect_equal("loaded sessions", sorted([a_session, b_session]), sorted(loaded))
+
+
 if __name__ == "__main__":
     unittest.main()
