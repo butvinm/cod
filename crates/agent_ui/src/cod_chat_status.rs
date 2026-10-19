@@ -1,11 +1,13 @@
 //! Cod (#28): the state of an agent chat, as its chat tab dot, the workspace tab dot (#25) and the
 //! overview row (#26) show it.
 //!
-//! Hook point: this is a local function until the status contract of PR #65
-//! (`crates/workspace/src/multi_workspace/cod_status.rs`) is on master. Then the agent panel writes
-//! these states into that contract for its workspace, from `AgentPanel::cod_chat_snapshot`.
+//! The agent panel writes these states into the status contract
+//! (`crates/workspace/src/multi_workspace/cod_status.rs`) for its workspace, from
+//! `AgentPanel::cod_publish_chat_statuses`, as a `workspace::CodEntry` of kind `Session`
+//! (`cod_status`, `cod_context`).
 
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus};
+use workspace::CodStatus;
 
 /// What a chat is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,11 +70,74 @@ impl CodChatStatus {
             Self::Error => "error",
         }
     }
+
+    /// The status of the workspace status contract (#25, #26) this chat state means.
+    pub fn cod_status(self) -> CodStatus {
+        match self {
+            Self::Idle => CodStatus::Idle,
+            Self::Working => CodStatus::Working,
+            Self::NeedsInput => CodStatus::NeedsInput,
+            Self::Done => CodStatus::Done,
+            Self::Error => CodStatus::Error,
+        }
+    }
+
+    /// The short status line a `CodEntry` of this chat carries as its context (its own words,
+    /// not an agent-set context line: that is #39, out of scope here).
+    pub fn cod_context(self) -> &'static str {
+        match self {
+            Self::Idle => "",
+            Self::Working => "working",
+            Self::NeedsInput => "waiting for you",
+            Self::Done => "done",
+            Self::Error => "failed",
+        }
+    }
+}
+
+/// The chat's name shown in its tab, the workspace tab's tooltip and the overview row: the
+/// agent's label, then the thread's own title once it has one (#28 open question: default is
+/// the agent name plus the thread title Zed already makes, for example "Claude: fix invoice
+/// rounding").
+pub fn cod_chat_title(agent_label: &str, thread_title: Option<&str>) -> String {
+    match thread_title {
+        Some(title) if !title.is_empty() => format!("{agent_label}: {title}"),
+        _ => agent_label.to_string(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CodChatStatus;
+    use super::{CodChatStatus, cod_chat_title};
+    use workspace::CodStatus;
+
+    #[test]
+    fn cod_status_follows_the_chat_status_urgency() {
+        assert_eq!(CodChatStatus::NeedsInput.cod_status(), CodStatus::NeedsInput);
+        assert_eq!(CodChatStatus::Error.cod_status(), CodStatus::Error);
+        assert_eq!(CodChatStatus::Working.cod_status(), CodStatus::Working);
+        assert_eq!(CodChatStatus::Done.cod_status(), CodStatus::Done);
+        assert_eq!(CodChatStatus::Idle.cod_status(), CodStatus::Idle);
+    }
+
+    #[test]
+    fn cod_context_is_a_short_status_line() {
+        assert_eq!(CodChatStatus::NeedsInput.cod_context(), "waiting for you");
+        assert_eq!(CodChatStatus::Working.cod_context(), "working");
+        assert_eq!(CodChatStatus::Done.cod_context(), "done");
+        assert_eq!(CodChatStatus::Error.cod_context(), "failed");
+        assert_eq!(CodChatStatus::Idle.cod_context(), "");
+    }
+
+    #[test]
+    fn the_title_is_the_agent_label_then_the_thread_title() {
+        assert_eq!(
+            cod_chat_title("Claude", Some("fix invoice rounding")),
+            "Claude: fix invoice rounding"
+        );
+        assert_eq!(cod_chat_title("Claude", None), "Claude");
+        assert_eq!(cod_chat_title("Claude", Some("")), "Claude");
+    }
 
     #[test]
     fn a_chat_without_a_turn_is_idle() {
