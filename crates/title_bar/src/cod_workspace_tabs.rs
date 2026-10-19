@@ -190,7 +190,8 @@ pub fn render_cod_workspace_tabs(
                 let Some(room) = bounds.last().filter(|_| !rest_text.is_empty()) else {
                     return;
                 };
-                let style = window.text_style();
+                // The label's font: the UI font at the default label size.
+                let font = theme::theme_settings(cx).ui_font(cx).clone();
                 let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
                 let text_width = window
                     .text_system()
@@ -199,8 +200,7 @@ pub fn render_cod_workspace_tabs(
                         font_size,
                         &[gpui::TextRun {
                             len: rest_text.len(),
-                            font: style.font(),
-                            color: style.color,
+                            font,
                             ..Default::default()
                         }],
                         None,
