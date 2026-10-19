@@ -335,7 +335,10 @@ fn gather(
     (members, groups)
 }
 
-/// Shows the member, then focuses what the row stands for.
+/// Shows the member, then focuses what the row stands for. A pending member (lazily restored
+/// after a restart, see `restore_multiworkspace`) loads in the background: Enter waits for that
+/// load to finish before it focuses the row's target, instead of silently doing nothing (Cod #26
+/// AC6).
 fn activate(
     multi_workspace: WeakEntity<MultiWorkspace>,
     member: CodMember,
@@ -343,23 +346,65 @@ fn activate(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if multi_workspace
-        .update(cx, |multi_workspace, cx| {
-            multi_workspace.cod_show_member(member.clone(), window, cx)
-        })
-        .is_err()
-    {
-        return;
+    match member {
+        CodMember::Live(workspace) => {
+            if multi_workspace
+                .update(cx, |multi_workspace, cx| {
+                    multi_workspace
+                        .cod_show_member(CodMember::Live(workspace.clone()), window, cx)
+                })
+                .is_err()
+            {
+                return;
+            }
+            apply_target(&workspace, target, window, cx);
+        }
+        CodMember::Pending(id) => {
+            let Ok(load) = multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.cod_show_pending(id, window, cx)
+            }) else {
+                return;
+            };
+            let multi_workspace = multi_workspace.clone();
+            window
+                .spawn(cx, async move |cx| {
+                    if load.await.is_err() {
+                        return;
+                    }
+                    cx.update(|window, cx| {
+                        let Some(workspace) = multi_workspace
+                            .update(cx, |multi_workspace, cx| {
+                                multi_workspace.cod_members(cx).into_iter().find_map(
+                                    |member| match member {
+                                        CodMember::Live(workspace)
+                                            if workspace.read(cx).database_id() == Some(id) =>
+                                        {
+                                            Some(workspace)
+                                        }
+                                        _ => None,
+                                    },
+                                )
+                            })
+                            .ok()
+                            .flatten()
+                        else {
+                            return;
+                        };
+                        apply_target(&workspace, target, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+        }
     }
+}
+
+/// Focuses what the row's target stands for in `workspace`, now that it is loaded and shown.
+fn apply_target(workspace: &Entity<Workspace>, target: RowTarget, window: &mut Window, cx: &mut App) {
     match target {
         RowTarget::Workspace | RowTarget::Entry(None) => {}
         RowTarget::Entry(Some(open)) => open(window, cx),
-        RowTarget::Folder(path) => {
-            // A pending workspace loads in the background; its folder rows only show it.
-            if let CodMember::Live(workspace) = member {
-                focus_folder_root(&workspace, &path, window, cx);
-            }
-        }
+        RowTarget::Folder(path) => focus_folder_root(workspace, &path, window, cx),
     }
 }
 

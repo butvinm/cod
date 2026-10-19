@@ -48,6 +48,9 @@ DOC_ROW = 8
 # How long a command, a key or a click may take to show.
 SHOW_TIMEOUT = 15.0
 
+# How long Cod may take to restore its workspaces after a restart.
+RESTORE_TIMEOUT = 45.0
+
 BILLING_API = {
     "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
     "README.md": "# billing-api\n\nAn invented service that issues invoices.\n",
@@ -324,6 +327,64 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
                 SHOW_TIMEOUT,
                 "the billing-api root to be focused in the project panel of PAY-1234",
             )
+
+    def test_ac6_enter_on_a_pending_workspace_waits_for_it_to_load_then_focuses(self) -> None:
+        """A workspace not loaded yet since a restart (#25's lazy restore) is a pending row: it
+        still shows its folder, because that only needs the saved workspace list, not the
+        workspace itself. Enter on that folder row waits for the workspace to load, then focuses
+        the project panel there, instead of doing nothing while it loads in the background."""
+        with self.step("start Cod on billing-api, keeping its session, and name the workspace PAY-1234"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for(lambda state: state["workspace_count"] == 1 and state["modal"] is None, SHOW_TIMEOUT, "the first workspace")
+            self.rename_workspace(PAY_NAME)
+
+        with self.step("open a second workspace on billing-api too and name it DOC-208"):
+            self.new_workspace()
+            self.add_folder_to_active_workspace(billing_api)
+            self.rename_workspace(DOC_NAME)
+
+        with self.step("restart Cod: DOC-208 (the last active) loads eagerly, PAY-1234 stays pending until shown"):
+            self.restart_cod()
+            self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["modal"] is None,
+                RESTORE_TIMEOUT,
+                "both workspaces back",
+            )
+
+        with self.step("open the overview and select PAY-1234's folder row"):
+            state = self.open_overview()
+            rows = overview(state)["rows"]
+            row_index = next(
+                index for index, row in enumerate(rows) if row["kind"] == "folder" and row["title"] == "billing-api"
+            )
+            self.keys(" ".join(["down"] * row_index))
+            self.wait_for_selected(row_index)
+
+        with self.step("press enter: Cod waits for PAY-1234 to load, then focuses billing-api in its project panel"):
+            self.keys("enter")
+            self.wait_for(
+                lambda state: state["overview"] is None
+                and state["workspaces"][state["active_workspace"]]["name"] == PAY_NAME
+                and (state["project_panel"] or {}).get("focused") is True
+                and (state["project_panel"] or {}).get("selected") == "billing-api",
+                RESTORE_TIMEOUT,
+                "PAY-1234 to load and focus billing-api in the project panel",
+            )
+
+    def add_folder_to_active_workspace(self, folder: Any) -> None:
+        """Adds the folder to the active workspace with "workspace: add folder to project" and Zed's own path picker, as in test_24 and test_28."""
+        self.run_command("workspace: add folder to project")
+        self.wait_for(lambda state: state["path_prompt"] is not None, SHOW_TIMEOUT, "the path picker to open")
+        self.keys("ctrl-a")
+        self.type(str(folder))
+        self.wait_for(
+            lambda state: state["path_prompt"] is not None and state["path_prompt"]["match_count"] == 1,
+            SHOW_TIMEOUT,
+            "the path picker to list exactly the folder",
+        )
+        self.keys("enter")
+        self.wait_for(lambda state: state["path_prompt"] is None, SHOW_TIMEOUT, "the folder to be added")
 
     # AC7
 
