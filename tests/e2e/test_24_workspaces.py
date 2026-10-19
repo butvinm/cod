@@ -1814,6 +1814,63 @@ class WorkspacesTest(CodTestCase):
             self.stays(lambda state: state["tabs"] == [], SETTLE_TIME, "the second port's window having no tab")
             self.expect_equal("window count", 2, fresh["window_count"])
 
+    def open_from_command_line(self, url: str) -> None:
+        """Opens the url in the running Cod as `cod <url>` does, and checks the command's exit status."""
+        assert self.cod is not None
+        env = cod_environment(os.environ, self.cod.preview_dir, self.cod.socket_path, self.cod.home, persistent=True)
+        result = subprocess.run(cod_command(self.cod.run_dir, None) + [url], cwd=self.workdir, env=env, capture_output=True, timeout=60)
+        self.expect_equal(f"exit status of cod {url}", 0, result.returncode)
+
+    def test_first_ssh_host_keeps_its_saved_layout_after_the_same_folder_opens_on_another_port(self) -> None:
+        # The existing-window path (projects: open remote, then the host's "Open Folder" path picker) is not driven here: the driver reports that modal only as "other", with no selected entry and no query of its path picker, so keys there would be blind. The command line open is used instead.
+        with self.step("start two loopback sshd services on two ports"):
+            first = self.loopback("revisit-first")
+            second = self.loopback("revisit-second")
+            remote = self.make_repo("ledger-remote", LEDGER_REMOTE)
+
+        with self.step("open ledger-remote over the first port, open ledger.rs, quit and start again"):
+            self.start_cod_on_remote([first, second], first.url(remote))
+            self.wait_for(lambda state: real_paths(state["worktrees"]) == [real(remote)], REMOTE_TIMEOUT, "ledger-remote over the first port")
+            self.open_file("ledger.rs")
+            self.restart_cod(REMOTE_TIMEOUT)
+            self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] == "ledger.rs",
+                REMOTE_TIMEOUT,
+                "the first port's workspace with ledger.rs to come back",
+            )
+
+        with self.step("open the same folder over the second port (cod ssh://...): a fresh workspace with no tab"):
+            self.open_from_command_line(second.url(remote))
+            self.wait_for(lambda state: state["window_count"] == 2, REMOTE_TIMEOUT, "a second window for the second port")
+            self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] is None,
+                REMOTE_TIMEOUT,
+                "the second port's window with ledger-remote and no tab",
+            )
+
+        with self.step("open the folder over the first port again (cod ssh://...): ledger.rs is still its layout"):
+            self.open_from_command_line(first.url(remote))
+            self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] == "ledger.rs",
+                REMOTE_TIMEOUT,
+                "the first port's workspace with ledger.rs again",
+            )
+
+        with self.step("quit with ctrl-q and start again: the first port's workspace keeps ledger.rs"):
+            self.restart_cod(REMOTE_TIMEOUT)
+            state = self.wait_for(
+                lambda state: [real(remote)] in [real_paths(workspace["worktrees"]) for workspace in workspace_list(state)],
+                REMOTE_TIMEOUT,
+                "ledger-remote to come back",
+            )
+            if state["active_tab"] != "ledger.rs":
+                self.open_from_command_line(first.url(remote))
+            self.wait_for(
+                lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] == "ledger.rs",
+                REMOTE_TIMEOUT,
+                "the first port's workspace with ledger.rs after restart",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
