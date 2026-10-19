@@ -109,6 +109,11 @@ class Agent:
             state.update(json.loads(self.state_path.read_text(encoding="utf-8")))
         return state
 
+    def refresh_state(self) -> None:
+        """Reads the state file again before a change: Cod may run one agent process per workspace, and they share the file."""
+        if self.state_path is not None:
+            self.state = self.load_state()
+
     def save_state(self) -> None:
         if self.state_path is None:
             return
@@ -118,6 +123,7 @@ class Agent:
 
     def record(self, session_id: str, role: str, text: str) -> None:
         with self.state_lock:
+            self.refresh_state()
             session = self.state["sessions"].setdefault(session_id, {"title": None, "history": []})
             history = session["history"]
             if history and history[-1]["role"] == role:
@@ -163,6 +169,7 @@ class Agent:
 
     def new_session_id(self) -> str:
         with self.state_lock:
+            self.refresh_state()
             index = self.state["created"]
             self.state["created"] = index + 1
             ids = self.script.get("session_ids") or []
@@ -173,7 +180,9 @@ class Agent:
 
     def load_session(self, request_id: Any, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId", "")
-        session = self.state["sessions"].get(session_id)
+        with self.state_lock:
+            self.refresh_state()
+            session = self.state["sessions"].get(session_id)
         if session is None:
             self.reply_error(request_id, INTERNAL_ERROR, f"unknown session: {session_id}")
             return
@@ -186,6 +195,7 @@ class Agent:
 
     def next_turn(self) -> dict[str, Any] | None:
         with self.state_lock:
+            self.refresh_state()
             index = self.state["next_turn"]
             self.state["next_turn"] = index + 1
             self.save_state()
@@ -224,6 +234,7 @@ class Agent:
             )
         elif "title" in step:
             with self.state_lock:
+                self.refresh_state()
                 self.state["sessions"].setdefault(session_id, {"title": None, "history": []})["title"] = step["title"]
                 self.save_state()
             self.session_update(session_id, {"sessionUpdate": "session_info_update", "title": step["title"]})
@@ -266,6 +277,7 @@ class Agent:
         outcome = (response.get("result") or {}).get("outcome") or {}
         answer = outcome.get("optionId") if outcome.get("outcome") == "selected" else "cancelled"
         with self.state_lock:
+            self.refresh_state()
             self.state["permissions"].append({"session": session_id, "title": title, "answer": answer})
             self.save_state()
         status = "completed" if answer == "allow" else "failed"
