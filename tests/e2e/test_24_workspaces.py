@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import loopback_ssh
-from cod_e2e import POLL_INTERVAL, Cod, CodTestCase, cod_command, cod_environment
+from cod_e2e import Cod, CodTestCase, cod_command, cod_environment
 
 NEW_WORKSPACE = "workspace: new workspace"
 RENAME_WORKSPACE = "workspace: rename workspace"
@@ -1720,12 +1720,11 @@ class WorkspacesTest(CodTestCase):
         with self.step("put the real remote server back and open ledger-remote over SSH again (cod ssh://...)"):
             ssh.install_remote_server()
             assert self.cod is not None
-            deadline = time.monotonic() + SHOW_TIMEOUT
-            while self.cod.process is not None and self.cod.process.poll() is None and time.monotonic() < deadline:
-                if not self.compositor_windows():
-                    break
-                time.sleep(POLL_INTERVAL)
-            if self.cod.process is not None and self.cod.process.poll() is not None:
+            # On Linux Zed quits when its last window closes (bind_on_window_closed in crates/zed/src/zed.rs).
+            assert self.cod.process is not None
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.cod.process.wait(timeout=RESTORE_TIMEOUT)
+            if self.cod.process.poll() is not None:
                 # Closing the last window quit Cod: start it again on the ssh:// url.
                 status = self.cod.process.returncode
                 self.expect_equal("exit status after the last window closed", 0, status)
