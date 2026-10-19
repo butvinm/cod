@@ -1513,9 +1513,8 @@ impl AgentPanel {
             // its agent as the global "last used agent", which is right for the active thread
             // restored above but wrong for a background one; put back below once every
             // background chat is resumed.
-            let original_selected_agent = panel
-                .read_with(cx, |panel, _cx| panel.selected_agent.clone())
-                .ok();
+            let original_selected_agent =
+                panel.read_with(cx, |panel, _cx| panel.selected_agent.clone());
 
             // Cod (#28 AC4): every other chat this workspace held before quitting also comes
             // back, not only the one just restored as active, each resumed in the background
@@ -1530,21 +1529,14 @@ impl AgentPanel {
                 }) {
                     Ok(Some((store, reload_task))) => {
                         reload_task.await;
-                        let sessions = store
-                            .read_with(cx, |store, cx| {
-                                store.cod_workspace_sessions(i64::from(workspace_id), cx)
-                            })
-                            .ok();
-                        if let Some(sessions) = sessions
-                            && let Ok(session_ids) = sessions.await
-                        {
+                        let sessions = store.read_with(cx, |store, cx| {
+                            store.cod_workspace_sessions(i64::from(workspace_id), cx)
+                        });
+                        if let Ok(session_ids) = sessions.await {
                             for session_id in session_ids {
-                                let entry = store
-                                    .read_with(cx, |store, _cx| {
-                                        store.entry_by_session(&session_id).cloned()
-                                    })
-                                    .ok()
-                                    .flatten();
+                                let entry = store.read_with(cx, |store, _cx| {
+                                    store.entry_by_session(&session_id).cloned()
+                                });
                                 let Some(entry) = entry else {
                                     continue;
                                 };
@@ -1571,13 +1563,9 @@ impl AgentPanel {
                     }
                 }
             }
-            if let Some(original_agent) = original_selected_agent {
-                panel
-                    .update(cx, |panel, cx| {
-                        panel.set_selected_agent_and_persist(original_agent, cx);
-                    })
-                    .ok();
-            }
+            panel.update(cx, |panel, cx| {
+                panel.set_selected_agent_and_persist(original_selected_agent, cx);
+            });
 
             // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
             // the default agent in its agent panel, so opening the panel lands in it ready for
