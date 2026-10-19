@@ -13,6 +13,7 @@ from typing import Any
 
 from cod_e2e import CodTestCase
 from fake_acp_agent import fake_agent_settings
+from page_server import PageServer
 
 AGENT_ID = "claude-acp"
 
@@ -64,6 +65,11 @@ def focused_link_text(state: dict[str, Any]) -> str | None:
 
 
 class AgentChatLinksTest(CodTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.server = PageServer()
+        self.addCleanup(self.server.close)
+
     def test_links_and_file_mentions_in_a_reply_are_reached_and_opened_from_the_keyboard(self) -> None:
         with self.step("create the fixture repo billing-api and the agent script"):
             repo = self.make_repo("billing-api", BILLING_API)
@@ -138,6 +144,59 @@ class AgentChatLinksTest(CodTestCase):
         with self.step("check that the file opened in the same workspace"):
             state = self.state()
             self.expect_equal("workspace count", 1, state["workspace_count"])
+            self.expect_equal("window count", 1, state["window_count"])
+
+    def test_ac6_enter_on_a_focused_url_opens_it_in_a_page_tab_like_a_click(self) -> None:
+        """#28 AC6, the URL half: Enter on the focused URL of a reply opens it the same way a click does, a page tab (#32)."""
+        page_url = self.server.url("/tracker/PAY-1234")
+        page_title = "PAY-1234 Fix invoice rounding"
+        reply = f"The ticket is [the tracker]({page_url})."
+
+        with self.step("create the fixture repo billing-api and an agent script whose reply links to the local page"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            script = self.workdir / "agent-script.json"
+            script.write_text(
+                json.dumps(
+                    {
+                        "session_ids": ["claude-session-pay-1234"],
+                        "turns": [{"steps": [{"chunk": reply}, {"end": "end_turn"}]}],
+                    }
+                )
+            )
+            agent_servers = {AGENT_ID: fake_agent_settings(script, log=self.workdir / "agent.log")}
+
+        with self.step("start Cod on billing-api, start a chat with the fake agent and send a prompt"):
+            self.start_cod(repo, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                30,
+                "the billing-api folder to open",
+            )
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            self.keys("end up enter")
+            self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
+            self.type("Where is the ticket?")
+            self.keys("enter")
+            self.wait_for(lambda state: page_url in chat(state).get("transcript", ""), 30, "the scripted reply in the transcript")
+
+        with self.step("move the focus into the reply and tab to its one link"):
+            self.keys("alt-up")
+            self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
+            self.keys("tab")
+            self.wait_for(lambda state: focused_link_text(state) == "the tracker", 10, "the focus on the tracker link")
+
+        with self.step("press enter: the page opens in a tab, the same way a click on the link would"):
+            self.keys("enter")
+            self.wait_for(lambda state: state["active_tab"] == page_title, 30, "the page to open in a tab and become active")
+
+        with self.step("check the page tab"):
+            state = self.state()
+            page = next((page for page in state["pages"]["open"] if page["url"] == page_url), None)
+            assert page is not None, f"expected a page tab for {page_url!r}, actual pages: {state['pages']['open']}"
+            self.expect_equal("page title", page_title, page["title"])
+            self.expect_equal("page active", True, page["active"])
             self.expect_equal("window count", 1, state["window_count"])
 
 
@@ -390,6 +449,59 @@ class WorkspaceChatsTest(CodTestCase):
                 if direction == "in" and json.loads(message).get("method") == "session/load":
                     loaded.add(json.loads(message)["params"]["sessionId"])
             self.expect_equal("loaded sessions", sorted([a_session, b_session]), sorted(loaded))
+
+    def test_ac1_ac4_two_chats_in_one_workspace_and_one_in_another_all_come_back_after_a_restart(self) -> None:
+        """#28 AC1/AC4: every chat of each workspace comes back after a restart, not only the
+        workspace's last active one: two chats in workspace A, one in workspace B."""
+        with self.step("start Cod on billing-api with a fake agent that titles its chats, keeping its session"):
+            repo = self.start_fake_agent_cod(
+                persistent=True,
+                turns=[
+                    {"steps": [{"title": "fix invoice rounding"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]},
+                    {"steps": [{"title": "read the ledger export"}, {"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
+                    {"steps": [{"title": "plan the next release"}, {"chunk": "No blockers."}, {"end": "end_turn"}]},
+                ],
+            )
+
+        with self.step("workspace A: start two chats with the fake agent"):
+            a_first = self.start_chat("Where does the rounding happen?", PAY_REPLY, [])
+            a_second = self.start_chat("What does the ledger export read?", LEDGER_REPLY, [a_first])
+
+        with self.step(f"run {NEW_WORKSPACE!r}, add billing-api there and start one chat"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] != before["active_workspace"]
+                and state["modal"] is None,
+                SHOW_TIMEOUT,
+                "the new workspace",
+            )
+            self.add_folder(repo)
+            b_session = self.start_chat("What's next?", "No blockers.", [a_first, a_second])
+
+        with self.step("quit Cod and start it again"):
+            self.restart_cod()
+
+        with self.step("workspace B (the last active) comes back with its one chat as a tab"):
+            self.wait_for(
+                lambda state: [tab["session_id"] for tab in state["chat_tabs"]] == [b_session],
+                RESTORE_TIMEOUT,
+                "workspace B's one chat tab",
+            )
+
+        with self.step(f"switch to workspace A with {PREVIOUS_WORKSPACE!r}: both of its chats are back as tabs"):
+            self.run_command(PREVIOUS_WORKSPACE)
+            state = self.wait_for(
+                lambda state: sorted(tab["session_id"] for tab in state["chat_tabs"]) == sorted([a_first, a_second]),
+                RESTORE_TIMEOUT,
+                "workspace A's two chat tabs",
+            )
+            self.expect_equal(
+                "tab titles",
+                sorted([f"{AGENT_ID}: fix invoice rounding", f"{AGENT_ID}: read the ledger export"]),
+                sorted(tab["title"] for tab in state["chat_tabs"]),
+            )
 
     def test_ac1_tabs_show_only_the_active_workspaces_chats_with_name_and_dot(self) -> None:
         """Given two chats in one workspace and one in another, the panel header's chat tabs show only the active workspace's own chats, each named and with a status dot."""
