@@ -1,8 +1,8 @@
 """Remote SSH windows with Cod workspaces: lifecycle cases that are not in the 0.0.1 minimum (story #24, PM scope comment of 2026-10-19).
 
-These tests are not a #24 gate. The name of this file does not match test_*.py, so `script/e2e` without names never runs it; CI runs it in its own step, "Remote multi-workspace tracking (not a #24 gate)", and keeps its artifacts apart.
-Run it with `script/e2e remote_tracking_24`. The basic SSH tests that gate #24 stay in test_24_workspaces.py.
-They use the loopback sshd of tests/e2e/loopback_ssh.py, as the basic SSH tests do.
+These tests are not a #24 gate. The name of this file does not match test_*.py, so `script/e2e` without names never runs it; the optional workflow "E2E remote (optional)" (.github/workflows/e2e-remote.yml) runs it in its own step, which never fails the run, and keeps its artifacts apart.
+Run it with `script/e2e remote_tracking_24`. The basic SSH set is in remote_24.py.
+They use the loopback sshd of tests/e2e/loopback_ssh.py and the helpers of remote_24.py, as the basic SSH tests do.
 With lazy restore a remote workspace that is not shown connects only when it is shown, so the restart tests switch to it before they expect its connection modal.
 """
 
@@ -14,7 +14,7 @@ import subprocess
 import unittest
 from typing import Any
 
-import test_24_workspaces as workspaces
+import remote_24
 from cod_e2e import cod_command, cod_environment
 from test_24_workspaces import (
     DOCS_SITE,
@@ -31,8 +31,8 @@ from test_24_workspaces import (
 )
 
 
-class RemoteWorkspacesTrackingTest(workspaces.WorkspacesTest):
-    """Uses the helpers of WorkspacesTest; load_tests below runs only the tests defined here, never the inherited ones."""
+class RemoteWorkspacesTrackingTest(remote_24.RemoteWorkspacesTest):
+    """Uses the helpers of RemoteWorkspacesTest and WorkspacesTest; load_tests below runs only the tests defined here, never the inherited ones."""
 
     def show_restoring_remote_workspace(self) -> dict[str, Any]:
         """After a restart with the local workspace active: waits for both workspaces, then shows the remote one with "workspace: next workspace", so its connection starts."""
@@ -304,7 +304,7 @@ class RemoteWorkspacesTrackingTest(workspaces.WorkspacesTest):
 
 
 def load_tests(loader: unittest.TestLoader, tests: unittest.TestSuite, pattern: str | None) -> unittest.TestSuite:
-    """Only the tests defined in RemoteWorkspacesTrackingTest, never the ones it inherits from WorkspacesTest. -k still filters them."""
+    """Only the tests defined in RemoteWorkspacesTrackingTest, never the ones it inherits from RemoteWorkspacesTest or WorkspacesTest. -k still filters them."""
     own = set(vars(RemoteWorkspacesTrackingTest))
     names = [name for name in loader.getTestCaseNames(RemoteWorkspacesTrackingTest) if name in own]
     return unittest.TestSuite(RemoteWorkspacesTrackingTest(name) for name in names)
