@@ -372,6 +372,52 @@ class RestartTest(unittest.TestCase):
         cod.connect.assert_called_once_with(7)
 
 
+class StopTest(unittest.TestCase):
+    """Cod.stop() kills the processes of a test that left its process group, including one that shows up after a first empty scan."""
+
+    def stopped_cod(self) -> cod_e2e.Cod:
+        cod = cod_e2e.Cod.__new__(cod_e2e.Cod)
+        cod.driver = None
+        cod.socket_path = Path("/tmp/cod-e2e-stop/driver/cod.sock")
+        cod.process = mock.Mock(pid=4242)
+        return cod
+
+    def test_a_helper_that_appears_after_an_empty_scan_is_killed(self) -> None:
+        cod = self.stopped_cod()
+        scans = iter([[], [57680], [], []])
+        with (
+            mock.patch.object(cod_e2e, "processes_with_marker", side_effect=lambda marker: next(scans, [])),
+            mock.patch.object(cod_e2e.os, "killpg") as killpg,
+            mock.patch.object(cod_e2e.os, "kill") as kill,
+            mock.patch.object(cod_e2e, "STOP_SETTLE_INTERVAL", 0.01),
+            mock.patch.object(cod_e2e, "POLL_INTERVAL", 0.01),
+        ):
+            cod.stop()
+        killpg.assert_called_once()
+        kill.assert_called_once_with(57680, cod_e2e.signal.SIGKILL)
+        self.assertIsNone(cod.process)
+
+    def test_a_helper_that_stays_fails_with_its_command_line(self) -> None:
+        cod = self.stopped_cod()
+        me = os.getpid()
+        with (
+            mock.patch.object(cod_e2e, "processes_with_marker", return_value=[me]),
+            mock.patch.object(cod_e2e.os, "killpg"),
+            mock.patch.object(cod_e2e.os, "kill"),
+            mock.patch.object(cod_e2e, "STOP_LEFTOVER_TIMEOUT", 0.1),
+            mock.patch.object(cod_e2e, "POLL_INTERVAL", 0.01),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                cod.stop()
+        message = str(caught.exception)
+        self.assertIn("still running 0.1 s after Cod was stopped", message)
+        self.assertIn(f"{me} (", message)
+        self.assertIn("python", message)
+
+    def test_describe_processes_names_a_gone_process(self) -> None:
+        self.assertEqual(cod_e2e.describe_processes([0]), "0 (gone)")
+
+
 class SwayTest(unittest.TestCase):
     TREE = {
         "type": "root",

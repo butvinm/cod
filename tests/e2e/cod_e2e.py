@@ -45,6 +45,10 @@ POLL_INTERVAL = 0.1
 MAX_SOCKET_PATH = 107
 # How long Cod may take to exit after Ctrl-Q, and how long the processes it started may take to follow.
 QUIT_TIMEOUT = 30.0
+# How long stop() keeps killing processes of a test that left its process group before it fails. Cod starts helpers in sessions of their own (Zed's login shell that reads the environment, language servers), and one of them can be in the middle of exec, with an empty /proc/<pid>/environ, when the first scan runs.
+STOP_LEFTOVER_TIMEOUT = 10.0
+# The pause between the two scans that must both find no process before stop() reports the test clean.
+STOP_SETTLE_INTERVAL = 0.2
 # How long the command palette may take to highlight the typed command.
 PALETTE_TIMEOUT = 10.0
 
@@ -343,6 +347,20 @@ def processes_with_marker(marker: str) -> list[int]:
     return found
 
 
+def describe_processes(pids: list[int]) -> str:
+    """Each process id with its command line, for error messages: `123 (/bin/bash -l -i -c ...)`, or `123 (gone)` when it exited meanwhile."""
+    parts = []
+    for pid in pids:
+        try:
+            raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            parts.append(f"{pid} (gone)")
+            continue
+        command = " ".join(part.decode(errors="replace") for part in raw.split(b"\0") if part)
+        parts.append(f"{pid} ({command or 'no command line'})")
+    return ", ".join(parts)
+
+
 class Cod:
     """One running Cod app, started through cod-wayland.sh. A persistent Cod can be quit and started again on the same data folder and home."""
 
@@ -449,7 +467,7 @@ class Cod:
             time.sleep(POLL_INTERVAL)
             left = processes_with_marker(self.marker)
         if left:
-            raise AssertionError(f"processes of this Cod were still running {timeout:g} s after it quit: {left}")
+            raise AssertionError(f"processes of this Cod were still running {timeout:g} s after it quit: {describe_processes(left)}")
         if status != 0:
             raise AssertionError(f"Cod exited with status {status} after ctrl-q (see cod-output.log and logs/cod-stderr.log)")
         # The socket file of the old Cod stays behind; the next Cod replaces it, but connect() must not see it in the meantime.
@@ -480,7 +498,7 @@ class Cod:
             time.sleep(POLL_INTERVAL)
             left = processes_with_marker(self.marker)
         if left:
-            raise AssertionError(f"processes of this Cod were still running {timeout:g} s after SIGKILL: {left}")
+            raise AssertionError(f"processes of this Cod were still running {timeout:g} s after SIGKILL: {describe_processes(left)}")
         # The killed Cod leaves its socket file behind; connect() must not see it before the next Cod listens.
         with contextlib.suppress(FileNotFoundError):
             self.socket_path.unlink()
@@ -504,20 +522,28 @@ class Cod:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(self.process.pid, signal.SIGKILL)
                 self.process.wait(timeout=10)
-        # Helpers that left the process group still carry the driver socket in their environment.
-        for _ in range(2):
+        self.process = None
+        # Helpers that left the process group still carry the driver socket in their environment. They are killed until two scans in a row find none, for up to STOP_LEFTOVER_TIMEOUT.
+        deadline = time.monotonic() + STOP_LEFTOVER_TIMEOUT
+        clean_scans = 0
+        while clean_scans < 2 and time.monotonic() < deadline:
             leftovers = processes_with_marker(marker)
             if not leftovers:
-                break
-            log(f"  killing processes of this test that left its process group: {leftovers}")
+                clean_scans += 1
+                if clean_scans < 2:
+                    time.sleep(STOP_SETTLE_INTERVAL)
+                continue
+            clean_scans = 0
+            log(f"  killing processes of this test that left its process group: {describe_processes(leftovers)}")
             for pid in leftovers:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(pid, signal.SIGKILL)
-            time.sleep(0.5)
-        self.process = None
+            time.sleep(POLL_INTERVAL)
         left = processes_with_marker(marker)
         if left:
-            raise RuntimeError(f"processes of this test are still running after Cod was stopped: {left}")
+            raise RuntimeError(
+                f"processes of this test are still running {STOP_LEFTOVER_TIMEOUT:g} s after Cod was stopped: {describe_processes(left)}"
+            )
         log("  Cod stopped; no process of this test is left")
 
 
