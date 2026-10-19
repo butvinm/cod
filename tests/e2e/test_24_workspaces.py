@@ -1238,6 +1238,8 @@ class WorkspacesTest(CodTestCase):
             names = [entry["name"] for entry in entries]
             self.expect_equal("window count", 1, state["window_count"])
             self.expect_equal("workspace count", len(entries), state["workspace_count"])
+            # The path launch opens a folder that saved workspaces already use: it shows one of them and adds no workspace.
+            self.expect_equal("workspace count after the path launch and the plain start", len(named_expected), state["workspace_count"])
             for name in named_expected:
                 self.expect_equal(f"times {name!r} shows", 1, names.count(name))
             for entry in entries:
