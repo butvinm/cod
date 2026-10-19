@@ -46,6 +46,10 @@ RESTORE_TIMEOUT = 45.0
 DOT_TIMEOUT = 1.0
 # How long a state that must not change is watched.
 SETTLE_TIME = 1.5
+# Review #25/#26: how long a workspace other than the one shown after a restart may take to
+# load lazily the first time it is shown (about 1-3 s in CI); watched long enough that an
+# older load's completion switching back to it would be caught.
+PENDING_LOAD_SETTLE = 6.0
 
 BILLING_API = {
     "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -285,6 +289,38 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.wait_for_tabs("the clicked tab", {"active": [True, False, False], "active_workspace": 0, "dots": ["yellow", None, None]})
 
     # AC5
+
+    def test_ac5_newest_click_wins_over_a_still_loading_tabs_completion(self) -> None:
+        """Review finding: clicking a tab that is still loading, then clicking an already loaded
+        tab before the first one finishes, must leave the second tab active. The first
+        workspace keeps loading in the background, but its completion must not switch the
+        window back to it: the newest click decides."""
+        self.start_with_three_named_workspaces(persistent=True)
+
+        with self.step("quit with ctrl-q and start again: OPS-77 stays active, PAY-1234 and DOC-208 are pending"):
+            self.restart_cod()
+            state = self.wait_for_tabs(
+                "the restored tabs", {"names": NAMES, "active": [False, False, True], "active_workspace": 2}, RESTORE_TIMEOUT
+            )
+            self.expect_equal("PAY-1234 not loaded yet", False, state["workspaces"][0]["drawn"])
+
+        with self.step("click PAY-1234 (still loading), then click OPS-77 (already loaded) before it finishes"):
+            self.click_tab(state, 0)
+            self.click_tab(state, 2)
+            self.wait_for_tabs(
+                "OPS-77 active right after the second click", {"active": [False, False, True], "active_workspace": 2}
+            )
+
+        with self.step("OPS-77 stays active for as long as PAY-1234 may still be loading in the background"):
+            self.stays(
+                lambda state: state["active_workspace"] == 2 and active_tabs(state) == [False, False, True],
+                PENDING_LOAD_SETTLE,
+                "OPS-77 active while PAY-1234 finishes loading in the background",
+            )
+
+        with self.step("PAY-1234 did load in the background: clicking it now shows it"):
+            self.click_tab(self.state(), 0)
+            self.wait_for_tabs("PAY-1234 after its own click", {"active": [True, False, False], "active_workspace": 0})
 
     def test_ac5_clicking_a_tab_shows_it_and_plus_opens_a_new_workspace(self) -> None:
         self.start_with_three_named_workspaces()
