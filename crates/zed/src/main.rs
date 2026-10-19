@@ -977,15 +977,19 @@ fn main() {
                                 }
                             }
                         };
-                    for window in registry_windows.unwrap_or_default() {
-                        if matches!(
-                            window.active_workspace.location,
-                            SerializedWorkspaceLocation::Local
-                        ) {
-                            restore_multiworkspace(window, app_state.clone(), cx)
-                                .await
-                                .log_err();
-                        }
+                    // Cod (#24): as at a plain launch, the restore owners of the windows that
+                    // come back are installed before any of them is created, so each window is
+                    // built with its saved key and all its members (a quit during the restore
+                    // saves the window whole).
+                    let (local_windows, _) = cod_prepare_restored_windows(
+                        registry_windows.unwrap_or_default(),
+                        false,
+                        cx,
+                    );
+                    for window in local_windows {
+                        restore_multiworkspace(window, app_state.clone(), cx)
+                            .await
+                            .log_err();
                     }
                     cx.update(|cx| {
                         workspace::cod_finish_registry_startup(cx);
@@ -1574,6 +1578,35 @@ fn cod_release_external_opens(cx: &mut App) {
     }
 }
 
+/// Cod (#24): splits the windows of a start into local and remote windows and installs the
+/// restore owner of every window this start restores (saved key, complete ordered membership,
+/// each member's location and folders) before any window is created, so each restored window
+/// is built with its saved key and all its members. Without `restore_remote` the remote
+/// windows are not restored: they get no owner and none is returned.
+fn cod_prepare_restored_windows(
+    windows: Vec<workspace::SerializedMultiWorkspace>,
+    restore_remote: bool,
+    cx: &mut AsyncApp,
+) -> (
+    Vec<workspace::SerializedMultiWorkspace>,
+    Vec<workspace::SerializedMultiWorkspace>,
+) {
+    let (mut restored, remote_windows): (Vec<_>, Vec<_>) =
+        windows.into_iter().partition(|window| {
+            matches!(
+                window.active_workspace.location,
+                SerializedWorkspaceLocation::Local
+            )
+        });
+    let local_count = restored.len();
+    if restore_remote {
+        restored.extend(remote_windows);
+    }
+    cx.update(|cx| workspace::cod_install_restore_owners(&restored, cx));
+    let remote_windows = restored.split_off(local_count);
+    (restored, remote_windows)
+}
+
 async fn restore_or_create_from(
     restorable: Option<Vec<workspace::SerializedMultiWorkspace>>,
     app_state: Arc<AppState>,
@@ -1581,20 +1614,11 @@ async fn restore_or_create_from(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if let Some(multi_workspaces) = restorable {
-        // Cod (#24): every window's restore owner (saved key, complete ordered membership,
-        // each member's location and folders) is in place before any window is created, so
-        // each restored window is built with its saved key and all its members.
-        cx.update(|cx| workspace::cod_install_restore_owners(&multi_workspaces, cx));
         // Cod (#24): the local windows come back first. A remote window may wait on its
         // connection (a Retry/Cancel prompt), so external opens are released once only remote
         // windows are left.
-        let (local_windows, remote_windows): (Vec<_>, Vec<_>) =
-            multi_workspaces.into_iter().partition(|multi_workspace| {
-                matches!(
-                    multi_workspace.active_workspace.location,
-                    SerializedWorkspaceLocation::Local
-                )
-            });
+        let (local_windows, remote_windows) =
+            cod_prepare_restored_windows(multi_workspaces, true, cx);
         let mut error_count = 0;
         for multi_workspace in local_windows.into_iter().chain(remote_windows) {
             let result = match &multi_workspace.active_workspace.location {
