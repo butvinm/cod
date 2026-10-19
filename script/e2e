@@ -8,7 +8,7 @@
 #   script/e2e remote_tracking_24               the remote multi-workspace lifecycle cases; never in the default run either
 # The remote tests need the remote server binary and a throwaway SSH account (below). CI runs them only in the optional workflow "E2E remote (optional)" (.github/workflows/e2e-remote.yml), by hand or on pushes to master.
 # Optional environment:
-#   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
+#   COD_E2E_BIN        a prebuilt zed binary with cod-browser and codctl next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
 #   COD_E2E_REMOTE_SERVER  the remote_server binary for the loopback SSH tests (cargo build --profile release-fast -p remote_server); default the one next to the zed binary when it exists.
@@ -58,13 +58,14 @@ if [ -n "${COD_E2E_BIN:-}" ]; then
     zed_bin=$(realpath "$COD_E2E_BIN")
     say "using the prebuilt binary $zed_bin"
 else
-    say "build started at $(date '+%H:%M:%S'): cargo build --profile release-fast -p zed -p cod_browser"
-    cargo build --profile release-fast -p zed -p cod_browser
+    say "build started at $(date '+%H:%M:%S'): cargo build --profile release-fast -p zed -p cod_browser -p codctl"
+    cargo build --profile release-fast -p zed -p cod_browser -p codctl
     say "build finished at $(date '+%H:%M:%S')"
     zed_bin="$root/target/release-fast/zed"
 fi
 browser_bin="$(dirname "$zed_bin")/cod-browser"
-for binary in "$zed_bin" "$browser_bin"; do
+codctl_bin="$(dirname "$zed_bin")/codctl"
+for binary in "$zed_bin" "$browser_bin" "$codctl_bin"; do
     [ -x "$binary" ] || { say "$binary is missing or not executable"; exit 2; }
 done
 if [ -z "${COD_E2E_REMOTE_SERVER:-}" ] && [ -x "$(dirname "$zed_bin")/remote_server" ]; then
@@ -109,8 +110,9 @@ rm -rf "$root/target/e2e-run"
 mkdir -p "$run"
 ln -f "$zed_bin" "$run/cod" 2> /dev/null || cp -f "$zed_bin" "$run/cod"
 ln -f "$browser_bin" "$run/cod-browser" 2> /dev/null || cp -f "$browser_bin" "$run/cod-browser"
+ln -f "$codctl_bin" "$run/codctl" 2> /dev/null || cp -f "$codctl_bin" "$run/codctl"
 cp -f script/cod-wayland.sh "$run/cod-wayland.sh"
-chmod +x "$run/cod" "$run/cod-browser" "$run/cod-wayland.sh"
+chmod +x "$run/cod" "$run/cod-browser" "$run/codctl" "$run/cod-wayland.sh"
 export COD_E2E_RUN_DIR="$run"
 
 # 5. The artifacts folder. Only the default folder is emptied first.
