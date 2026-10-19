@@ -938,3 +938,21 @@ fn cod_linked_worktree_main_path(folder: &std::path::Path) -> Option<std::path::
     // A folder whose identity is the folder itself is not a linked worktree of another one.
     (identity != folder).then_some(identity)
 }
+
+/// Cod (#37): names the workspace like "workspace: rename workspace" does (None removes the
+/// name) and shows the new name in the window title when the workspace is the one shown.
+pub fn cod_set_workspace_name(
+    workspace: &Entity<Workspace>,
+    name: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let id = workspace.read(cx).database_id();
+    set_workspace_name(id, name, cx);
+    workspace.update(cx, |workspace, cx| {
+        if workspace.owns_window_chrome() {
+            workspace.refresh_window_state(window, cx);
+        }
+        cx.notify();
+    });
+}

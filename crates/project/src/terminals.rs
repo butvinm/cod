@@ -29,6 +29,39 @@ pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
 }
 
+/// Cod (#37): environment variables that the terminals of a project get on top of the usual ones,
+/// by the project's entity id. The workspace that holds the project sets `COD_WORKSPACE` here.
+#[derive(Default)]
+struct CodTerminalEnv(HashMap<gpui::EntityId, HashMap<String, String>>);
+
+impl gpui::Global for CodTerminalEnv {}
+
+/// Cod (#37): sets (or with None removes) a variable for the terminals the project opens from now on.
+pub fn cod_set_terminal_env(
+    project: gpui::EntityId,
+    name: &str,
+    value: Option<String>,
+    cx: &mut App,
+) {
+    let vars = &mut cx.default_global::<CodTerminalEnv>().0;
+    match value {
+        Some(value) => {
+            vars.entry(project).or_default().insert(name.to_owned(), value);
+        }
+        None => {
+            if let Some(project_vars) = vars.get_mut(&project) {
+                project_vars.remove(name);
+            }
+        }
+    }
+}
+
+fn cod_terminal_env(project: gpui::EntityId, cx: &App) -> HashMap<String, String> {
+    cx.try_global::<CodTerminalEnv>()
+        .and_then(|vars| vars.0.get(&project).cloned())
+        .unwrap_or_default()
+}
+
 impl Project {
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
         let entry_id = self.active_entry()?;
@@ -132,9 +165,11 @@ impl Project {
             .map(|p| self.active_toolchain(p, LanguageName::new_static("Python"), cx))
             .collect::<Vec<_>>();
         let lang_registry = self.languages.clone();
+        let cod_env = cod_terminal_env(cx.entity_id(), cx);
         cx.spawn(async move |project, cx| {
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            env.extend(cod_env);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -383,6 +418,7 @@ impl Project {
             self.resolve_directory_environment(&env_shell, path.clone(), remote_client.clone(), cx);
 
         let lang_registry = self.languages.clone();
+        let cod_env = cod_terminal_env(cx.entity_id(), cx);
         cx.spawn(async move |project, cx| {
             let remote_shell = if let Some(remote_shell_request) = remote_shell_request {
                 let response = remote_shell_request
@@ -404,6 +440,7 @@ impl Project {
             let shell_kind = ShellKind::new(&shell_program, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
             env.extend(settings.env);
+            env.extend(cod_env);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {

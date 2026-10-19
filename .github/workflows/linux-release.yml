@@ -101,7 +101,7 @@ jobs:
           CARGO_BUILD_JOBS: "8"
         run: |
           sccache --zero-stats
-          cargo build --profile release-fast --timings -p zed -p cod_browser
+          cargo build --profile release-fast --timings -p zed -p cod_browser -p codctl
           sccache --show-stats
           df -h /
           du -sh "$CEF_PATH"
@@ -194,9 +194,10 @@ jobs:
           mkdir cod
           cp target/release-fast/zed cod/cod
           cp target/release-fast/cod-browser cod/cod-browser
-          strip cod/cod cod/cod-browser
+          cp target/release-fast/codctl cod/codctl
+          strip cod/cod cod/cod-browser cod/codctl
           cp script/cod-xwayland.sh script/cod-wayland.sh cod/
-          chmod +x cod/cod cod/cod-browser cod/cod-xwayland.sh cod/cod-wayland.sh
+          chmod +x cod/cod cod/cod-browser cod/codctl cod/cod-xwayland.sh cod/cod-wayland.sh
           cp LICENSE-GPL LICENSE-APACHE README.md cod/
           # The Cod icons in a hicolor layout and the launcher (Icon=cod), as in stock Zed's Linux bundle,
           # plus install-launcher.sh, which installs both for the user with Exec pointing at the unpacked cod-wayland.sh.

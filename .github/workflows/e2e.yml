@@ -142,7 +142,7 @@ jobs:
         run: |
           echo "build started at $(date -u '+%H:%M:%S')"
           sccache --zero-stats
-          cargo build --profile release-fast -p zed -p cod_browser
+          cargo build --profile release-fast -p zed -p cod_browser -p codctl
           sccache --show-stats
           echo "build finished at $(date -u '+%H:%M:%S')"
 

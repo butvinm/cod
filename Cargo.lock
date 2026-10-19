@@ -3450,6 +3450,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "codctl"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "codctl_server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "codctl",
+ "editor",
+ "futures 0.3.34",
+ "git_ui_core",
+ "gpui",
+ "libc",
+ "log",
+ "serde_json",
+ "workspace",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23751,6 +23774,7 @@ dependencies = [
  "client",
  "clock",
  "cod_e2e_driver",
+ "codctl_server",
  "codestral",
  "collab_ui",
  "collections",

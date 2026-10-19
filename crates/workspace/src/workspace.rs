@@ -42,6 +42,7 @@ pub use multi_workspace::{
 pub use multi_workspace::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
+pub use multi_workspace::cod_set_workspace_name;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
@@ -1734,6 +1735,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Cod (#37): the terminals of the workspace know its ID, so codctl acts on it by default.
+        if let Some(id) = workspace_id {
+            ::project::terminals::cod_set_terminal_env(
+                project.entity_id(),
+                "COD_WORKSPACE",
+                Some(i64::from(id).to_string()),
+                cx,
+            );
+        }
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             cx.subscribe(&trusted_worktrees, |_, worktrees_store, e, cx| {
                 if let TrustedWorktreesEvent::Trusted(..) = e {
