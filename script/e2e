@@ -4,6 +4,7 @@
 #   script/e2e                                  all tests
 #   script/e2e test_22_open_file                one story file (more names or Class.method names work too)
 #   script/e2e -k file_finder                   tests whose name contains "file_finder"
+#   script/e2e remote_tracking_24               the remote multi-workspace lifecycle cases; not a #24 gate, and never in the default run (the file name does not match test_*.py)
 # Optional environment:
 #   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)

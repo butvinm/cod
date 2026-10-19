@@ -3,6 +3,7 @@
 # The tests run through script/e2e, the same command a developer runs locally; its own cargo build finds nothing to do.
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 # Pushes to master run it too, which keeps the caches warm: only master writes them.
+# The job's status is the "Run end-to-end tests" step: every test_*.py, with the basic SSH set. The remote multi-workspace lifecycle cases run after it in "Remote multi-workspace tracking (not a #24 gate)", which reports but never fails the job.
 name: E2E
 
 on:
@@ -150,6 +151,7 @@ jobs:
       # The remote server for the loopback SSH tests, so Cod never downloads one. A separate cargo command, so the zed build above keeps its own feature set and cache hits.
       # A failure here fails the job: CI is never green without the loopback SSH tests.
       - name: Build the remote server for the loopback SSH tests
+        id: remote-server
         if: steps.changes.outputs.code == 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
@@ -187,5 +189,37 @@ jobs:
         with:
           name: e2e-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
           path: target/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # The remote multi-workspace lifecycle cases (tests/e2e/remote_tracking_24.py). They are tracked for later triage and are not a #24 gate (PM scope comment on #24): this step never fails the job, but it prints every result, warns when a test fails, and keeps its own artifacts.
+      # It runs after the required tests, red or green, on the same build; the cargo build inside script/e2e has nothing to do.
+      - name: "Remote multi-workspace tracking (not a #24 gate)"
+        id: remote-tracking
+        if: ${{ !cancelled() && steps.changes.outputs.code == 'true' && steps.remote-server.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+          COD_E2E_REMOTE_SERVER: ${{ github.workspace }}/target/release-fast/remote_server
+          COD_E2E_REQUIRE_SSH: "1"
+          COD_E2E_ARTIFACTS: ${{ github.workspace }}/target/e2e-remote-tracking-artifacts
+        run: |
+          status=0
+          script/e2e remote_tracking_24 || status=$?
+          if [ "$status" != 0 ]; then
+            echo "::warning title=Remote multi-workspace tracking::remote_tracking_24 failed with status $status (not a #24 gate; see the log above and the e2e-remote-tracking-artifacts artifact)"
+          fi
+          exit "$status"
+
+      - name: Upload remote tracking artifacts
+        if: ${{ !cancelled() && steps.remote-tracking.outcome != 'skipped' && steps.changes.outputs.code == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-remote-tracking-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
+          path: target/e2e-remote-tracking-artifacts
           retention-days: 14
           if-no-files-found: warn
