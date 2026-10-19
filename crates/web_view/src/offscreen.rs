@@ -5,35 +5,78 @@
 
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
+use anyhow::Context as _;
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     App, Bounds, Context, DispatchPhase, Entity, ImageId, EventEmitter, FocusHandle, Focusable,
     HitboxBehavior, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render, RenderImage,
     ScrollDelta, ScrollWheelEvent, SharedString, Styled as _,
-    Subscription, Task, Window, canvas, div, img, px,
+    Subscription, Task, WeakEntity, Window, canvas, div, img, px,
 };
+use project::Project;
 use smallvec::SmallVec;
 use ui::prelude::*;
 use util::ResultExt as _;
-use workspace::{SplitDirection, Workspace, item::Item};
-
-use crate::browser_client::{
-    Page, PageEvent, PageFrame,
-    protocol::{
-        self, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, EVENT_ALT, EVENT_COMMAND, EVENT_CONTROL,
-        EVENT_LEFT_BUTTON, EVENT_MIDDLE_BUTTON, EVENT_RIGHT_BUTTON, EVENT_SHIFT,
-    },
+use workspace::{
+    ItemId, MultiWorkspaceEvent, SplitDirection, Workspace, WorkspaceId, delete_unloaded_items,
+    item::{Item, ItemEvent, SerializableItem},
 };
+
+use crate::{
+    browser_client::{
+        Page, PageEvent, PageFrame,
+        protocol::{
+            self, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, EVENT_ALT, EVENT_COMMAND,
+            EVENT_CONTROL, EVENT_LEFT_BUTTON, EVENT_MIDDLE_BUTTON, EVENT_RIGHT_BUTTON,
+            EVENT_SHIFT,
+        },
+    },
+    page_db::{self, CodPagesDb},
+    pages::{self, PageId, PageInfo, PageKind},
+};
+
+/// Whether a page is loading, shows its page, or could not load it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageState {
+    Loading,
+    Loaded,
+    Failed,
+}
+
+impl PageState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Loaded => "loaded",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// What a page tab tells its pane: the tab label follows the title, and a new URL or title is saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageItemEvent {
+    TitleChanged,
+    UrlChanged,
+}
 
 /// Pixels one wheel "line" scrolls, for devices that report lines.
 const WHEEL_LINE_PIXELS: f32 = 40.0;
 
+/// The off-screen browser is the Linux default (D24); `COD_WEBVIEW_BACKEND=webkitgtk` keeps the old X11 child-window spike.
 pub(crate) fn backend_requested() -> bool {
-    std::env::var("COD_WEBVIEW_BACKEND").is_ok_and(|value| value == "offscreen")
+    !std::env::var("COD_WEBVIEW_BACKEND").is_ok_and(|value| value == "webkitgtk")
 }
 
 pub(crate) fn init(cx: &mut App) {
+    workspace::register_serializable_item::<OffscreenView>(cx);
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &crate::OpenUrl, window, cx| {
+            crate::open_page_modal::OpenPageModal::toggle(workspace, window, cx);
+        });
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &crate::web_view_item::OpenSpikeUrl, window, cx| {
             let url = std::env::var("COD_SPIKE_URL")
@@ -84,33 +127,85 @@ pub fn open_url_in_split(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> anyhow::Result<Entity<OffscreenView>> {
-    let page = cx.new(|cx| OffscreenView::new(url, window, cx));
-    let view = page.read(cx);
-    if let Some(error) = view.start_error.clone() {
-        anyhow::bail!("{error}");
-    }
+    let id = pages::allocate_page_id(cx);
+    let page = OffscreenView::build(
+        url,
+        id,
+        PageKind::External,
+        None,
+        Some(workspace.weak_handle()),
+        window,
+        cx,
+    );
     workspace.split_item(direction, Box::new(page.clone()), window, cx);
     Ok(page)
 }
 
+/// Opens a new page tab in the active pane, next to the files there, and focuses it. The browser starts when the tab is first painted.
+pub(crate) fn open_page_in_active_pane(
+    workspace: &mut Workspace,
+    url: String,
+    kind: PageKind,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<OffscreenView> {
+    let id = pages::allocate_page_id(cx);
+    let page = OffscreenView::build(
+        url,
+        id,
+        kind,
+        None,
+        Some(workspace.weak_handle()),
+        window,
+        cx,
+    );
+    workspace.add_item_to_active_pane(Box::new(page.clone()), None, true, window, cx);
+    page
+}
+
+/// The off-screen driver's entry point (#16).
 pub(crate) fn open_url_in_active_pane(
     workspace: &mut Workspace,
     url: String,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> anyhow::Result<Entity<OffscreenView>> {
-    let page = cx.new(|cx| OffscreenView::new(url, window, cx));
-    if let Some(error) = page.read(cx).start_error.clone() {
-        anyhow::bail!("{error}");
+    Ok(open_page_in_active_pane(
+        workspace,
+        url,
+        PageKind::External,
+        window,
+        cx,
+    ))
+}
+
+/// Focuses the page tab of this workspace that shows `url`, or opens a new one (#32 AC4).
+pub fn open_or_focus_page(
+    workspace: &mut Workspace,
+    url: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<OffscreenView> {
+    let this = cx.entity();
+    if let Some(existing) = pages::find_by_url(&this, &url, cx) {
+        workspace.activate_item(&existing, true, true, window, cx);
+        return existing;
     }
-    workspace.add_item_to_active_pane(Box::new(page.clone()), None, true, window, cx);
-    Ok(page)
+    open_page_in_active_pane(workspace, url, PageKind::External, window, cx)
 }
 
 pub struct OffscreenView {
+    page_id: PageId,
+    kind: PageKind,
+    workspace: Option<WeakEntity<Workspace>>,
     url: SharedString,
     title: Option<SharedString>,
     loading: bool,
+    /// The last main-frame load error, cleared by the next load.
+    load_error: Option<String>,
+    /// Set once the browser was asked for, on the first paint with real bounds.
+    browser_started: bool,
+    events_tx: mpsc::UnboundedSender<PageEvent>,
     page: Option<Rc<Page>>,
     start_error: Option<String>,
     /// Set when the helper died: the pane shows this instead of a frozen page.
@@ -128,24 +223,38 @@ pub struct OffscreenView {
     pub(crate) last_frame_size: (u32, u32),
     _events: Task<()>,
     _subscriptions: Vec<Subscription>,
+    _multi_workspace: Option<Subscription>,
 }
 
 impl OffscreenView {
-    fn new(url: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// A page tab with this ID, registered so links and `codctl` can find it.
+    pub(crate) fn build(
+        url: String,
+        page_id: PageId,
+        kind: PageKind,
+        title: Option<String>,
+        workspace: Option<WeakEntity<Workspace>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let view = cx.new(|cx| {
+            let mut view = Self::new(url, page_id.clone(), kind, window, cx);
+            view.title = title.map(Into::into);
+            view.workspace = workspace;
+            view
+        });
+        pages::register(page_id, &view, cx);
+        view
+    }
+
+    fn new(
+        url: String,
+        page_id: PageId,
+        kind: PageKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (events_tx, mut events_rx) = mpsc::unbounded();
-        let scale = window.scale_factor();
-        let window_size = window.viewport_size();
-        let (page, start_error) = match Page::new(
-            &url,
-            (f32::from(window_size.width) / 2.0) as i32,
-            f32::from(window_size.height) as i32,
-            scale,
-            paths::data_dir(),
-            events_tx,
-        ) {
-            Ok(page) => (Some(Rc::new(page)), None),
-            Err(error) => (None, Some(format!("{error:#}"))),
-        };
 
         let events = cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events_rx.next().await {
@@ -173,6 +282,7 @@ impl OffscreenView {
                 }
             }),
             cx.on_release(|this, cx| {
+                pages::unregister(&this.page_id, cx);
                 if let Some(image) = this.image.take() {
                     cx.drop_image(image, None);
                 }
@@ -184,11 +294,17 @@ impl OffscreenView {
         ];
 
         Self {
+            page_id,
+            kind,
+            workspace: None,
             url: url.into(),
             title: None,
             loading: true,
-            page,
-            start_error,
+            load_error: None,
+            browser_started: false,
+            events_tx,
+            page: None,
+            start_error: None,
             failure: None,
             image: None,
             focus_handle,
@@ -201,6 +317,84 @@ impl OffscreenView {
             last_frame_size: (0, 0),
             _events: events,
             _subscriptions: subscriptions,
+            _multi_workspace: None,
+        }
+    }
+
+    /// Starts the browser at the size the pane gives the page. Pages that are never shown (inactive tabs, workspaces not opened yet) never start one.
+    fn start_browser(&mut self, bounds: Bounds<Pixels>, scale: f32) {
+        if self.browser_started {
+            return;
+        }
+        self.browser_started = true;
+        log::info!(
+            "web_view: starting the browser for {} at {:?}",
+            self.page_id,
+            bounds.size
+        );
+        match Page::new(
+            &self.url,
+            f32::from(bounds.size.width) as i32,
+            f32::from(bounds.size.height) as i32,
+            scale,
+            paths::data_dir(),
+            self.events_tx.clone(),
+        ) {
+            Ok(page) => self.page = Some(Rc::new(page)),
+            Err(error) => self.start_error = Some(format!("{error:#}")),
+        }
+    }
+
+    pub fn page_id(&self) -> &PageId {
+        &self.page_id
+    }
+
+    pub fn kind(&self) -> PageKind {
+        self.kind
+    }
+
+    pub fn workspace(&self) -> Option<&WeakEntity<Workspace>> {
+        self.workspace.as_ref()
+    }
+
+    pub fn browser_started(&self) -> bool {
+        self.browser_started
+    }
+
+    pub fn state(&self) -> PageState {
+        if self.failure.is_some() || self.start_error.is_some() || self.load_error.is_some() {
+            PageState::Failed
+        } else if self.loading {
+            PageState::Loading
+        } else {
+            PageState::Loaded
+        }
+    }
+
+    pub fn info(&self) -> PageInfo {
+        PageInfo {
+            id: self.page_id.clone(),
+            url: self.url.clone(),
+            title: self.title.clone(),
+            state: self.state(),
+            kind: self.kind,
+            workspace: self.workspace.clone(),
+        }
+    }
+
+    /// Back, forward or reload (`protocol::NAVIGATE_*`). A page whose browser has not started yet ignores it.
+    pub(crate) fn navigate(&mut self, action: u8, _cx: &mut Context<Self>) {
+        if let Some(page) = &self.page {
+            page.navigate(action);
+        }
+    }
+
+    fn hide(&mut self, reason: &str) {
+        if !self.hidden.replace(true) {
+            log::info!("web_view: {} hidden: {reason}", self.page_id);
+            if let Some(page) = &self.page {
+                page.set_hidden(true);
+            }
         }
     }
 
@@ -219,13 +413,22 @@ impl OffscreenView {
                 };
                 if let Some(title) = diagnostics.title {
                     log::info!("web_view: title {title:?}");
-                    self.title = Some(title.into());
+                    if self.title.as_deref() != Some(title.as_str()) {
+                        self.title = Some(title.into());
+                        cx.emit(PageItemEvent::TitleChanged);
+                    }
                 }
                 if let Some(url) = diagnostics.address {
                     log::info!("web_view: address {url}");
-                    self.url = url.into();
+                    if self.url.as_ref() != url.as_str() {
+                        self.url = url.into();
+                        cx.emit(PageItemEvent::UrlChanged);
+                    }
                 }
                 if let Some(loading) = diagnostics.loading {
+                    if loading {
+                        self.load_error = None;
+                    }
                     log::info!(
                         "web_view: loading={loading} title={:?}",
                         self.title.as_deref().unwrap_or_default()
@@ -254,6 +457,22 @@ impl OffscreenView {
                 }
             }
             PageEvent::Closed => {}
+            PageEvent::LoadFailed { url, error } => {
+                log::warn!("web_view: {} could not load {url}: {error}", self.page_id);
+                self.load_error = Some(error);
+            }
+            PageEvent::PopupRequested(url) => {
+                // A new window becomes a page tab of the same workspace, like a link from a chat.
+                log::info!("web_view: {} asked for a new window: {url}", self.page_id);
+                if let Some(workspace) = self.workspace.as_ref().and_then(|w| w.upgrade()) {
+                    // Deferred: finding an open tab by URL reads every page, this one included.
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            open_or_focus_page(workspace, url, window, cx);
+                        });
+                    });
+                }
+            }
             PageEvent::Failed(reason) => {
                 log::error!("web_view: the page failed: {reason}");
                 if let Some(image) = self.image.take() {
@@ -446,7 +665,7 @@ fn page_point(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (i32, i32) {
     )
 }
 
-impl EventEmitter<()> for OffscreenView {}
+impl EventEmitter<PageItemEvent> for OffscreenView {}
 
 impl Focusable for OffscreenView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -455,10 +674,17 @@ impl Focusable for OffscreenView {
 }
 
 impl Item for OffscreenView {
-    type Event = ();
+    type Event = PageItemEvent;
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        self.title.clone().unwrap_or_else(|| self.url.clone())
+        self.title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| self.url.clone())
+    }
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::Link))
     }
 
     fn tab_tooltip_text(&self, _: &App) -> Option<SharedString> {
@@ -469,13 +695,61 @@ impl Item for OffscreenView {
         None
     }
 
-    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        if !self.hidden.replace(true) {
-            log::info!("web_view: tab deactivated, page hidden");
-            if let Some(page) = &self.page {
-                page.set_hidden(true);
-            }
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
+        match event {
+            PageItemEvent::TitleChanged | PageItemEvent::UrlChanged => f(ItemEvent::UpdateTab),
         }
+    }
+
+    fn can_split(&self) -> bool {
+        true
+    }
+
+    /// The split shows the page's current URL in a new page tab with its own ID.
+    fn clone_on_split(
+        &self,
+        _workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<Entity<Self>>> {
+        let id = pages::allocate_page_id(cx);
+        let view = Self::build(
+            self.url.to_string(),
+            id,
+            self.kind,
+            self.title.as_ref().map(|title| title.to_string()),
+            self.workspace.clone(),
+            window,
+            cx,
+        );
+        Task::ready(Some(view))
+    }
+
+    fn added_to_workspace(
+        &mut self,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this_workspace = workspace.weak_handle();
+        self.workspace = Some(this_workspace.clone());
+        // When the window switches to another workspace, this page is not drawn any more: tell the browser so it stops painting. It shows again, without a reload, on the next paint.
+        self._multi_workspace = workspace
+            .multi_workspace()
+            .and_then(|multi| multi.upgrade())
+            .map(|multi| {
+                cx.subscribe_in(&multi, window, move |this, multi, event, _window, cx| {
+                    if let MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event
+                        && multi.read(cx).workspace().downgrade() != this_workspace
+                    {
+                        this.hide("its workspace is not the active one");
+                    }
+                })
+            });
+    }
+
+    fn deactivated(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.hide("tab deactivated");
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
@@ -483,6 +757,74 @@ impl Item for OffscreenView {
         if let Some(page) = &self.page {
             page.close();
         }
+    }
+}
+
+impl SerializableItem for OffscreenView {
+    fn serialized_item_kind() -> &'static str {
+        "CodPage"
+    }
+
+    fn cleanup(
+        workspace_id: WorkspaceId,
+        alive_items: Vec<ItemId>,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = CodPagesDb::global(cx);
+        delete_unloaded_items(alive_items, workspace_id, page_db::TABLE, &db, cx)
+    }
+
+    /// Restores the tab from its saved row. The browser is not started here, so a restore never fails because of the browser; it starts when the tab is first shown.
+    fn deserialize(
+        _project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Entity<Self>>> {
+        let saved = CodPagesDb::global(cx).get_page(item_id, workspace_id);
+        window.spawn(cx, async move |cx| {
+            let saved = saved?.context("no saved page for this item")?;
+            cx.update(|window, cx| {
+                OffscreenView::build(
+                    saved.url,
+                    PageId(saved.page_id.into()),
+                    PageKind::parse(&saved.kind),
+                    saved.title,
+                    Some(workspace),
+                    window,
+                    cx,
+                )
+            })
+        })
+    }
+
+    fn serialize(
+        &mut self,
+        workspace: &mut Workspace,
+        item_id: ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<anyhow::Result<()>>> {
+        let workspace_id = workspace.database_id()?;
+        let db = CodPagesDb::global(cx);
+        let page_id = self.page_id.to_string();
+        let url = self.url.to_string();
+        let title = self.title.as_ref().map(|title| title.to_string());
+        let kind = self.kind.as_str().to_string();
+        Some(cx.background_spawn(async move {
+            db.save_page(item_id, workspace_id, page_id, url, title, kind)
+                .await
+        }))
+    }
+
+    fn should_serialize(&self, event: &Self::Event) -> bool {
+        matches!(
+            event,
+            PageItemEvent::UrlChanged | PageItemEvent::TitleChanged
+        )
     }
 }
 
@@ -514,6 +856,8 @@ impl Render for OffscreenView {
         // Recorded when GPUI paints the pane, so the driver can tell a frame that was built from one that was drawn.
         let painted = self.painted.clone();
         let painted_marker = image.as_ref().map(|image| (image.id, shown_size));
+        let needs_browser = !self.browser_started;
+        let this = cx.weak_entity();
 
         div()
             .key_context("WebView")
@@ -528,7 +872,18 @@ impl Render for OffscreenView {
                     {
                         let page = page.clone();
                         let pane_bounds = pane_bounds.clone();
-                        move |bounds, window, _cx| {
+                        move |bounds, window, cx| {
+                            if needs_browser
+                                && bounds.size.width > px(0.0)
+                                && bounds.size.height > px(0.0)
+                            {
+                                let scale = window.scale_factor();
+                                this.update(cx, |this, cx| {
+                                    this.start_browser(bounds, scale);
+                                    cx.notify();
+                                })
+                                .log_err();
+                            }
                             if pane_bounds.get() != bounds {
                                 log::info!(
                                     "web_view: pane bounds {:?} scale {}",
