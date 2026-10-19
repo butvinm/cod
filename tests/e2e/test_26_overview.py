@@ -246,6 +246,40 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
             self.keys("left")
             self.wait_for_selected(0)
 
+    def test_ac5_the_list_scrolls_to_keep_the_selection_visible(self) -> None:
+        with self.step("start Cod on billing-api and give its workspace enough sessions to overflow the list"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(billing_api)
+            self.wait_for(lambda state: state["workspace_count"] == 1 and state["modal"] is None, SHOW_TIMEOUT, "the first workspace")
+            session_count = 30
+            for index in range(session_count):
+                self.set_entry(0, f"s{index}", "idle", title=f"Session {index:02d}")
+
+        with self.step("open the overview: fewer rows are drawn than the list holds"):
+            state = self.open_overview()
+            total_rows = len(overview(state)["rows"])
+            visible = overview(state)["visible_range"]
+            visible_count = visible["end"] - visible["start"]
+            if visible_count <= 0 or visible_count >= total_rows:
+                raise AssertionError(
+                    f"expected the fixture to overflow the list (drew {visible_count} of {total_rows} rows): widen the fixture"
+                )
+            self.expect_equal("the first row is visible", True, visible["start"] <= 0 < visible["end"])
+
+        with self.step("press down past the first page: the list scrolls to keep the selection visible"):
+            for _ in range(visible_count):
+                self.keys("down")
+            state = self.wait_for_selected(visible_count)
+            visible = overview(state)["visible_range"]
+            self.expect_equal("the selected row is visible", True, visible["start"] <= visible_count < visible["end"])
+            self.expect_equal("the list scrolled past the first page", True, visible["start"] > 0)
+
+        with self.step("press up back to the first row: the list scrolls back up with it"):
+            self.keys(" ".join(["up"] * visible_count))
+            state = self.wait_for_selected(0)
+            visible = overview(state)["visible_range"]
+            self.expect_equal("the first row is visible again", True, visible["start"] <= 0 < visible["end"])
+
     # AC6
 
     def test_ac6_enter_switches_to_the_workspace_of_the_row(self) -> None:
