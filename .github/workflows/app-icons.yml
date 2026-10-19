@@ -14,6 +14,11 @@ on:
       - "crates/zed/build.rs"
       - "script/cod-app-icons*"
       - "script/cod-linux-desktop-files"
+      - "script/install-launcher.sh"
+      - "script/cod-wayland.sh"
+      - "crates/zed/src/zed.rs"
+      - "crates/workspace/src/welcome.rs"
+      - "crates/onboarding/src/onboarding.rs"
       - "script/bundle-*"
       - ".github/workflows/app-icons.yml"
       - ".github/workflows/linux-release.yml"
@@ -79,9 +84,39 @@ jobs:
           test "$(tr -d '[:space:]' < crates/zed/RELEASE_CHANNEL)" = stable
           grep -q 'ReleaseChannel::Stable => "dev.zed.Zed",' crates/release_channel/src/lib.rs
           grep -q 'script/cod-linux-desktop-files cod' .github/workflows/linux-release.yml
+          test -x cod/install-launcher.sh
+          grep -q 'cp script/cod-xwayland.sh script/cod-wayland.sh cod/' .github/workflows/linux-release.yml
           tar -cJf cod-desktop-files.tar.xz cod
           tar -tvJf cod-desktop-files.tar.xz | tee out/package-listing.txt
           cp cod/share/applications/dev.zed.Zed.desktop out/
+
+      # Unpacks the layout with the start script into a folder with a space, as a user would, and installs the launcher into a temporary HOME.
+      - name: Install the launcher into a temporary HOME
+        run: |
+          unpacked="$RUNNER_TEMP/unpacked here"
+          home="$RUNNER_TEMP/home"
+          mkdir -p "$unpacked" "$home"
+          tar -xJf cod-desktop-files.tar.xz -C "$unpacked"
+          cp script/cod-wayland.sh "$unpacked/cod/"
+          chmod +x "$unpacked/cod/cod-wayland.sh"
+          # Run from another folder, so nothing depends on the current directory.
+          (cd "$home" && env -u XDG_DATA_HOME HOME="$home" sh "$unpacked/cod/install-launcher.sh") | tee out/install-launcher.txt
+          installed="$home/.local/share/applications/dev.zed.Zed.desktop"
+          desktop-file-validate "$installed"
+          cp "$installed" out/installed-dev.zed.Zed.desktop
+          grep -qx 'Icon=cod' "$installed"
+          exec_line=$(grep '^Exec=' "$installed")
+          tryexec_line=$(grep '^TryExec=' "$installed")
+          test "$exec_line" = "Exec=\"$unpacked/cod/cod-wayland.sh\""
+          test "$tryexec_line" = "TryExec=$unpacked/cod/cod-wayland.sh"
+          exec_path=${exec_line#Exec=\"}
+          exec_path=${exec_path%\"}
+          test -x "$exec_path"
+          test -x "${tryexec_line#TryExec=}"
+          for size in 16 32 48 64 128 256 512 1024; do
+            cmp "cod/share/icons/hicolor/${size}x${size}/apps/cod.png" "$home/.local/share/icons/hicolor/${size}x${size}/apps/cod.png"
+          done
+          { echo "$exec_line"; echo "$tryexec_line"; find "$home" -type f | sort; } | tee -a out/install-launcher.txt
 
       - name: Record where the app uses the icons
         run: |

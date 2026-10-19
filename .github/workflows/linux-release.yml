@@ -198,7 +198,8 @@ jobs:
           cp script/cod-xwayland.sh script/cod-wayland.sh cod/
           chmod +x cod/cod cod/cod-browser cod/cod-xwayland.sh cod/cod-wayland.sh
           cp LICENSE-GPL LICENSE-APACHE README.md cod/
-          # The Cod icons in a hicolor layout and the launcher (Icon=cod), as in stock Zed's Linux bundle.
+          # The Cod icons in a hicolor layout and the launcher (Icon=cod), as in stock Zed's Linux bundle,
+          # plus install-launcher.sh, which installs both for the user with Exec pointing at the unpacked cod-wayland.sh.
           script/cod-linux-desktop-files cod
           {
             echo "version=$CEF_VERSION"

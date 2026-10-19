@@ -14,4 +14,7 @@ mkdir -p "$dest/share/icons" "$dest/share/applications"
 cp -R "$resources/linux/hicolor" "$dest/share/icons/"
 cp "$resources/linux/dev.zed.Zed.desktop" "$dest/share/applications/dev.zed.Zed.desktop"
 chmod 755 "$dest/share/applications/dev.zed.Zed.desktop"
-find "$dest/share" -type f | sort
+# install-launcher.sh copies both into ~/.local/share with Exec pointing at the unpacked cod-wayland.sh.
+cp "$(dirname "$0")/install-launcher.sh" "$dest/install-launcher.sh"
+chmod 755 "$dest/install-launcher.sh"
+find "$dest/share" "$dest/install-launcher.sh" -type f | sort
