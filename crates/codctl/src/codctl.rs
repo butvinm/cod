@@ -33,6 +33,9 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 /// Exit code of `workspace close`: the user kept the workspace.
 pub const EXIT_KEPT: i32 = 2;
+/// Exit code of `session wait` (#39 AC4): the timeout ran out before the session reached the
+/// wanted state.
+pub const EXIT_TIMEOUT: i32 = 3;
 
 /// What `codctl` prints to stderr when no Cod listens on the socket.
 pub const NOT_RUNNING: &str = "Cod is not running";
@@ -131,6 +134,31 @@ pub enum Request {
     PageForward { page: String },
     /// Closes the page tab.
     PageClose { page: String },
+    /// Starts a chat with this agent id in the workspace's agent panel and returns its provider
+    /// session id (#39 AC1). `pane` is accepted for the story's CLI shape but has no effect yet:
+    /// Zed 1.23.2's agent panel has no chat-as-pane-tab UI (an open question for the PM).
+    SessionNew {
+        workspace: Option<String>,
+        agent: String,
+        pane: Option<u64>,
+    },
+    /// Lists the sessions of the workspace (#39 AC2).
+    SessionList { workspace: Option<String> },
+    /// Sends the text as the user's message in the session and starts the agent (#39 AC3).
+    SessionSend { session: String, text: String },
+    /// Blocks until the session reaches `until` (`idle` or `needs-input`), or the timeout runs
+    /// out (#39 AC4).
+    SessionWait {
+        session: String,
+        until: String,
+        timeout: Option<f64>,
+    },
+    /// Without `line`, reports the session's state and current status line. With one (even
+    /// empty, which clears it), sets the status line shown in the overview (#39 AC5).
+    SessionStatus {
+        session: String,
+        line: Option<String>,
+    },
 }
 
 fn paths_json(paths: &[PathBuf]) -> Value {
@@ -166,6 +194,11 @@ impl Request {
             Request::PageBack { .. } => "page.back",
             Request::PageForward { .. } => "page.forward",
             Request::PageClose { .. } => "page.close",
+            Request::SessionNew { .. } => "session.new",
+            Request::SessionList { .. } => "session.list",
+            Request::SessionSend { .. } => "session.send",
+            Request::SessionWait { .. } => "session.wait",
+            Request::SessionStatus { .. } => "session.status",
         }
     }
 
@@ -235,6 +268,15 @@ impl Request {
             | Request::PageBack { page }
             | Request::PageForward { page }
             | Request::PageClose { page } => json!({ "page": page }),
+            Request::SessionNew { workspace, agent, pane } => {
+                json!({ "workspace": workspace, "agent": agent, "pane": pane })
+            }
+            Request::SessionList { workspace } => json!({ "workspace": workspace }),
+            Request::SessionSend { session, text } => json!({ "session": session, "text": text }),
+            Request::SessionWait { session, until, timeout } => {
+                json!({ "session": session, "until": until, "timeout": timeout })
+            }
+            Request::SessionStatus { session, line } => json!({ "session": session, "line": line }),
         }
     }
 
@@ -287,6 +329,17 @@ fn arg_optional_number(args: &Map<String, Value>, key: &str) -> Result<Option<u6
 
 fn arg_number(args: &Map<String, Value>, key: &str) -> Result<u64, String> {
     arg_optional_number(args, key)?.ok_or_else(|| format!("missing {key}"))
+}
+
+fn arg_optional_f64(args: &Map<String, Value>, key: &str) -> Result<Option<f64>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|number| *number > 0.)
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a number greater than 0")),
+    }
 }
 
 fn arg_position(args: &Map<String, Value>, key: &str) -> Result<Option<u32>, String> {
@@ -453,6 +506,36 @@ pub fn parse_request_line(line: &str) -> Result<Envelope, (Value, String)> {
         "page.close" => Request::PageClose {
             page: arg_string(args, "page").map_err(&fail)?,
         },
+        "session.new" => Request::SessionNew {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+            agent: arg_string(args, "agent").map_err(&fail)?,
+            pane: arg_optional_number(args, "pane").map_err(&fail)?,
+        },
+        "session.list" => Request::SessionList {
+            workspace: arg_optional_string(args, "workspace").map_err(&fail)?,
+        },
+        "session.send" => Request::SessionSend {
+            session: arg_string(args, "session").map_err(&fail)?,
+            text: arg_string(args, "text").map_err(&fail)?,
+        },
+        "session.wait" => Request::SessionWait {
+            session: arg_string(args, "session").map_err(&fail)?,
+            until: match arg_string(args, "until").map_err(&fail)?.as_str() {
+                until @ ("idle" | "needs-input") => until.to_owned(),
+                other => return Err(fail(format!("until must be idle or needs-input, not {other}"))),
+            },
+            timeout: arg_optional_f64(args, "timeout").map_err(&fail)?,
+        },
+        "session.status" => Request::SessionStatus {
+            session: arg_string(args, "session").map_err(&fail)?,
+            // Unlike `arg_optional_string`, an empty line is valid here: it clears the override
+            // (#39 AC5), so only a missing or non-string `line` is an error.
+            line: match args.get("line") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(value.clone()),
+                Some(_) => return Err(fail("line must be a string".to_owned())),
+            },
+        },
         other => return Err(fail(format!("unknown command {other}"))),
     };
     Ok(Envelope { id, request })
@@ -541,12 +624,27 @@ Page commands:
   page close <page>
       Close the page tab.
 
+Session commands:
+  session new --agent claude|codex [--workspace <workspace>] [--pane <pane>]
+      Start a chat with the agent in the workspace's agent panel and print its provider session ID.
+      It does not take focus. --pane is accepted but has no effect yet (Zed 1.23.2 has no chat tabs in a pane).
+  session list [--workspace <workspace>]
+      Print ID, agent, state and name of every session of the workspace, one per line.
+  session send <session> <text>
+      Send the text as the user's message in the session and start the agent. Returns at once.
+  session wait <session> --until idle|needs-input [--timeout <seconds>]
+      Block until the session reaches that state, then print its last reply or the pending prompt.
+  session status <session> [--line <text>]
+      Without --line, print the session's state and current status line.
+      With --line, set the status line shown in the overview; an empty line clears it.
+
 <workspace> is a workspace ID or its exact name, also given as --workspace <workspace>.
-Without one, workspace commands act on the workspace in $COD_WORKSPACE. Pane, file and diff commands act on --workspace, else $COD_WORKSPACE, else the workspace shown in the active window.
+Without one, workspace commands act on the workspace in $COD_WORKSPACE. Pane, file, diff and session new/list commands act on --workspace, else $COD_WORKSPACE, else the workspace shown in the active window.
 Page commands act on the page ID alone: a page keeps the same ID across every workspace and window, and across a restart.
+Session send, wait and status act on the session ID alone, found among the sessions of every workspace.
 --json prints the result as JSON.
 
-Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace or pane (close).
+Exit codes: 0 done, 1 error or Cod is not running, 2 the user kept the workspace or pane (close), 3 session wait timed out.
 ";
 
 /// What the command line asks for.
@@ -571,6 +669,10 @@ struct Options {
     workspace: Option<String>,
     pane: Option<String>,
     size: Option<String>,
+    agent: Option<String>,
+    until: Option<String>,
+    timeout: Option<String>,
+    line: Option<String>,
     seen: Vec<&'static str>,
     positionals: Vec<String>,
 }
@@ -651,6 +753,34 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
                 options.workspace = Some(take_value("--workspace", &mut rest)?);
                 "--workspace"
             }
+            "--agent" => {
+                if options.agent.is_some() {
+                    return Err("--agent is given twice".to_owned());
+                }
+                options.agent = Some(take_value("--agent", &mut rest)?);
+                "--agent"
+            }
+            "--until" => {
+                if options.until.is_some() {
+                    return Err("--until is given twice".to_owned());
+                }
+                options.until = Some(take_value("--until", &mut rest)?);
+                "--until"
+            }
+            "--timeout" => {
+                if options.timeout.is_some() {
+                    return Err("--timeout is given twice".to_owned());
+                }
+                options.timeout = Some(take_value("--timeout", &mut rest)?);
+                "--timeout"
+            }
+            "--line" => {
+                if options.line.is_some() {
+                    return Err("--line is given twice".to_owned());
+                }
+                options.line = Some(take_value("--line", &mut rest)?);
+                "--line"
+            }
             other => return Err(format!("unknown option {other}")),
         };
         if !options.seen.contains(&flag) {
@@ -703,6 +833,9 @@ pub fn parse_cli(
     }
     if matches!(group.as_str(), "pane" | "open" | "diff" | "page") {
         return parse_layout_cli(group, &args[1..], env, cwd);
+    }
+    if group == "session" {
+        return parse_session_cli(&args[1..], env);
     }
     if group != "workspace" {
         return Err(format!("unknown command {group}: run codctl --help"));
@@ -1003,6 +1136,105 @@ fn parse_layout_cli(
     })
 }
 
+/// Parses `session <command> ...` (#39). `args` are the arguments after `session`.
+fn parse_session_cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> Result<Cli, String> {
+    let Some(command) = args.first() else {
+        return Ok(Cli::Help);
+    };
+    if command == "help" || command == "--help" || command == "-h" {
+        return Ok(Cli::Help);
+    }
+    let command = command.clone();
+    let options = parse_options(&args[1..])?;
+    let allowed: &[&str] = match command.as_str() {
+        "new" => &["--json", "--agent", "--workspace", "--pane"],
+        "list" => &["--json", "--workspace"],
+        "send" => &["--json"],
+        "wait" => &["--json", "--until", "--timeout"],
+        "status" => &["--json", "--line"],
+        other => return Err(format!("unknown command session {other}: run codctl --help")),
+    };
+    if let Some(flag) = options.seen.iter().find(|flag| !allowed.contains(*flag)) {
+        return Err(format!("session {command} does not take {flag}"));
+    }
+    let workspace = options
+        .workspace
+        .clone()
+        .or_else(|| env(WORKSPACE_ENV).filter(|workspace| !workspace.is_empty()));
+    let positionals = options.positionals.as_slice();
+    let takes = |expected: &str| format!("session {command} takes {expected}");
+    let request = match command.as_str() {
+        "new" => {
+            if !positionals.is_empty() {
+                return Err(takes("no positional arguments: use --agent"));
+            }
+            let agent = match options.agent.as_deref() {
+                Some(agent @ ("claude" | "codex")) => agent.to_owned(),
+                Some(other) => return Err(format!("--agent must be claude or codex, not {other}")),
+                None => return Err(takes("--agent claude or --agent codex")),
+            };
+            Request::SessionNew {
+                workspace,
+                agent,
+                pane: options.pane.as_deref().map(pane_id).transpose()?,
+            }
+        }
+        "list" => {
+            if !positionals.is_empty() {
+                return Err(takes("no arguments"));
+            }
+            Request::SessionList { workspace }
+        }
+        "send" => {
+            let [session, text] = positionals else {
+                return Err(takes("a session ID and a message"));
+            };
+            Request::SessionSend {
+                session: session.clone(),
+                text: text.clone(),
+            }
+        }
+        "wait" => {
+            let [session] = positionals else {
+                return Err(takes("one session ID"));
+            };
+            let until = match options.until.as_deref() {
+                Some(until @ ("idle" | "needs-input")) => until.to_owned(),
+                Some(other) => return Err(format!("--until must be idle or needs-input, not {other}")),
+                None => return Err(takes("--until idle or --until needs-input")),
+            };
+            let timeout = match options.timeout.as_deref() {
+                None => None,
+                Some(text) => Some(
+                    text.parse::<f64>()
+                        .ok()
+                        .filter(|seconds| *seconds > 0.)
+                        .ok_or_else(|| format!("--timeout must be a number of seconds greater than 0, not {text:?}"))?,
+                ),
+            };
+            Request::SessionWait {
+                session: session.clone(),
+                until,
+                timeout,
+            }
+        }
+        "status" => {
+            let [session] = positionals else {
+                return Err(takes("one session ID"));
+            };
+            Request::SessionStatus {
+                session: session.clone(),
+                line: options.line.clone(),
+            }
+        }
+        _ => unreachable!("checked above"),
+    };
+    Ok(Cli::Run {
+        request,
+        json: options.json,
+    })
+}
+
 /// Parses `<percent>%` into a whole percentage from 1 to 99.
 fn parse_size_percent(text: &str) -> Result<u8, String> {
     text.strip_suffix('%')
@@ -1111,6 +1343,55 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
             let title = result.get("title").and_then(Value::as_str).unwrap_or("-");
             let state = result.get("state").and_then(Value::as_str).unwrap_or_default();
             (format!("{url}\t{}\t{state}\n", one_line(title)), EXIT_OK)
+        }
+        Request::SessionNew { .. } => {
+            if json {
+                (format!("{result}\n"), EXIT_OK)
+            } else {
+                let id = result.get("id").and_then(Value::as_str).unwrap_or_default();
+                (format!("{id}\n"), EXIT_OK)
+            }
+        }
+        Request::SessionList { .. } => {
+            if json {
+                return (format!("{result}\n"), EXIT_OK);
+            }
+            let mut out = String::new();
+            for session in result.as_array().into_iter().flatten() {
+                let id = session.get("id").and_then(Value::as_str).unwrap_or_default();
+                let agent = session.get("agent").and_then(Value::as_str).unwrap_or("-");
+                let state = session.get("state").and_then(Value::as_str).unwrap_or("-");
+                let name = session.get("name").and_then(Value::as_str).unwrap_or("-");
+                out.push_str(&format!("{id}\t{agent}\t{state}\t{}\n", one_line(name)));
+            }
+            (out, EXIT_OK)
+        }
+        Request::SessionSend { .. } => {
+            let out = if json { format!("{result}\n") } else { String::new() };
+            (out, EXIT_OK)
+        }
+        Request::SessionWait { .. } => {
+            let timed_out = result.get("timeout").and_then(Value::as_bool).unwrap_or(false);
+            if json {
+                return (format!("{result}\n"), if timed_out { EXIT_TIMEOUT } else { EXIT_OK });
+            }
+            if timed_out {
+                return (String::new(), EXIT_TIMEOUT);
+            }
+            let text = result.get("text").and_then(Value::as_str).unwrap_or_default();
+            (format!("{text}\n"), EXIT_OK)
+        }
+        Request::SessionStatus { line: Some(_), .. } => {
+            let out = if json { format!("{result}\n") } else { String::new() };
+            (out, EXIT_OK)
+        }
+        Request::SessionStatus { line: None, .. } => {
+            if json {
+                return (format!("{result}\n"), EXIT_OK);
+            }
+            let state = result.get("state").and_then(Value::as_str).unwrap_or("-");
+            let line = result.get("line").and_then(Value::as_str).unwrap_or("");
+            (format!("{state}\t{line}\n"), EXIT_OK)
         }
     }
 }
