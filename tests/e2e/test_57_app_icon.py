@@ -416,8 +416,24 @@ class AppIconTest(CodTestCase):
             self.type("zed: show welcome")
 
         with self.step("press enter"):
+            windows_before = len(sway_windows(self.sway_tree()))
             self.keys("enter")
-            self.wait_for(lambda state: state["modal"] is None and state["active_tab"] == WELCOME_TAB, 10, "the Welcome tab to open")
+            self.wait_for(lambda state: state["modal"] is None, 10, "the command palette to close")
+
+        with self.step("wait for the Welcome page"):
+            # Stock Zed may open the Welcome page in a new window, which the driver's state does not see; sway's tree does.
+            deadline = time.monotonic() + 15
+            while True:
+                state = self.state()
+                windows = sway_windows(self.sway_tree())
+                if state["active_tab"] == WELCOME_TAB or len(windows) > windows_before:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AssertionError(
+                        f"timed out after 15 s waiting for the Welcome page; state {state!r}; sway windows {[w.get('name') for w in windows]!r}"
+                    )
+                time.sleep(0.2)
+            log(f"  active tab {state['active_tab']!r}; sway windows {[w.get('name') for w in windows]!r}")
 
         artifacts = self.icon_artifacts
         screen_path = artifacts / "welcome.png"
@@ -427,17 +443,25 @@ class AppIconTest(CodTestCase):
             self.grim(screen_path)
 
         with self.step("find the drawn icon and compare it with app-icon.png"):
-            # Recorded as evidence, not asserted: the 512 px icon drawn at 45 px is filtered differently from the area average here.
-            windows = [w for w in sway_windows(self.sway_tree()) if w.get("rect", {}).get("width", 0) > 0]
-            window = max(windows, key=lambda w: w["rect"]["width"] * w["rect"]["height"])
-            rect = window["rect"]
+            # The same limits as for the About window. The 512 px icon drawn at 45 px is filtered differently from the area average here, so the match is loose.
+            windows = [w for w in sway_windows(self.sway_tree()) if w.get("rect", {}).get("width", 0) > WELCOME_ICON_SIZE]
             width, height, channels, rows = read_png(screen_path)
             screen = rgb_pixels(width, height, channels, rows)
-            region = (rect["x"], rect["y"], min(width, rect["x"] + rect["width"]), min(height, rect["y"] + rect["height"]))
-            samples = [screen[y * width + x] for y in range(region[1], region[3], 7) for x in range(region[0], region[2], 7)]
-            background = Counter(samples).most_common(1)[0][0]
-            reference = area_scaled_reference(WELCOME_ICON_SIZE, background)
-            difference, x, y = search_icon(screen, width, region, reference, WELCOME_ICON_SIZE)
+            matches = []
+            # Every window is searched with its own most common color as the background; the best match wins.
+            for window in windows:
+                rect = window["rect"]
+                region = (rect["x"], rect["y"], min(width, rect["x"] + rect["width"]), min(height, rect["y"] + rect["height"]))
+                if region[2] - region[0] <= WELCOME_ICON_SIZE or region[3] - region[1] <= WELCOME_ICON_SIZE:
+                    continue
+                samples = [screen[y * width + x] for y in range(region[1], region[3], 7) for x in range(region[0], region[2], 7)]
+                background = Counter(samples).most_common(1)[0][0]
+                reference = area_scaled_reference(WELCOME_ICON_SIZE, background)
+                difference, x, y = search_icon(screen, width, region, reference, WELCOME_ICON_SIZE)
+                matches.append((difference, x, y, rect, background, reference))
+            if not matches:
+                raise AssertionError(f"no window large enough to search; sway windows {windows!r}")
+            difference, x, y, rect, background, reference = min(matches, key=lambda match: match[0])
             flat = mean_difference(screen, width, x, y, [background] * (WELCOME_ICON_SIZE * WELCOME_ICON_SIZE), WELCOME_ICON_SIZE)
             crop = [screen[(y + dy) * width + x + dx] for dy in range(WELCOME_ICON_SIZE) for dx in range(WELCOME_ICON_SIZE)]
             write_png(artifacts / "welcome-icon-crop.png", WELCOME_ICON_SIZE, WELCOME_ICON_SIZE, crop)
@@ -458,6 +482,16 @@ class AppIconTest(CodTestCase):
                 + "\n"
             )
             log(f"  welcome icon difference {difference:.2f} at ({x}, {y}); background-only difference {flat:.2f}; background {background}")
+            self.assertLess(
+                difference,
+                MAX_ICON_DIFFERENCE,
+                f"the best match for app-icon.png on the Welcome page differs by {difference:.2f} per channel (allowed {MAX_ICON_DIFFERENCE}); see welcome.png and welcome-icon-crop.png",
+            )
+            self.assertLess(
+                difference,
+                flat * MAX_SHARE_OF_BACKGROUND,
+                f"the Welcome page icon ({difference:.2f}) is not much closer to app-icon.png than a plain background ({flat:.2f}) is",
+            )
 
 
 if __name__ == "__main__":
