@@ -583,6 +583,7 @@ fn read_state(
                         "name": workspace::cod_workspace_name_by_id(*id, cx),
                         "worktrees": worktrees,
                         "drawn": false,
+                        "remote": multi_workspace.cod_pending_is_remote(*id),
                     });
                 }
             };
@@ -597,6 +598,7 @@ fn read_state(
                 "name": workspace_name(workspace, cx),
                 "worktrees": worktrees_of(workspace.read(cx), cx),
                 "drawn": drawn,
+                "remote": workspace.read(cx).project().read(cx).is_via_remote_server(),
             })
         })
         .collect();
