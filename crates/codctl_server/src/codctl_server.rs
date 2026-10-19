@@ -12,10 +12,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use codctl::Request;
-use gpui::{App, AsyncApp, Entity, WindowHandle};
+use gpui::{App, AsyncApp, Entity, EntityId, WindowHandle};
 use serde_json::{Value, json};
 use workspace::{
-    CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Workspace, WorkspaceId,
+    CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RemovalIntent, SaveIntent,
+    Workspace, WorkspaceId,
 };
 
 /// The rolled-up status of a workspace until workspace statuses exist (#25, #26).
@@ -86,9 +87,8 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
             cx.update(|cx| resolve(&workspace, cx))?;
             bail!("workspace rename is not available in this build yet (#37)")
         }
-        Request::WorkspaceClose { workspace, .. } => {
-            cx.update(|cx| resolve(&workspace, cx))?;
-            bail!("workspace close is not available in this build yet (#37)")
+        Request::WorkspaceClose { workspace, force } => {
+            close_workspace(&workspace, force, cx).await
         }
     }
 }
@@ -287,6 +287,65 @@ async fn add_folders(reference: &str, folders: Vec<PathBuf>, cx: &mut AsyncApp) 
         result?;
     }
     Ok(json!({ "id": id }))
+}
+
+/// How many items of the workspace have unsaved changes.
+fn unsaved_count(workspace: &Entity<Workspace>, cx: &App) -> usize {
+    workspace
+        .read(cx)
+        .panes()
+        .iter()
+        .flat_map(|pane| pane.read(cx).items())
+        .filter(|item| item.is_dirty(cx))
+        .count()
+}
+
+/// Closes the workspace. Its unsaved files are closed first the way Zed closes unsaved tabs (`Pane::close_items` with `SaveIntent::Close`: the same prompt, Save, Don't Save or Cancel), in the workspace shown so the user sees what is asked; `force` drops them without asking (`SaveIntent::Skip`).
+/// When a file is still unsaved after that, the user kept the workspace: `{"closed": false}`. Otherwise the workspace leaves the window and its session like the palette close (`MultiWorkspace::remove`, which also drops its name), and a closed only workspace leaves an empty one.
+async fn close_workspace(reference: &str, force: bool, cx: &mut AsyncApp) -> Result<Value> {
+    let member = cx.update(|cx| resolve(reference, cx))?;
+    let id = i64::from(id_of(&member)?);
+    let window = member.window;
+    let Some(workspace) = member.live else {
+        bail!("workspace {id} is not loaded yet: show it first with codctl workspace focus {id}");
+    };
+    if cx.update(|cx| unsaved_count(&workspace, cx)) > 0 {
+        if !force {
+            window.update(cx, |multi_workspace, window, cx| {
+                if *multi_workspace.workspace() != workspace {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                }
+            })?;
+        }
+        let intent = if force {
+            SaveIntent::Skip
+        } else {
+            SaveIntent::Close
+        };
+        let panes = cx.update(|cx| workspace.read(cx).panes().to_vec());
+        for pane in panes {
+            let closing = window.update(cx, |_, window, cx| {
+                pane.update(cx, |pane, cx| {
+                    let unsaved: Vec<EntityId> = pane
+                        .items()
+                        .filter(|item| item.is_dirty(cx))
+                        .map(|item| item.item_id())
+                        .collect();
+                    pane.close_items(window, cx, intent, &move |item| unsaved.contains(&item))
+                })
+            })?;
+            closing.await?;
+        }
+        if cx.update(|cx| unsaved_count(&workspace, cx)) > 0 {
+            return Ok(json!({ "closed": false }));
+        }
+    }
+    let removed = window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.remove([workspace], RemovalIntent::CloseProject, window, cx)
+        })?
+        .await?;
+    Ok(json!({ "closed": removed }))
 }
 
 /// Checks on the client thread, before anything reaches the window, that every folder of the request is a folder.
