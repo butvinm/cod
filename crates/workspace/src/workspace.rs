@@ -12334,7 +12334,13 @@ async fn open_remote_project_inner(
                 cx,
             );
         } else {
+            // Cod (#24): the empty local workspace the window showed while it connected leaves
+            // as soon as the remote workspace is shown, in a new window or the window Cod
+            // started with. Only a workspace with no saved id, no folder and no item goes
+            // (`cod_drop_connection_placeholder`): one the user made or named has a saved id.
+            let cod_placeholder = multi_workspace.workspace().clone();
             multi_workspace.activate(new_workspace.clone(), source_workspace, window, cx);
+            multi_workspace.cod_drop_connection_placeholder(&cod_placeholder, cx);
         }
         new_workspace
     })?;
