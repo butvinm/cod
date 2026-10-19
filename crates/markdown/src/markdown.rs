@@ -1167,11 +1167,11 @@ impl Markdown {
             .map(|link| link.destination_url.clone())
     }
 
-    /// The source text of the link that has the keyboard focus, if any (Cod #28).
+    /// The rendered text of the link that has the keyboard focus, if any (Cod #28): what the
+    /// link shows, not its raw markdown source (which for a real `[text](url)` link also holds
+    /// the brackets, the destination and any inline formatting markers its text carries).
     pub fn focused_link_text(&self) -> Option<&str> {
-        self.focused_link
-            .as_ref()
-            .and_then(|link| self.source.get(link.source_range.clone()))
+        self.focused_link.as_ref().map(|link| link.text.as_ref())
     }
 
     /// Moves the keyboard focus to the next or previous link of `links` (in reading order).
@@ -1977,7 +1977,7 @@ impl MarkdownElement {
                 );
             }
             let source_range = range.start + candidate.start..range.start + candidate.end;
-            builder.push_link(url.clone(), source_range.clone());
+            builder.push_link(text[candidate.clone()].into(), url.clone(), source_range.clone());
             let link_style = self
                 .style
                 .link_callback
@@ -2016,7 +2016,7 @@ impl MarkdownElement {
         let chip_background = code_style.background_color.take();
 
         if let Some(url) = link_url {
-            builder.push_link(url.clone(), range.clone());
+            builder.push_link(text.into(), url.clone(), range.clone());
             let link_style = self
                 .style
                 .link_callback
@@ -3056,7 +3056,11 @@ impl Element for MarkdownElement {
                         MarkdownTag::Link { dest_url, .. } => {
                             if builder.code_block_stack.is_empty() {
                                 builder.link_depth += 1;
-                                builder.push_link(dest_url.clone(), range.clone());
+                                // The link's rendered text is only known once its child text
+                                // runs have rendered, so `push_link` runs at `MarkdownTagEnd::Link`
+                                // below, not here (Cod #28 AC5/AC6).
+                                builder.open_link =
+                                    Some((dest_url.clone(), range.clone(), builder.pending_line.text.len()));
                                 let style = self
                                     .style
                                     .link_callback
@@ -3319,6 +3323,17 @@ impl Element for MarkdownElement {
                     MarkdownTagEnd::Link => {
                         if builder.code_block_stack.is_empty() {
                             builder.link_depth = builder.link_depth.saturating_sub(1);
+                            if let Some((destination_url, source_range, text_start)) =
+                                builder.open_link.take()
+                            {
+                                let text = builder
+                                    .pending_line
+                                    .text
+                                    .get(text_start..)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                builder.push_link(text.into(), destination_url, source_range);
+                            }
                             builder.pop_text_style()
                         }
                     }
@@ -3962,6 +3977,11 @@ struct MarkdownElementBuilder {
     code_block_stack: Vec<Option<Arc<Language>>>,
     code_block_highlights: Arc<CodeBlockHighlights>,
     link_depth: usize,
+    /// The destination, source range and rendered-text start offset of a `[text](url)` link
+    /// whose closing tag has not been seen yet: its text is only known once its child text runs
+    /// have rendered, so `push_link` runs at the link's end, not its start (Cod #28 AC5/AC6: the
+    /// link's keyboard-focus text must be its rendered text, not its raw markdown source).
+    open_link: Option<(SharedString, Range<usize>, usize)>,
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
@@ -4083,6 +4103,7 @@ impl MarkdownElementBuilder {
             code_block_stack: Vec::new(),
             code_block_highlights,
             link_depth: 0,
+            open_link: None,
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
@@ -4297,10 +4318,16 @@ impl MarkdownElementBuilder {
         self.code_block_stack.pop();
     }
 
-    fn push_link(&mut self, destination_url: SharedString, source_range: Range<usize>) {
+    fn push_link(
+        &mut self,
+        text: SharedString,
+        destination_url: SharedString,
+        source_range: Range<usize>,
+    ) {
         self.rendered_links.push(RenderedLink {
             source_range,
             destination_url,
+            text,
         });
     }
 
@@ -4993,6 +5020,10 @@ struct WrappedLineSegment {
 struct RenderedLink {
     source_range: Range<usize>,
     destination_url: SharedString,
+    /// The link's rendered text (Cod #28 AC5/AC6), as opposed to its raw markdown source, which
+    /// for a real `[text](url)` link also holds the brackets, the destination and any inline
+    /// formatting markers its text carries.
+    text: SharedString,
 }
 
 /// The index of the link the keyboard focus moves to from the link at `current` (Cod #28).
@@ -7575,6 +7606,7 @@ mod tests {
         let link = |start: usize| RenderedLink {
             source_range: start..start + 3,
             destination_url: "https://example.com".into(),
+            text: "link".into(),
         };
         let links = [link(0), link(10), link(20)];
         assert_eq!(next_link_index(&links, None, true), Some(0));

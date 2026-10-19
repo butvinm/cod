@@ -491,7 +491,12 @@ impl WorkspaceOverview {
                     visible_rows: RefCell::new(VisibleRows::default()),
                 };
                 let picker = cx.new(|cx| {
-                    Picker::list(delegate, window, cx).initial_width(rems(PANEL_WIDTH_REMS))
+                    // Every row has the same shape (icon, two lines, an optional dot), so
+                    // `uniform_list` gives the picker's virtualization a true viewport-based
+                    // visible range (#26 AC5): `Picker::list` measures every match at least
+                    // once to infer its own height, so it does not virtualize rows of equal
+                    // height the way `uniform_list` does.
+                    Picker::uniform_list(delegate, window, cx).initial_width(rems(PANEL_WIDTH_REMS))
                 });
                 WorkspaceOverview { picker }
             })

@@ -355,8 +355,12 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
         with self.step("open the overview and select PAY-1234's folder row"):
             state = self.open_overview()
             rows = overview(state)["rows"]
+            # Both workspaces hold the same folder, so "billing-api" is not a unique title: the
+            # second line carries the workspace id ("[PAY-1234] - ...", #26 AC2), which is.
             row_index = next(
-                index for index, row in enumerate(rows) if row["kind"] == "folder" and row["title"] == "billing-api"
+                index
+                for index, row in enumerate(rows)
+                if row["kind"] == "folder" and row["title"] == "billing-api" and row["detail"].startswith("[PAY-1234]")
             )
             self.keys(" ".join(["down"] * row_index))
             self.wait_for_selected(row_index)
