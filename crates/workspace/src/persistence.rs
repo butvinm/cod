@@ -612,6 +612,7 @@ pub fn cod_begin_remote_restore(
     let identity = remote_connection_identity(connection);
     let wanted = PathList::new(paths);
     let registry = cx.global_mut::<CodWindowRegistry>();
+    registry.drop_closed_restore_owners();
     let index = registry.restore_owners.iter().position(|owner| {
         owner.members.iter().any(|member| {
             member.workspace_id == owner.active_workspace_id
@@ -694,6 +695,11 @@ pub fn cod_install_restore_owners(owners: Vec<CodRestoreOwner>, cx: &mut App) {
 /// Cod (#24): adds the restore owner of one more window (a project group moving to a new
 /// window), which the destination window takes at construction.
 pub fn cod_add_restore_owner(owner: CodRestoreOwner, cx: &mut App) {
+    // An explicit close is final: the owner of a closed window is discarded, so no later open
+    // adopts the closed key (whose saves are ignored). A later open uses a fresh key.
+    if cod_registry_is_closed(&owner.key, cx) {
+        return;
+    }
     let owners = &mut cx.default_global::<CodWindowRegistry>().restore_owners;
     owners.retain(|existing| existing.key != owner.key);
     owners.push(owner);
@@ -729,7 +735,9 @@ pub fn cod_take_restore_owner(active: WorkspaceId, cx: &mut App) -> Option<CodRe
     if !cx.has_global::<CodWindowRegistry>() {
         return None;
     }
-    let owners = &mut cx.global_mut::<CodWindowRegistry>().restore_owners;
+    let registry = cx.global_mut::<CodWindowRegistry>();
+    registry.drop_closed_restore_owners();
+    let owners = &mut registry.restore_owners;
     let index = owners
         .iter()
         .position(|owner| owner.active_workspace_id == active)?;
@@ -742,7 +750,9 @@ pub fn cod_take_restore_owner_by_key(key: &str, cx: &mut App) -> Option<CodResto
     if !cx.has_global::<CodWindowRegistry>() {
         return None;
     }
-    let owners = &mut cx.global_mut::<CodWindowRegistry>().restore_owners;
+    let registry = cx.global_mut::<CodWindowRegistry>();
+    registry.drop_closed_restore_owners();
+    let owners = &mut registry.restore_owners;
     let index = owners.iter().position(|owner| owner.key == key)?;
     Some(owners.remove(index))
 }
@@ -750,6 +760,14 @@ pub fn cod_take_restore_owner_by_key(key: &str, cx: &mut App) -> Option<CodResto
 impl gpui::Global for CodWindowRegistry {}
 
 impl CodWindowRegistry {
+    /// Discards the restore owners of windows closed in this session: an explicit close is
+    /// final, so no open reserves or adopts a closed key.
+    fn drop_closed_restore_owners(&mut self) {
+        let closed_keys = &self.closed_keys;
+        self.restore_owners
+            .retain(|owner| !closed_keys.contains(&owner.key));
+    }
+
     /// Queues the whole document to the writer. The receiver gets the result of the write; it
     /// is cancelled (a failure for `cod_registry_done`) when the document was never queued.
     fn queue_write(&mut self, cx: &mut App) -> futures::channel::oneshot::Receiver<Result<()>> {
@@ -963,9 +981,9 @@ pub fn cod_registry_rename(first_key: String, key: String, cx: &mut App) -> CodR
 /// Removes a window's entry, after the user agreed to close the window. The key stays closed
 /// for the rest of the session, also when the start is still restoring windows.
 pub fn cod_registry_remove(key: String, cx: &mut App) -> CodRegistryWriteDone {
-    cx.default_global::<CodWindowRegistry>()
-        .closed_keys
-        .insert(key.clone());
+    let registry = cx.default_global::<CodWindowRegistry>();
+    registry.closed_keys.insert(key.clone());
+    registry.drop_closed_restore_owners();
     cod_registry_edit(cx, move |entries| {
         let len = entries.len();
         entries.retain(|entry| entry.key != key);
