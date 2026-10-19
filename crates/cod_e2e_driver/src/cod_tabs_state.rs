@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use gpui::{
-    App, AsyncApp, Bounds, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+    App, AppContext as _, AsyncApp, Bounds, Entity, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, PlatformInput, SharedString, point, px,
 };
 use serde::Deserialize;
