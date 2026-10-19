@@ -43,6 +43,25 @@ pub fn cod_set_remote_member_opener(open: CodRemoteMemberOpen, cx: &mut App) {
     cx.set_global(CodRemoteMemberOpener(open));
 }
 
+/// Cod (#24): the window that holds a pending remote member on the same connection identity as
+/// `connection` with exactly the folders `paths`, and that member's saved id. An ordinary
+/// remote open of the same workspace shows this member (it loads its saved row by id) instead
+/// of selecting the same row by its folders a second time.
+pub fn cod_pending_remote_member(
+    connection: &remote::RemoteConnectionOptions,
+    paths: &[std::path::PathBuf],
+    cx: &App,
+) -> Option<(gpui::WindowHandle<MultiWorkspace>, WorkspaceId)> {
+    cx.windows().into_iter().find_map(|window| {
+        let window = window.downcast::<MultiWorkspace>()?;
+        let id = window
+            .read(cx)
+            .ok()?
+            .cod_pending_remote_id_for(connection, paths)?;
+        Some((window, id))
+    })
+}
+
 fn cod_open_remote_member(
     id: WorkspaceId,
     connection: remote::RemoteConnectionOptions,
@@ -477,6 +496,36 @@ impl MultiWorkspace {
     /// connection).
     pub fn cod_pending_is_remote(&self, id: WorkspaceId) -> bool {
         self.cod_pending_remote.contains_key(&id)
+    }
+
+    /// The pending remote member on the same connection identity as `connection` with exactly
+    /// the folders `paths`, if any.
+    pub fn cod_pending_remote_id_for(
+        &self,
+        connection: &remote::RemoteConnectionOptions,
+        paths: &[std::path::PathBuf],
+    ) -> Option<WorkspaceId> {
+        let identity = remote::remote_connection_identity(connection);
+        let wanted = util::path_list::PathList::new(paths);
+        let mut matches: Vec<WorkspaceId> = self
+            .cod_pending_remote
+            .iter()
+            .filter(|(id, options)| {
+                remote::remote_connection_identity(options) == identity
+                    && self.cod_pending.get(*id).is_some_and(|saved| {
+                        util::path_list::PathList::new(saved.as_slice()) == wanted
+                    })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        // The first one in window order, so the choice does not depend on map order.
+        matches.sort_by_key(|id| {
+            self.cod_saved_order
+                .iter()
+                .position(|saved| saved == id)
+                .unwrap_or(usize::MAX)
+        });
+        matches.first().copied()
     }
 
     /// Adds a remote member that is saved but not loaded: the first time it is shown it loads

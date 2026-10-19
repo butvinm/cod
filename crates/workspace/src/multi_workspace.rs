@@ -30,7 +30,9 @@ pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
-pub use cod_workspaces::{CodRemoteMemberOpen, cod_set_remote_member_opener};
+pub use cod_workspaces::{
+    CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
+};
 pub(crate) use cod_workspaces::init_workspace_names;
 
 use crate::open_remote_project_with_existing_connection;
@@ -1405,6 +1407,27 @@ impl MultiWorkspace {
                 cx,
             );
         };
+
+        // Cod (#24): a pending remote member of this window with the same connection and
+        // folders loads its saved row by id and is shown, so the row never gets a second live
+        // claim through a selection by folders.
+        if let Some(pending_id) =
+            self.cod_pending_remote_id_for(&connection_options, paths.paths())
+        {
+            let shown = self.cod_show_pending(pending_id, window, cx);
+            return cx.spawn(async move |this, cx| {
+                shown.await?;
+                this.update(cx, |this, cx| {
+                    this.held
+                        .iter()
+                        .map(|held| held.workspace.clone())
+                        .find(|workspace| workspace.read(cx).database_id() == Some(pending_id))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("workspace {pending_id:?} did not load")
+                        })
+                })?
+            });
+        }
 
         let app_state = self.workspace().read(cx).app_state().clone();
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();

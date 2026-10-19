@@ -306,6 +306,23 @@ async fn cod_open_remote_project_attempt(
         );
     }
 
+    // Cod (#24): an ordinary open of a workspace that a window holds as a pending remote member
+    // (same connection and folders) shows that member in its window: it loads its saved row by
+    // id. Selecting the row by its folders here would give that row a second live claim. The
+    // load of a pending member itself goes on below.
+    if cod_attempt.pending_restore_id.is_none()
+        && let Some((pending_window, pending_id)) = cx.update(|cx| {
+            workspace::cod_pending_remote_member(&connection_options, &paths, cx)
+        })
+    {
+        let shown = pending_window.update(cx, |multi_workspace, window, cx| {
+            window.activate_window();
+            multi_workspace.cod_show_pending(pending_id, window, cx)
+        })?;
+        shown.await?;
+        return Ok(pending_window);
+    }
+
     // Cod (#24): a new window for a remote workspace that this start restores takes that
     // window's restore owner, and the restoration is registered before connecting, so a
     // matching open waits for it. It is done when the attempt ends (`cod_attempt.done`
