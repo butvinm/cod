@@ -13089,7 +13089,7 @@ pub(crate) fn open_link(
                 }
             }
             MentionUri::Fetch { url } => {
-                cx.open_url(url.as_str());
+                workspace.cod_open_link(url.as_str(), window, cx);
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
