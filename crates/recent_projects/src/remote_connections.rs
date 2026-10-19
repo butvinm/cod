@@ -587,6 +587,16 @@ async fn cod_open_remote_project_attempt(
 
             // Cod (#24): only a remote workspace that came up keeps the restore owner.
             Ok((Some(_), items)) => {
+                // The empty workspace this new window showed while connecting goes now that
+                // the remote workspace is shown: it is not a member of the window.
+                if created_new_window {
+                    let placeholder = initial_workspace.clone();
+                    window
+                        .update(cx, |multi_workspace, _window, cx| {
+                            multi_workspace.cod_drop_connection_placeholder(&placeholder, cx)
+                        })
+                        .ok();
+                }
                 // The saved local members of the restored window join it as pending members
                 // (they load when first shown), on a later retry as at start.
                 if let Some(owner) = cod_attempt.owner.take() {

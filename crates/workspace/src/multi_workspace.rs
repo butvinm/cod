@@ -1939,6 +1939,37 @@ impl MultiWorkspace {
         Some(moved)
     }
 
+    /// Cod (#24): a window built for a remote open shows an empty local workspace while it
+    /// connects. Once the remote workspace it was built for is shown, that placeholder leaves
+    /// the window: it is not kept, not saved and not listed. A placeholder that is shown, has
+    /// a saved id, folders or open items stays.
+    pub fn cod_drop_connection_placeholder(
+        &mut self,
+        placeholder: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace() == placeholder || self.held_index(placeholder).is_none() {
+            return;
+        }
+        let is_empty = {
+            let workspace = placeholder.read(cx);
+            workspace.database_id().is_none()
+                && workspace
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .is_none()
+                && workspace.items(cx).next().is_none()
+        };
+        if !is_empty {
+            return;
+        }
+        self.detach_workspace(placeholder, cx);
+        self.serialize(cx);
+        cx.notify();
+    }
+
     /// Cod (#24): a remote restore that was cancelled before its workspace joined the window.
     /// The window takes a new key and drops the saved membership, so closing it leaves the
     /// saved window in the registry for the next start.
