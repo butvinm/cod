@@ -41,3 +41,27 @@ pub(crate) fn chat_state(workspace: &Workspace, window: &Window, cx: &App) -> Va
             .map(|link| json!({ "text": link.text, "url": link.url })),
     })
 }
+
+/// The `chat_tabs` field of the driver state (story #28 AC1): the panel header's chat tabs of
+/// the active workspace, in the order they are drawn, as `[{"session_id", "title", "status",
+/// "dot", "active"}]`. Empty (not null) when the panel holds no chat yet.
+pub(crate) fn chat_tabs_state(workspace: &Workspace, cx: &App) -> Value {
+    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+        return json!([]);
+    };
+    let tabs: Vec<Value> = panel
+        .read(cx)
+        .cod_chat_tabs(cx)
+        .into_iter()
+        .map(|tab| {
+            json!({
+                "session_id": tab.session_id,
+                "title": tab.title,
+                "status": tab.status.as_str(),
+                "dot": tab.status.cod_status().dot_name(),
+                "active": tab.active,
+            })
+        })
+        .collect();
+    json!(tabs)
+}
