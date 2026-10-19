@@ -3428,6 +3428,7 @@ dependencies = [
 name = "cod_e2e_driver"
 version = "0.1.0"
 dependencies = [
+ "agent_ui",
  "anyhow",
  "command_palette",
  "editor",

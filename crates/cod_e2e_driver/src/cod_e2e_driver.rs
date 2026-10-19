@@ -18,6 +18,8 @@
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
+mod cod_chat_state;
+
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -788,6 +790,7 @@ fn read_state(
         "window_active": window_active,
         "focus": focus,
         "prompt": prompt,
+        "chat": cod_chat_state::chat_state(workspace, window, cx),
     }))
 }
 
