@@ -37,6 +37,7 @@ pub use multi_workspace::{
 pub use multi_workspace::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
+pub use multi_workspace::cod_set_workspace_name;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,

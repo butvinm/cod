@@ -34,6 +34,7 @@ pub use cod_workspaces::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
 pub(crate) use cod_workspaces::init_workspace_names;
+pub use cod_workspaces::cod_set_workspace_name;
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{

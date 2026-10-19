@@ -82,10 +82,8 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
         Request::WorkspaceAddFolder { workspace, folders } => {
             add_folders(&workspace, folders, cx).await
         }
-        Request::WorkspaceRename { workspace, .. } => {
-            // Checked first, so an unknown workspace reads the same as for the other commands.
-            cx.update(|cx| resolve(&workspace, cx))?;
-            bail!("workspace rename is not available in this build yet (#37)")
+        Request::WorkspaceRename { workspace, name } => {
+            rename_workspace(&workspace, name, cx).await
         }
         Request::WorkspaceClose { workspace, force } => {
             close_workspace(&workspace, force, cx).await
@@ -214,9 +212,6 @@ async fn new_workspace(
     focus: bool,
     cx: &mut AsyncApp,
 ) -> Result<Value> {
-    if name.is_some() {
-        bail!("workspace new --name is not available in this build yet (#37)");
-    }
     let window = cx
         .update(|cx| target_window(cx))
         .context("Cod has no workspace window")?;
@@ -236,7 +231,28 @@ async fn new_workspace(
     let id = cx
         .update(|cx| opened.workspace.read(cx).database_id())
         .context("the new workspace has no ID")?;
+    if let Some(name) = name {
+        opened.window.update(cx, |_, window, cx| {
+            workspace::cod_set_workspace_name(&opened.workspace, Some(name), window, cx)
+        })?;
+    }
     Ok(json!({ "id": i64::from(id) }))
+}
+
+/// Names the workspace like "workspace: rename workspace" does; the window title follows when it is the one shown.
+async fn rename_workspace(reference: &str, name: String, cx: &mut AsyncApp) -> Result<Value> {
+    if name.is_empty() {
+        bail!("the name must not be empty");
+    }
+    let member = cx.update(|cx| resolve(reference, cx))?;
+    let id = i64::from(id_of(&member)?);
+    let Some(workspace) = member.live else {
+        bail!("workspace {id} is not loaded yet: show it first with codctl workspace focus {id}");
+    };
+    member.window.update(cx, |_, window, cx| {
+        workspace::cod_set_workspace_name(&workspace, Some(name), window, cx)
+    })?;
+    Ok(json!({ "id": id }))
 }
 
 async fn focus_workspace(reference: &str, cx: &mut AsyncApp) -> Result<Value> {
