@@ -13,7 +13,7 @@ script/e2e -k file_finder                    # tests whose name contains "file_f
 
 A selection that runs no test fails with status 5 and says so, so a typo never looks like a green run.
 
-The default run and the required `e2e` job run every `test_*.py`, including the basic SSH set in `test_24_workspaces.py` (open an SSH project while Cod runs, and remote plus local workspaces coming back after a restart). The remote multi-workspace lifecycle cases live in `remote_tracking_24.py`, which only `script/e2e remote_tracking_24` and the CI step "Remote multi-workspace tracking (not a #24 gate)" run: that step prints its results and uploads its own artifacts, but never fails the job.
+The default run and the required `e2e` job run every `test_*.py`, including the basic SSH set in `test_24_workspaces.py` (open an SSH project at start, edit and save a file there, and remote plus local workspaces coming back after a restart). The remote multi-workspace lifecycle cases live in `remote_tracking_24.py`, which only `script/e2e remote_tracking_24` and the CI step "Remote multi-workspace tracking (not a #24 gate)" run: that step prints its results and uploads its own artifacts, but never fails the job.
 
 `script/e2e` is the same command CI runs. It builds Cod (`cargo build --profile release-fast -p zed -p cod_browser`), puts `cod`, `cod-browser` and `cod-wayland.sh` into `target/e2e-run/cod/` like the release tarball, starts its own headless sway (no window appears on your desktop) and runs `python3 -m unittest` over this folder. It exits with the test status.
 

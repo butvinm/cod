@@ -208,6 +208,10 @@ class RemoteWorkspacesTrackingTest(workspaces.WorkspacesTest):
             self.expect_remote_flags(state, [remote])
 
     def test_same_folder_on_another_ssh_port_does_not_take_the_first_hosts_saved_workspace(self) -> None:
+        """Opens the second port's url with `cod ssh://...` while Cod runs, so it also covers a second window opened while Cod runs.
+
+        Expected to fail until Cod on Linux hands a second start's paths and urls to the running Cod (issue "Opening a path while Cod runs does nothing").
+        """
         with self.step("start two loopback sshd services on two ports"):
             first = self.loopback("first")
             second = self.loopback("second")
@@ -244,6 +248,10 @@ class RemoteWorkspacesTrackingTest(workspaces.WorkspacesTest):
             self.expect_remote_flags(fresh, [remote])
 
     def test_first_ssh_host_keeps_its_saved_layout_after_the_same_folder_opens_on_another_port(self) -> None:
+        """Opens the second and then the first port's url with `cod ssh://...` while Cod runs, so it also covers a second window opened while Cod runs.
+
+        Expected to fail until Cod on Linux hands a second start's paths and urls to the running Cod (issue "Opening a path while Cod runs does nothing").
+        """
         # The existing-window path (projects: open remote, then the host's "Open Folder" path picker) is not driven here: the driver reports that modal only as "other", with no selected entry and no query of its path picker, so keys there would be blind. The command line open is used instead.
         with self.step("start two loopback sshd services on two ports"):
             first = self.loopback("revisit-first")
