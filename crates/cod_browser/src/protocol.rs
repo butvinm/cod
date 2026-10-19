@@ -21,6 +21,11 @@ pub const EVENT_MIDDLE_BUTTON: u32 = 1 << 5;
 pub const EVENT_RIGHT_BUTTON: u32 = 1 << 6;
 pub const EVENT_COMMAND: u32 = 1 << 7;
 
+/// The `action` of `ToBrowser::Navigate`.
+pub const NAVIGATE_BACK: u8 = 0;
+pub const NAVIGATE_FORWARD: u8 = 1;
+pub const NAVIGATE_RELOAD: u8 = 2;
+
 const MAX_MESSAGE: u32 = 1 << 20;
 const MAX_FRAME_BYTES: usize = 1 << 28;
 
@@ -90,6 +95,11 @@ pub enum ToBrowser {
     Close {
         page: u32,
     },
+    /// Back, forward or reload: one of the `NAVIGATE_*` constants.
+    Navigate {
+        page: u32,
+        action: u8,
+    },
 }
 
 /// Messages from the helper to Cod.
@@ -110,6 +120,14 @@ pub enum FromBrowser {
         height: u32,
         bgra: Vec<u8>,
     },
+    /// The main frame could not load `url`.
+    LoadFailed {
+        page: u32,
+        url: String,
+        error: String,
+    },
+    /// The page asked for a new window; the helper cancelled it and Cod routes the URL like a link.
+    PopupRequested { page: u32, url: String },
 }
 
 struct Body(Vec<u8>);
@@ -301,6 +319,7 @@ impl ToBrowser {
                 .u16(*character)
                 .u32(*modifiers),
             Self::Close { page } => Body::new(11).u32(*page),
+            Self::Navigate { page, action } => Body::new(12).u32(*page).u8(*action),
         }
         .send(out)
     }
@@ -377,6 +396,10 @@ impl ToBrowser {
                 modifiers: fields.u32()?,
             },
             11 => Self::Close { page },
+            12 => Self::Navigate {
+                page,
+                action: fields.u8()?,
+            },
             _ => return Err(bad("unknown message")),
         })
     }
@@ -393,6 +416,10 @@ impl FromBrowser {
             Self::Loading { page, loading } => Body::new(6).u32(*page).bool(*loading),
             Self::Console { page, message } => Body::new(7).u32(*page).string(message),
             Self::Closed { page } => Body::new(8).u32(*page),
+            Self::LoadFailed { page, url, error } => {
+                Body::new(10).u32(*page).string(url).string(error)
+            }
+            Self::PopupRequested { page, url } => Body::new(11).u32(*page).string(url),
             Self::Frame {
                 page,
                 width,
@@ -458,6 +485,15 @@ impl FromBrowser {
                 message: fields.string()?,
             },
             8 => Self::Closed { page: fields.u32()? },
+            10 => Self::LoadFailed {
+                page: fields.u32()?,
+                url: fields.string()?,
+                error: fields.string()?,
+            },
+            11 => Self::PopupRequested {
+                page: fields.u32()?,
+                url: fields.string()?,
+            },
             _ => return Err(bad("unknown message")),
         })
     }
@@ -533,6 +569,14 @@ mod tests {
                 modifiers: 0,
             },
             ToBrowser::Close { page: 3 },
+            ToBrowser::Navigate {
+                page: 3,
+                action: NAVIGATE_BACK,
+            },
+            ToBrowser::Navigate {
+                page: 3,
+                action: NAVIGATE_RELOAD,
+            },
         ];
         for message in messages {
             let mut bytes = Vec::new();
@@ -560,6 +604,27 @@ mod tests {
         let mut input = bytes.as_slice();
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), frame);
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), title);
+    }
+
+    #[test]
+    fn load_failures_and_popups_round_trip() {
+        let messages = [
+            FromBrowser::LoadFailed {
+                page: 4,
+                url: "http://127.0.0.1:9/tracker/PAY-1234".into(),
+                error: "ERR_CONNECTION_REFUSED".into(),
+            },
+            FromBrowser::PopupRequested {
+                page: 4,
+                url: "http://127.0.0.1:9/wiki/Home".into(),
+            },
+        ];
+        for message in messages {
+            let mut bytes = Vec::new();
+            message.write_to(&mut bytes).unwrap();
+            let decoded = FromBrowser::read_from(&mut bytes.as_slice()).unwrap();
+            assert_eq!(decoded, message);
+        }
     }
 
     fn frame_header(length: u32, page: u32, width: u32, height: u32) -> Vec<u8> {

@@ -546,7 +546,8 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         | ToBrowser::MouseButton { page, .. }
         | ToBrowser::Wheel { page, .. }
         | ToBrowser::Key { page, .. }
-        | ToBrowser::Close { page } => *page,
+        | ToBrowser::Close { page }
+        | ToBrowser::Navigate { page, .. } => *page,
     };
     let Some(state) = pages.lock().ok().and_then(|table| table.get(&page).cloned()) else {
         return;
@@ -663,6 +664,19 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         ToBrowser::Close { .. } => {
             state.close_requested.store(true, Ordering::Release);
             state.with_host(|host| host.close_browser(1));
+        }
+        ToBrowser::Navigate { action, .. } => {
+            let Ok(slot) = state.browser.lock() else {
+                return;
+            };
+            let Some(handle) = slot.as_ref() else {
+                return;
+            };
+            match action {
+                protocol::NAVIGATE_BACK => handle.0.go_back(),
+                protocol::NAVIGATE_FORWARD => handle.0.go_forward(),
+                _ => handle.0.reload(),
+            }
         }
     }
 }
