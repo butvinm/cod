@@ -140,7 +140,7 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
 /// hovers with the modifier held before pressing, which lets the editor's hover-link lookup
 /// (`Editor::update_hovered_link`, an async task) finish and cache the link under the mouse before the
 /// down event arrives, the same as a person moving the mouse before clicking (#32 AC3).
-const CTRL_HOVER_SETTLE: Duration = Duration::from_millis(250);
+const CTRL_HOVER_SETTLE: Duration = Duration::from_millis(500);
 
 /// Moves the mouse to the position, then presses and releases the left button there, holding the
 /// control key for all three events when `ctrl` is set (#32 AC3: Ctrl-click a URL in a code comment).
