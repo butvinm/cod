@@ -1418,6 +1418,11 @@ impl AgentPanel {
                 None
             };
 
+            // Captured before thread_to_restore moves into the closure below, so the background
+            // restore pass after it can still tell which chat not to resume a second time.
+            let active_thread_id_to_skip =
+                thread_to_restore.as_ref().map(|(_, thread_id)| *thread_id);
+
             let panel = workspace.update_in(cx, |workspace, window, cx| {
                 let panel = cx.new(|cx| Self::new(workspace, window, cx));
 
@@ -1503,6 +1508,76 @@ impl AgentPanel {
 
                 panel
             })?;
+
+            // create_agent_thread_inner (via cod_restore_background_chat below) always persists
+            // its agent as the global "last used agent", which is right for the active thread
+            // restored above but wrong for a background one; put back below once every
+            // background chat is resumed.
+            let original_selected_agent = panel
+                .read_with(cx, |panel, _cx| panel.selected_agent.clone())
+                .ok();
+
+            // Cod (#28 AC4): every other chat this workspace held before quitting also comes
+            // back, not only the one just restored as active, each resumed in the background
+            // (`retained_threads`) by the provider's own session id, never a made-up one. The
+            // selected agent is left exactly as the restore above set it.
+            if has_open_project && let Some(workspace_id) = workspace_id {
+                match cx.update(|_window, cx| {
+                    ThreadMetadataStore::try_global(cx).map(|store| {
+                        let reload_task = store.read(cx).reload_task();
+                        (store, reload_task)
+                    })
+                }) {
+                    Ok(Some((store, reload_task))) => {
+                        reload_task.await;
+                        let sessions = store
+                            .read_with(cx, |store, cx| {
+                                store.cod_workspace_sessions(i64::from(workspace_id), cx)
+                            })
+                            .ok();
+                        if let Some(sessions) = sessions
+                            && let Ok(session_ids) = sessions.await
+                        {
+                            for session_id in session_ids {
+                                let entry = store
+                                    .read_with(cx, |store, _cx| {
+                                        store.entry_by_session(&session_id).cloned()
+                                    })
+                                    .ok()
+                                    .flatten();
+                                let Some(entry) = entry else {
+                                    continue;
+                                };
+                                if Some(entry.thread_id) == active_thread_id_to_skip
+                                    || entry.archived
+                                {
+                                    continue;
+                                }
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.cod_restore_background_chat(entry, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        log::warn!("failed to restore background chats: metadata store missing");
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "failed to access thread metadata store for background chats: {err}"
+                        );
+                    }
+                }
+            }
+            if let Some(original_agent) = original_selected_agent {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.set_selected_agent_and_persist(original_agent, cx);
+                    })
+                    .ok();
+            }
 
             // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
             // the default agent in its agent panel, so opening the panel lands in it ready for
@@ -4322,6 +4397,38 @@ impl AgentPanel {
                 })
             })
             .collect()
+    }
+
+    /// Resumes one chat this workspace held before quitting into the background
+    /// (`retained_threads`), as part of restoring every chat of the workspace, not only the one
+    /// that was active (Cod #28 AC4). Leaves the active chat, the focus and the selected agent
+    /// exactly as they were; does nothing when the chat is already in memory.
+    fn cod_restore_background_chat(
+        &mut self,
+        entry: crate::thread_metadata_store::ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.retained_threads.contains_key(&entry.thread_id) {
+            return;
+        }
+        let selected_agent = self.selected_agent.clone();
+        let agent: Agent = entry.agent_id.clone().into();
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(entry.thread_id),
+            Some(entry.folder_paths().clone()),
+            entry.title(),
+            None,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        self.retained_threads
+            .insert(entry.thread_id, thread.conversation_view);
+        self.selected_agent = selected_agent;
     }
 
     /// Shows this chat in the panel, promoting it from the background when it is only
