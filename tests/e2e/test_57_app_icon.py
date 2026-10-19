@@ -8,6 +8,7 @@ It compares the drawn icon loosely with crates/zed/resources/app-icon.png scaled
 from __future__ import annotations
 
 import glob
+import heapq
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ import subprocess
 import time
 import unittest
 import zlib
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,9 @@ REFERENCE_ICON = REPO_ROOT / "crates" / "zed" / "resources" / "app-icon.png"
 MAX_ICON_DIFFERENCE = 20.0
 # The same difference must also be well below the difference between the drawn crop and a plain window background, so a missing or blank icon cannot pass.
 MAX_SHARE_OF_BACKGROUND = 0.6
+# The Welcome page of crates/workspace/src/welcome.rs draws the icon at rems_from_px(45), 45 output pixels at scale 1.
+WELCOME_TAB = "Welcome"
+WELCOME_ICON_SIZE = 45
 
 
 def read_png(path: Path) -> tuple[int, int, int, list[bytes]]:
@@ -146,6 +151,32 @@ def scaled_reference(size: int, background: tuple[int, int, int]) -> list[tuple[
     return pixels
 
 
+def area_scaled_reference(size: int, background: tuple[int, int, int]) -> list[tuple[int, int, int]]:
+    """app-icon.png scaled to size x size by averaging the source pixels that fall in each target pixel (any size), over the background color."""
+    width, height, channels, rows = read_png(REFERENCE_ICON)
+    if channels != 4 or width != height:
+        raise ValueError(f"{REFERENCE_ICON}: expected a square RGBA icon, got {width} x {height}, {channels} channels")
+    sums = [[0, 0, 0, 0, 0] for _ in range(size * size)]
+    bins = [x * size // width for x in range(width)]
+    for y, row in enumerate(rows[:height]):
+        base = bins[y] * size
+        for x in range(width):
+            a = row[x * 4 + 3]
+            cell = sums[base + bins[x]]
+            cell[0] += row[x * 4] * a
+            cell[1] += row[x * 4 + 1] * a
+            cell[2] += row[x * 4 + 2] * a
+            cell[3] += a
+            cell[4] += 1
+    pixels = []
+    for red, green, blue, alpha, count in sums:
+        coverage = alpha / (255 * count)
+        pixels.append(
+            tuple(round(premultiplied / (255 * count) + base * (1 - coverage)) for premultiplied, base in zip((red, green, blue), background))
+        )
+    return pixels
+
+
 def mean_difference(
     crop: list[tuple[int, int, int]], crop_width: int, left: int, top: int, reference: list[tuple[int, int, int]], size: int, step: int = 1
 ) -> float:
@@ -168,6 +199,34 @@ def best_match(crop: list[tuple[int, int, int]], crop_width: int, reference: lis
     )
     _, dx, dy = coarse
     return mean_difference(crop, crop_width, dx, dy, reference, size), dx, dy
+
+
+def search_icon(
+    screen: list[tuple[int, int, int]], screen_width: int, region: tuple[int, int, int, int], reference: list[tuple[int, int, int]], size: int
+) -> tuple[float, int, int]:
+    """Where in region (left, top, right, bottom) of the screen the reference matches best: a coarse grid first, then finer around the best candidates."""
+    left, top, right, bottom = region
+    coarse = [
+        (mean_difference(screen, screen_width, x, y, reference, size, step=9), x, y)
+        for y in range(top, bottom - size + 1, 4)
+        for x in range(left, right - size + 1, 4)
+    ]
+    candidates = heapq.nsmallest(30, coarse)
+
+    def refine(points: list[tuple[float, int, int]], reach: int, step: int) -> tuple[float, int, int]:
+        best = None
+        for _, cx, cy in points:
+            for y in range(max(top, cy - reach), min(bottom - size, cy + reach) + 1):
+                for x in range(max(left, cx - reach), min(right - size, cx + reach) + 1):
+                    found = (mean_difference(screen, screen_width, x, y, reference, size, step=step), x, y)
+                    if best is None or found < best:
+                        best = found
+        assert best is not None
+        return best
+
+    middle = refine(candidates, 3, 3)
+    _, x, y = refine([middle], 1, 1)
+    return mean_difference(screen, screen_width, x, y, reference, size), x, y
 
 
 def sway_socket() -> str:
@@ -334,6 +393,71 @@ class AppIconTest(CodTestCase):
                 flat * MAX_SHARE_OF_BACKGROUND,
                 f"the drawn icon ({difference:.2f}) is not much closer to app-icon.png than a plain background ({flat:.2f}) is",
             )
+
+    def test_welcome_page_shows_the_cod_icon(self) -> None:
+        with self.step("create the fixture repo lantern-notes"):
+            repo = self.make_repo("lantern-notes", LANTERN_NOTES)
+
+        with self.step("start Cod on lantern-notes"):
+            self.start_cod(repo)
+
+        with self.step("wait for the lantern-notes worktree"):
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                30,
+                "the lantern-notes folder to open",
+            )
+
+        with self.step("press ctrl-shift-p"):
+            self.keys("ctrl-shift-p")
+            self.wait_for(lambda state: state["modal"] == "command_palette", 10, "the command palette to open")
+
+        with self.step("type zed: show welcome"):
+            self.type("zed: show welcome")
+
+        with self.step("press enter"):
+            self.keys("enter")
+            self.wait_for(lambda state: state["modal"] is None and state["active_tab"] == WELCOME_TAB, 10, "the Welcome tab to open")
+
+        artifacts = self.icon_artifacts
+        screen_path = artifacts / "welcome.png"
+        with self.step("take a screenshot of the Welcome page"):
+            # The image may be decoded and drawn a few frames after the tab opens.
+            time.sleep(2)
+            self.grim(screen_path)
+
+        with self.step("find the drawn icon and compare it with app-icon.png"):
+            # Recorded as evidence, not asserted: the 512 px icon drawn at 45 px is filtered differently from the area average here.
+            windows = [w for w in sway_windows(self.sway_tree()) if w.get("rect", {}).get("width", 0) > 0]
+            window = max(windows, key=lambda w: w["rect"]["width"] * w["rect"]["height"])
+            rect = window["rect"]
+            width, height, channels, rows = read_png(screen_path)
+            screen = rgb_pixels(width, height, channels, rows)
+            region = (rect["x"], rect["y"], min(width, rect["x"] + rect["width"]), min(height, rect["y"] + rect["height"]))
+            samples = [screen[y * width + x] for y in range(region[1], region[3], 7) for x in range(region[0], region[2], 7)]
+            background = Counter(samples).most_common(1)[0][0]
+            reference = area_scaled_reference(WELCOME_ICON_SIZE, background)
+            difference, x, y = search_icon(screen, width, region, reference, WELCOME_ICON_SIZE)
+            flat = mean_difference(screen, width, x, y, [background] * (WELCOME_ICON_SIZE * WELCOME_ICON_SIZE), WELCOME_ICON_SIZE)
+            crop = [screen[(y + dy) * width + x + dx] for dy in range(WELCOME_ICON_SIZE) for dx in range(WELCOME_ICON_SIZE)]
+            write_png(artifacts / "welcome-icon-crop.png", WELCOME_ICON_SIZE, WELCOME_ICON_SIZE, crop)
+            write_png(artifacts / "welcome-icon-expected.png", WELCOME_ICON_SIZE, WELCOME_ICON_SIZE, reference)
+            (artifacts / "welcome-icon-check.json").write_text(
+                json.dumps(
+                    {
+                        "workspace_window_rect": rect,
+                        "icon_position": [x, y],
+                        "icon_size": WELCOME_ICON_SIZE,
+                        "background": background,
+                        "mean_abs_difference": round(difference, 3),
+                        "background_only_difference": round(flat, 3),
+                        "about_test_max_allowed_difference": MAX_ICON_DIFFERENCE,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            log(f"  welcome icon difference {difference:.2f} at ({x}, {y}); background-only difference {flat:.2f}; background {background}")
 
 
 if __name__ == "__main__":
