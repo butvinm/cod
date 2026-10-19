@@ -559,6 +559,14 @@ async fn close_pane(reference: Option<&str>, pane: u64, cx: &mut AsyncApp) -> Re
 /// handle to that position would. `Workspace::resize_pane` only ever resizes the active pane, so
 /// the pane is focused first (as `focus_pane` above does) and, when it was not the active pane
 /// already, the previous active pane is re-focused afterward: only the size changes.
+///
+/// The focus and the resize each run in their own `window.update` call. GPUI only flushes the
+/// effects of an update (here, the `pane::Event::Focus` that `focus_pane_now` emits) once its
+/// outermost `window.update`/`App::update` call returns; doing the focus, the resize and the
+/// re-focus inside one such call left `Workspace::active_pane` still pointing at the pane that
+/// was active before this command ran when `resize_pane` read it, so the wrong pane (and the
+/// wrong sign of the share) was resized. Splitting the calls lets the focus take effect, as
+/// `focus_pane` above relies on too, before the resize reads the active pane.
 async fn resize_pane(
     reference: Option<&str>,
     pane: u64,
@@ -571,18 +579,20 @@ async fn resize_pane(
         .update(|cx| resize_amount(&workspace, &pane, size, cx))
         .with_context(|| format!("pane {} has not been shown yet", pane_id(&pane)))?;
     let previous_active = cx.update(|cx| workspace.read(cx).active_pane().clone());
+
+    fn focus_pane_now(target: &Entity<Pane>, window: &mut gpui::Window, cx: &mut App) {
+        let handle = target.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        target.update(cx, |_, cx| cx.emit(workspace::pane::Event::Focus));
+    }
+
+    window.update(cx, |_, window, cx| focus_pane_now(&pane, window, cx))?;
     window.update(cx, |_, window, cx| {
-        let focus = |target: &Entity<Pane>, window: &mut gpui::Window, cx: &mut App| {
-            let handle = target.read(cx).focus_handle(cx);
-            window.focus(&handle, cx);
-            target.update(cx, |_, cx| cx.emit(workspace::pane::Event::Focus));
-        };
-        focus(&pane, window, cx);
-        workspace.update(cx, |workspace, cx| workspace.resize_pane(axis, amount, window, cx));
-        if previous_active != pane {
-            focus(&previous_active, window, cx);
-        }
+        workspace.update(cx, |workspace, cx| workspace.resize_pane(axis, amount, window, cx))
     })?;
+    if previous_active != pane {
+        window.update(cx, |_, window, cx| focus_pane_now(&previous_active, window, cx))?;
+    }
     Ok(json!({ "id": pane_id(&pane) }))
 }
 
