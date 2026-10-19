@@ -5,6 +5,9 @@
 //! `rows` are the rows the list shows, in order; `kind` is "workspace", "folder", "session" or
 //! "page"; `dot` is the status dot ("yellow", "red", "blue", "green") or null; `focused` tells
 //! whether the overview holds the window's focus, so typed keys reach its query.
+//! `visible_range` is `{"start", "end"}`, the range of `rows` indices the list last drew on
+//! screen (#26 AC5: it scrolls to keep the selection visible); `{"start": 0, "end": 0}` before
+//! the list has drawn once.
 
 use gpui::{App, Focusable as _, Window};
 use picker::PickerDelegate as _;
@@ -36,11 +39,13 @@ pub(crate) fn overview_state(workspace: &Workspace, window: &Window, cx: &App) -
             })
         })
         .collect();
+    let visible_range = delegate.visible_range();
     json!({
         "placeholder": PLACEHOLDER,
         "query": picker.query(cx),
         "selected_index": selected,
         "focused": focused,
         "rows": rows,
+        "visible_range": { "start": visible_range.start, "end": visible_range.end },
     })
 }
