@@ -4,7 +4,10 @@
 //! It is written with a short debounce after it changes and applied once when the panel of a restored workspace first lists its worktrees.
 //! Saved entries that never appear before the worktrees finish their initial scan are dropped silently.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use collections::HashMap;
 use db::kvp::KeyValueStore;
@@ -25,6 +28,9 @@ const WORKTREE_WAIT: Duration = Duration::from_millis(250);
 pub(crate) struct CodPanelState {
     expanded: Vec<CodPanelPath>,
     selected: Option<CodPanelPath>,
+    /// Absolute paths of the worktrees whose root folder is collapsed. A root is expanded when it is first listed, so a collapsed root is stored on its own.
+    #[serde(default)]
+    collapsed_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +82,20 @@ fn resolve(
     Some((worktree.id(), entry.id, entry.is_dir()))
 }
 
+/// The root folder entry of the visible worktree at `worktree_path`, once it is listed.
+fn resolve_root(
+    project: &Project,
+    worktree_path: &Path,
+    cx: &App,
+) -> Option<(WorktreeId, ProjectEntryId)> {
+    let worktree_entity = project
+        .visible_worktrees(cx)
+        .find(|worktree| &*worktree.read(cx).abs_path() == worktree_path)?;
+    let worktree = worktree_entity.read(cx);
+    let root = worktree.root_entry()?;
+    root.is_dir().then_some((worktree.id(), root.id))
+}
+
 fn describe(
     project: &Project,
     worktree_id: WorktreeId,
@@ -111,7 +131,11 @@ impl ProjectPanel {
                 .and_then(|text| serde_json::from_str::<CodPanelState>(&text).log_err());
             self.cod_persistence.workspace_key = Some(key);
             match saved {
-                Some(state) if state.selected.is_some() || !state.expanded.is_empty() => {
+                Some(state)
+                    if state.selected.is_some()
+                        || !state.expanded.is_empty()
+                        || !state.collapsed_roots.is_empty() =>
+                {
                     self.cod_persistence.restore = CodRestore::Pending {
                         state,
                         scanned: false,
@@ -132,6 +156,8 @@ impl ProjectPanel {
 
         let mut to_expand = Vec::new();
         let mut still_missing = Vec::new();
+        let mut to_collapse = Vec::new();
+        let mut collapsed_roots = Vec::new();
         let mut selected = pending.selected;
         let mut new_selection = None;
         {
@@ -145,6 +171,20 @@ impl ProjectPanel {
                     }
                     Some((_, _, false)) => {}
                     _ => still_missing.push(saved),
+                }
+            }
+            for root in pending.collapsed_roots {
+                let resolved = resolve_root(project, &root, cx).filter(|(worktree_id, _)| {
+                    self.state.expanded_dir_ids.contains_key(worktree_id)
+                });
+                if let Some(root_entry) = resolved {
+                    to_collapse.push(root_entry);
+                }
+                // Expanding a folder later expands its root again, so a root stays pending
+                // while folders of its worktree still wait to be expanded.
+                if resolved.is_none() || still_missing.iter().any(|saved| saved.worktree == root)
+                {
+                    collapsed_roots.push(root);
                 }
             }
             if let Some(saved) = &selected
@@ -161,7 +201,7 @@ impl ProjectPanel {
             selected = None;
         }
 
-        let mut expanded_any = false;
+        let mut folders_changed = false;
         for (worktree_id, entry_id) in to_expand {
             let already = self
                 .state
@@ -170,11 +210,21 @@ impl ProjectPanel {
                 .is_some_and(|ids| ids.binary_search(&entry_id).is_ok());
             if !already {
                 self.expand_entry(worktree_id, entry_id, cx);
-                expanded_any = true;
+                folders_changed = true;
+            }
+        }
+        // Roots collapse after the expansions, which expand every ancestor of a folder.
+        for (worktree_id, root_id) in to_collapse {
+            if let Some(ids) = self.state.expanded_dir_ids.get_mut(&worktree_id)
+                && let Ok(ix) = ids.binary_search(&root_id)
+            {
+                ids.remove(ix);
+                folders_changed = true;
             }
         }
 
-        self.cod_persistence.restore = if scanned || (still_missing.is_empty() && selected.is_none())
+        self.cod_persistence.restore = if scanned
+            || (still_missing.is_empty() && selected.is_none() && collapsed_roots.is_empty())
         {
             self.cod_persistence.scan_task = None;
             CodRestore::Done
@@ -183,12 +233,13 @@ impl ProjectPanel {
                 state: CodPanelState {
                     expanded: still_missing,
                     selected,
+                    collapsed_roots,
                 },
                 scanned,
             }
         };
 
-        if expanded_any {
+        if folders_changed {
             cx.defer_in(window, |this, window, cx| {
                 this.update_visible_entries(None, false, false, window, cx);
                 cx.notify();
@@ -214,9 +265,11 @@ impl ProjectPanel {
                             .expanded
                             .iter()
                             .chain(state.selected.iter())
-                            .all(|saved| {
+                            .map(|saved| saved.worktree.as_path())
+                            .chain(state.collapsed_roots.iter().map(|root| root.as_path()))
+                            .all(|worktree_path| {
                                 project.visible_worktrees(cx).any(|worktree| {
-                                    &*worktree.read(cx).abs_path() == saved.worktree.as_path()
+                                    &*worktree.read(cx).abs_path() == worktree_path
                                 })
                             }),
                         _ => true,
@@ -294,18 +347,33 @@ impl ProjectPanel {
         let state = {
             let project = self.project.read(cx);
             let mut expanded = Vec::new();
+            let mut collapsed_roots = Vec::new();
             for (worktree_id, entry_ids) in &raw.1 {
                 for entry_id in entry_ids {
                     if let Some(path) = describe(project, *worktree_id, *entry_id, cx) {
                         expanded.push(path);
                     }
                 }
+                if let Some(worktree_entity) = project.worktree_for_id(*worktree_id, cx) {
+                    let worktree = worktree_entity.read(cx);
+                    if let Some(root) = worktree.root_entry()
+                        && root.is_dir()
+                        && !entry_ids.contains(&root.id)
+                    {
+                        collapsed_roots.push(worktree.abs_path().to_path_buf());
+                    }
+                }
             }
             expanded.sort_by(|a, b| (&a.worktree, &a.path).cmp(&(&b.worktree, &b.path)));
+            collapsed_roots.sort();
             let selected = raw
                 .0
                 .and_then(|selection| describe(project, selection.worktree_id, selection.entry_id, cx));
-            CodPanelState { expanded, selected }
+            CodPanelState {
+                expanded,
+                selected,
+                collapsed_roots,
+            }
         };
         self.cod_persistence.last_saved = Some(raw);
         let Some(text) = serde_json::to_string(&state).log_err() else {
