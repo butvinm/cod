@@ -1507,6 +1507,7 @@ class WorkspacesTest(CodTestCase):
         state = self.state()
         self.expect_equal("window count", 1, state["window_count"])
         self.expect_equal("workspace count", 2, state["workspace_count"])
+        self.expect_remote_flags(state, [remote])
         return remote, local, workspace_list(state)
 
     def expect_each_once(self, state: dict[str, Any], folders: list[Path]) -> None:
@@ -1544,10 +1545,9 @@ class WorkspacesTest(CodTestCase):
         self.wait_for(lambda state: state["modal"] is None and state["prompt"] is None, SHOW_TIMEOUT, "no modal and no prompt after cancel")
 
     def expect_remote_flags(self, state: dict[str, Any], remote: list[Path]) -> None:
-        """When the driver reports "remote" for each workspace, the workspaces showing a folder in `remote` are remote and the others are local."""
+        """By the driver's "remote" field of each workspace: the workspaces showing a folder in `remote` are remote and the others are local."""
         workspaces = state["workspaces"]
-        if not workspaces or not all("remote" in workspace for workspace in workspaces):
-            return
+        self.expect_equal("workspaces without a remote field in the driver state", [], [w for w in workspaces if "remote" not in w])
         remote_paths = [[real(folder)] for folder in remote]
         for workspace in workspaces:
             paths = real_paths(workspace["worktrees"])
@@ -1573,6 +1573,7 @@ class WorkspacesTest(CodTestCase):
             )
             self.expect_equal("window count", 1, state["window_count"])
             self.expect_each_once(state, [remote, local])
+            self.expect_remote_flags(state, [remote])
 
         with self.step("check the remote workspace: its folder over SSH and ledger.rs open"):
             self.show_workspace_of(remote, "ledger.rs")
@@ -1581,6 +1582,7 @@ class WorkspacesTest(CodTestCase):
             state = self.show_workspace_of(local, "invoice.rs")
             self.expect_each_once(state, [remote, local])
             self.expect_equal("window count", 1, state["window_count"])
+            self.expect_remote_flags(state, [remote])
 
     def test_remote_workspace_survives_a_cancelled_reconnection(self) -> None:
         with self.step("start a loopback sshd on 127.0.0.1 with a key made for this test"):
@@ -1617,6 +1619,7 @@ class WorkspacesTest(CodTestCase):
             state = self.show_workspace_of(remote, "ledger.rs")
             self.expect_each_once(state, [remote, local])
             self.expect_equal("window count", 1, state["window_count"])
+            self.expect_remote_flags(state, [remote])
 
     def test_active_remote_workspace_comes_back_active_with_the_local_one_switchable(self) -> None:
         with self.step("start a loopback sshd on 127.0.0.1 with a key made for this test"):
@@ -1812,6 +1815,7 @@ class WorkspacesTest(CodTestCase):
             )
             self.stays(lambda state: state["tabs"] == [], SETTLE_TIME, "the second port's window having no tab")
             self.expect_equal("window count", 2, fresh["window_count"])
+            self.expect_remote_flags(fresh, [remote])
 
     def open_from_command_line(self, url: str) -> None:
         """Opens the url in the running Cod as `cod <url>` does, and checks the command's exit status."""
@@ -1864,11 +1868,12 @@ class WorkspacesTest(CodTestCase):
             )
             if state["active_tab"] != "ledger.rs":
                 self.open_from_command_line(first.url(remote))
-            self.wait_for(
+            state = self.wait_for(
                 lambda state: real_paths(state["worktrees"]) == [real(remote)] and state["active_tab"] == "ledger.rs",
                 REMOTE_TIMEOUT,
                 "the first port's workspace with ledger.rs after restart",
             )
+            self.expect_remote_flags(state, [remote])
 
 
 if __name__ == "__main__":
