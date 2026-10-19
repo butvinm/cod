@@ -35,6 +35,8 @@ Optional environment:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import queue
@@ -42,7 +44,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 PROTOCOL_VERSION = 1
 METHOD_NOT_FOUND = -32601
@@ -59,10 +61,26 @@ class Agent:
         self.log_path = log_path
         self.write_lock = threading.Lock()
         self.state_lock = threading.Lock()
+        self.lock_path = state_path.with_suffix(state_path.suffix + ".lock") if state_path is not None else None
         self.next_request_id = 1
         self.pending: dict[int, queue.Queue[dict[str, Any]]] = {}
         self.cancelled: set[str] = set()
         self.state = self.load_state()
+
+    @contextlib.contextmanager
+    def cross_process_lock(self) -> Iterator[None]:
+        """Serializes state file reads and writes across the agent processes Cod starts (one per
+        workspace), which all share the same state file: an `fcntl` lock on a side lock file, held
+        for the whole read-modify-write so a concurrent process cannot interleave and drop a change."""
+        if self.lock_path is None:
+            yield
+            return
+        with self.lock_path.open("a") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
     # Transport
 
@@ -122,7 +140,7 @@ class Agent:
         temporary.replace(self.state_path)
 
     def record(self, session_id: str, role: str, text: str) -> None:
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             self.refresh_state()
             session = self.state["sessions"].setdefault(session_id, {"title": None, "history": []})
             history = session["history"]
@@ -168,7 +186,7 @@ class Agent:
             self.reply_error(request_id, METHOD_NOT_FOUND, f"method not supported by the fake agent: {method}")
 
     def new_session_id(self) -> str:
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             self.refresh_state()
             index = self.state["created"]
             self.state["created"] = index + 1
@@ -180,7 +198,7 @@ class Agent:
 
     def load_session(self, request_id: Any, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId", "")
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             self.refresh_state()
             session = self.state["sessions"].get(session_id)
         if session is None:
@@ -194,7 +212,7 @@ class Agent:
         self.reply(request_id, {})
 
     def next_turn(self) -> dict[str, Any] | None:
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             self.refresh_state()
             index = self.state["next_turn"]
             self.state["next_turn"] = index + 1
@@ -233,7 +251,7 @@ class Agent:
                 {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": str(step["thought"])}},
             )
         elif "title" in step:
-            with self.state_lock:
+            with self.state_lock, self.cross_process_lock():
                 self.refresh_state()
                 self.state["sessions"].setdefault(session_id, {"title": None, "history": []})["title"] = step["title"]
                 self.save_state()
@@ -259,7 +277,7 @@ class Agent:
         return False
 
     def ask_permission(self, session_id: str, title: str) -> None:
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             tool_call_id = f"fake-tool-{len(self.state['permissions']) + 1}"
         tool_call = {"toolCallId": tool_call_id, "title": title, "kind": "edit", "status": "pending"}
         self.session_update(session_id, {"sessionUpdate": "tool_call", **tool_call})
@@ -276,7 +294,7 @@ class Agent:
         )
         outcome = (response.get("result") or {}).get("outcome") or {}
         answer = outcome.get("optionId") if outcome.get("outcome") == "selected" else "cancelled"
-        with self.state_lock:
+        with self.state_lock, self.cross_process_lock():
             self.refresh_state()
             self.state["permissions"].append({"session": session_id, "title": title, "answer": answer})
             self.save_state()
