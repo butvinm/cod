@@ -1484,6 +1484,39 @@ impl AgentPanel {
                 panel
             })?;
 
+            // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
+            // the default agent, ready for typing. The panel joins its dock after this load
+            // returns, so the chat starts once the workspace holds the panel.
+            let fresh_chat = cx
+                .update(|_window, cx| workspace::cod_take_fresh_chat(workspace.entity_id(), cx))
+                .unwrap_or(false);
+            if fresh_chat {
+                let workspace = workspace.clone();
+                cx.spawn(async move |cx| {
+                    for _ in 0..100 {
+                        let started = workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                                    return false;
+                                };
+                                panel.update(cx, |panel, cx| {
+                                    panel.new_thread_with_workspace(Some(workspace), window, cx)
+                                });
+                                workspace.focus_panel::<AgentPanel>(window, cx);
+                                true
+                            })
+                            .unwrap_or(true);
+                        if started {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
+                    }
+                })
+                .detach();
+            }
+
             Ok(panel)
         })
     }
