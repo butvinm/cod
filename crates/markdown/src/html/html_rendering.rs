@@ -422,7 +422,11 @@ impl MarkdownElement {
             });
 
             if let Some(link) = link.as_ref() {
-                builder.push_link(link.clone(), source_start..source_end);
+                builder.push_link(
+                    text_contents[start..end].to_string().into(),
+                    link.clone(),
+                    source_start..source_end,
+                );
                 let link_style = self
                     .style
                     .link_callback
