@@ -1,15 +1,18 @@
 # Fast affected-scope check (issue #24 PM decision): `cargo check` of the app in the dev profile, with the target folder kept between runs.
 # It is the per-edit loop. The full release-fast build and the end-to-end tests (e2e.yml) stay the integration and merge gate.
-# Only master pushes save the build state (and a manual run with "save-cache"); pull requests restore the newest master state and never save.
+# Only master and integration/** pushes save the build state (and a manual run with "save-cache"); pull requests restore the newest state of their base branch or master and never save.
+# Pull requests and master pushes run it as the first job of E2E (e2e.yml), which admits its full build only after this check passed.
 # Restored fingerprints stay valid because every tracked file gets one fixed old mtime and only the files changed since the commit recorded in target/.cache-commit get the current time, so cargo rechecks just those crates and their reverse dependencies. Files that had another time when the state was saved get that exact time back from target/.cache-mtimes.
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 name: Check (fast)
 
 on:
-  pull_request:
+  # E2E (e2e.yml) calls this check first on pull requests and master pushes and starts its full build only after it passed.
+  workflow_call:
+  # An integration branch saves its own state, so the pull requests based on it start warm.
   push:
     branches:
-      - master
+      - "integration/**"
   workflow_dispatch:
     inputs:
       save-cache:
@@ -48,7 +51,7 @@ jobs:
       CEF_PATH: /home/runner/cef
       CC: clang
       CXX: clang++
-      SAVE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'workflow_dispatch' && inputs.save-cache) }}
+      SAVE: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/integration/'))) || (github.event_name == 'workflow_dispatch' && inputs.save-cache) }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -235,7 +238,12 @@ jobs:
           started=$(date +%s)
           echo "check started at $(date -u '+%H:%M:%S')"
           # The zed build script reads GITHUB_RUN_NUMBER, which differs on every run and would make cargo recheck zed each time.
-          env -u GITHUB_RUN_NUMBER cargo check --locked -p zed -p cod_browser 2>&1 | tee check.log
+          # The packages of the Build step of e2e.yml: codctl too once it exists.
+          packages="-p zed -p cod_browser"
+          if [ -d crates/codctl ]; then
+            packages="$packages -p codctl"
+          fi
+          env -u GITHUB_RUN_NUMBER cargo check --locked $packages 2>&1 | tee check.log
           finished=$(date +%s)
           echo "check finished at $(date -u '+%H:%M:%S')"
           echo "cargo check took $((finished - started)) s"

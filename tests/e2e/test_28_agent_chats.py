@@ -97,7 +97,7 @@ class AgentChatLinksTest(CodTestCase):
             self.run_command("agent: toggle focus")
             self.run_command("agent: toggle new thread menu")
             # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
-            self.keys("up up enter")
+            self.keys("end up enter")
             self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
 
         with self.step("send a prompt and wait for the scripted reply"):
@@ -182,7 +182,8 @@ class WorkspaceChatsTest(CodTestCase):
         if current.get("transcript") or current.get("agent") != AGENT_ID:
             known.append(current.get("session_id"))
         # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
-        self.keys("up up enter")
+        # The menu opens with the selected agent highlighted, which is the fake agent once a chat used it, so the keys start from the last row, not from the highlight.
+        self.keys("end up enter")
         return self.wait_for(
             lambda state: chat(state).get("agent") == AGENT_ID and chat(state).get("session_id") not in [None, "", *known],
             30,
