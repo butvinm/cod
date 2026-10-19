@@ -10,7 +10,10 @@
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
 #   COD_E2E_REMOTE_SERVER  the remote_server binary for the loopback SSH tests (cargo build --profile release-fast -p remote_server); default the one next to the zed binary when it exists.
-#                      Those tests run their own sshd on 127.0.0.1 as you, and copy the binary to ~/.zed_server/ in your passwd home. Without sshd or the binary they report skipped with the reason.
+#                      Those tests run their own sshd on 127.0.0.1 as you, log in as the account COD_E2E_SSH_USER names, and copy the binary to ~/.zed_server/ in that account's home. Without sshd, the binary or that account they report skipped with the reason.
+#   COD_E2E_SSH_USER       a dedicated throwaway account for the loopback SSH tests, never your own: your uid, another name, and a home that is a throwaway folder outside your home, for example
+#                      sudo useradd --non-unique --uid "$(id -u)" --gid "$(id -g)" --no-create-home --home-dir "$(mktemp -d /tmp/codssh-home.XXXXXX)" --shell /bin/bash --password '*' codssh
+#                      and later sudo userdel --force codssh, then remove its home. CI does the same (.github/workflows/e2e.yml). Unset, the tests write nothing and report skipped.
 #   COD_E2E_REQUIRE_SSH    1 (set in CI): the loopback SSH tests must run; a missing ssh, sshd or remote server binary, or an sshd that does not start, fails them instead of skipping.
 # Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
 set -euo pipefail

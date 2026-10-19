@@ -2,7 +2,9 @@
 
 It runs the system sshd as the current user (no root, no system config): its own host key, its own authorized_keys with a key pair made for this test, password and keyboard-interactive login off, bound to 127.0.0.1 on a free high port.
 Cod's ssh gets its key and known_hosts file through the "args" of an ssh_connections entry in settings.json, so nothing in ~/.ssh is read or written.
-The remote server binary is not downloaded: Zed runs ~/.zed_server/zed-remote-server-<channel>-<version> when "<binary> version" succeeds there (crates/remote/src/transport/ssh.rs), so the binary built in CI (COD_E2E_REMOTE_SERVER) is copied to that path in the passwd home of the current user, which is the home sshd logs in to.
+The remote server binary is not downloaded: Zed runs ~/.zed_server/zed-remote-server-<channel>-<version> when "<binary> version" succeeds there (crates/remote/src/transport/ssh.rs), so the binary built in CI (COD_E2E_REMOTE_SERVER) is copied to that path in the home sshd logs in to.
+That home is never the home of the person running the tests: sshd logs in only the dedicated test account named by COD_E2E_SSH_USER, whose passwd home is a throwaway folder made for the run. An sshd that is not root can only log in an account with its own uid, so that account shares the uid of the current user and differs in name and home. CI creates it in .github/workflows/e2e.yml (useradd --non-unique) and deletes it with its home at the end of the job.
+Without COD_E2E_SSH_USER, or when the account it names is the current user, has another uid, or has a home that is, holds or lies in the current user's home, the tests touch nothing and report the reason.
 Every reason the service cannot run is returned as a skip reason, so a missing sshd never looks like a pass.
 """
 
@@ -55,6 +57,41 @@ def missing_reason() -> str | None:
         return "COD_E2E_REMOTE_SERVER is not set (the remote_server binary: cargo build --profile release-fast -p remote_server)"
     if not os.access(server, os.X_OK):
         return f"COD_E2E_REMOTE_SERVER is not an executable file: {server}"
+    return account_reason()
+
+
+def test_account() -> pwd.struct_passwd:
+    """The passwd entry of the dedicated test account named by COD_E2E_SSH_USER. Call account_reason() first."""
+    return pwd.getpwnam(os.environ["COD_E2E_SSH_USER"])
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def account_reason() -> str | None:
+    """Why the dedicated test account cannot be used, or None. It protects the home of the person running the tests: nothing is ever written there."""
+    name = os.environ.get("COD_E2E_SSH_USER")
+    if not name:
+        return "COD_E2E_SSH_USER is not set: the loopback SSH tests log in only as a dedicated throwaway account with your uid and a throwaway home, never as you (see script/e2e)"
+    try:
+        account = pwd.getpwnam(name)
+    except KeyError:
+        return f"COD_E2E_SSH_USER names no account: {name}"
+    me = pwd.getpwuid(os.getuid())
+    if account.pw_name == me.pw_name:
+        return f"COD_E2E_SSH_USER names your own account ({name}); it must name a dedicated test account"
+    if account.pw_uid != os.getuid():
+        return f"COD_E2E_SSH_USER account {name} has uid {account.pw_uid}, not yours ({os.getuid()}); an sshd that is not root can only log in an account with its own uid"
+    home = Path(account.pw_dir).resolve()
+    own_homes = {Path(me.pw_dir).resolve()}
+    if os.environ.get("HOME"):
+        own_homes.add(Path(os.environ["HOME"]).resolve())
+    for own in own_homes:
+        if _inside(home, own) or _inside(own, home):
+            return f"the home of COD_E2E_SSH_USER account {name} ({home}) is, holds or lies in your home ({own}); it must be a throwaway folder outside it"
+    if not home.is_dir() or home.stat().st_uid != os.getuid():
+        return f"the home of COD_E2E_SSH_USER account {name} ({home}) is not a folder you own"
     return None
 
 
@@ -66,14 +103,18 @@ def sshd_path() -> str | None:
 
 
 class LoopbackSsh:
-    """One sshd on 127.0.0.1:<port> for the current user. stop() and start() again keep the same port, keys and known_hosts."""
+    """One sshd on 127.0.0.1:<port> that logs in only the dedicated test account (COD_E2E_SSH_USER). stop() and start() again keep the same port, keys and known_hosts."""
 
     def __init__(self, folder: Path, port: int | None = None) -> None:
+        reason = account_reason()
+        if reason is not None:
+            raise RuntimeError(f"refusing to set up the loopback sshd: {reason}")
         self.folder = folder
         self.folder.mkdir(parents=True, exist_ok=True)
         self.port = port or free_port()
-        self.user = pwd.getpwuid(os.getuid()).pw_name
-        self.home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        account = test_account()
+        self.user = account.pw_name
+        self.home = Path(account.pw_dir).resolve()
         self.client_key = folder / "client_ed25519"
         self.host_key = folder / "host_ed25519"
         self.known_hosts = folder / "known_hosts"
@@ -178,10 +219,17 @@ class LoopbackSsh:
         self.process = None
         # sshd -D leaves its per-connection children running; the remote server keeps those alive, and a stopped service must refuse new logins only, which it does once the listener is gone.
 
+    def server_path(self) -> Path:
+        """The remote server path in the test account's throwaway home, checked again right before every write."""
+        reason = account_reason()
+        if reason is not None or self.home != Path(test_account().pw_dir).resolve():
+            raise RuntimeError(f"refusing to write the remote server: {reason or 'the test account home changed'}")
+        return self.home / ".zed_server" / remote_server_name()
+
     def install_remote_server(self) -> Path:
         """Copies COD_E2E_REMOTE_SERVER to the path Zed checks on the remote host, so no download is needed."""
         source = Path(os.environ["COD_E2E_REMOTE_SERVER"])
-        target = self.home / ".zed_server" / remote_server_name()
+        target = self.server_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.unlink(missing_ok=True)
         shutil.copyfile(source, target)
@@ -191,7 +239,7 @@ class LoopbackSsh:
     def install_slow_remote_server(self, delay: float) -> Path:
         """Puts a wrapper at the path Zed checks on the remote host that sleeps `delay` seconds on every run, then runs COD_E2E_REMOTE_SERVER, so the remote client stays in its startup while sshd is up. install_remote_server() puts the real binary back."""
         source = Path(os.environ["COD_E2E_REMOTE_SERVER"]).resolve()
-        target = self.home / ".zed_server" / remote_server_name()
+        target = self.server_path()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.unlink(missing_ok=True)
         target.write_text(f'#!/bin/sh\nsleep {delay:g}\nexec "{source}" "$@"\n')

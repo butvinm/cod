@@ -103,6 +103,16 @@ jobs:
           # The remote workspace tests run their own sshd as the runner user on 127.0.0.1 (tests/e2e/loopback_ssh.py); sshd wants this folder to exist.
           sudo mkdir -p /run/sshd
 
+      # The loopback SSH tests log in only as this throwaway account, never as the runner user: the runner's uid (an sshd that is not root can only log in its own uid), its own name, and a home made for this job outside the runner's home, so the remote server they install never lands in a real home. "Remove the SSH test account" deletes both at the end.
+      - name: Create the SSH test account
+        if: steps.changes.outputs.code == 'true'
+        run: |
+          home=$(mktemp -d /tmp/codssh-home.XXXXXX)
+          sudo useradd --non-unique --uid "$(id -u)" --gid "$(id -g)" --no-create-home --home-dir "$home" --shell /bin/bash --password '*' --comment "Cod e2e SSH test account" codssh
+          getent passwd codssh
+          echo "COD_E2E_SSH_USER=codssh" >> "$GITHUB_ENV"
+          echo "COD_E2E_SSH_HOME=$home" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         if: steps.changes.outputs.code == 'true'
         run: |
@@ -223,3 +233,15 @@ jobs:
           path: target/e2e-remote-tracking-artifacts
           retention-days: 14
           if-no-files-found: warn
+
+      # The account shares the runner's uid, so this deletes it by name only (never pkill -u) and removes the throwaway home it logged in to.
+      - name: Remove the SSH test account
+        if: always() && steps.changes.outputs.code == 'true'
+        run: |
+          if getent passwd codssh > /dev/null; then
+            # --force: userdel sees the runner's own processes under the shared uid and would refuse otherwise.
+            sudo userdel --force codssh
+          fi
+          if [ -n "${COD_E2E_SSH_HOME:-}" ] && [ -d "$COD_E2E_SSH_HOME" ]; then
+            rm -rf "$COD_E2E_SSH_HOME"
+          fi
