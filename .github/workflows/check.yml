@@ -176,6 +176,9 @@ jobs:
             done <<< "$changed"
             echo "Files changed since $base: $count"
             printf '%s\n' "$changed" | head -n 50 || true
+          elif [ -z "${{ steps.restore.outputs.cache-matched-key }}" ]; then
+            # Nothing restored: keep the fixed time, so the saved fingerprints record it. Cargo stores the newest file time of a package whose build script names no inputs and reruns that script when the value differs.
+            echo "Nothing restored, every tracked file keeps the fixed time"
           else
             echo "No usable commit for the restored state, every tracked file counts as changed"
             git ls-files -z | xargs -0 -r touch -c -h
@@ -190,7 +193,8 @@ jobs:
         run: |
           started=$(date +%s)
           echo "check started at $(date -u '+%H:%M:%S')"
-          cargo check --locked -p zed -p cod_browser 2>&1 | tee check.log
+          # The zed build script reads GITHUB_RUN_NUMBER, which differs on every run and would make cargo recheck zed each time.
+          env -u GITHUB_RUN_NUMBER cargo check --locked -p zed -p cod_browser 2>&1 | tee check.log
           finished=$(date +%s)
           echo "check finished at $(date -u '+%H:%M:%S')"
           echo "cargo check took $((finished - started)) s"
