@@ -3465,11 +3465,15 @@ dependencies = [
  "codctl",
  "editor",
  "futures 0.3.34",
+ "git_ui",
  "git_ui_core",
  "gpui",
  "libc",
  "log",
+ "project",
  "serde_json",
+ "tempfile",
+ "web_view",
  "workspace",
 ]
 
