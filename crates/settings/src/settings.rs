@@ -1,3 +1,4 @@
+// Temporary measuring change for the fast check (#24), reverted in the next commit.
 mod base_keymap_setting;
 mod content_into_gpui;
 mod editable_setting_control;
