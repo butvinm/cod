@@ -1,3 +1,4 @@
+// Temporary measuring change for the fast check (#24), reverted in a later commit.
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 #![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
