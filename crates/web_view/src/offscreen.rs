@@ -71,6 +71,13 @@ pub(crate) fn backend_requested() -> bool {
 
 pub(crate) fn init(cx: &mut App) {
     workspace::register_serializable_item::<OffscreenView>(cx);
+    // Links from chats, files and previews open as page tabs (#32).
+    workspace::cod_links::CodPageOpener::install(
+        |workspace, url, window, cx| {
+            open_or_focus_page(workspace, url, window, cx);
+        },
+        cx,
+    );
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &crate::OpenUrl, window, cx| {
             crate::open_page_modal::OpenPageModal::toggle(workspace, window, cx);
@@ -482,7 +489,7 @@ impl OffscreenView {
                     // Deferred: finding an open tab by URL reads every page, this one included.
                     window.defer(cx, move |window, cx| {
                         workspace.update(cx, |workspace, cx| {
-                            open_or_focus_page(workspace, url, window, cx);
+                            workspace.cod_open_link(&url, window, cx);
                         });
                     });
                 }

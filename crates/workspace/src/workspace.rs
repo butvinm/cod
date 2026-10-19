@@ -1,4 +1,5 @@
 pub mod active_file_name;
+pub mod cod_links;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -5339,7 +5340,7 @@ impl Workspace {
 
         if let Ok(url) = Url::parse(url_or_path) {
             match url.scheme() {
-                "http" | "https" => cx.open_url(url_or_path),
+                "http" | "https" => self.cod_open_link(url_or_path, window, cx),
                 "file" => open_abs_path(self, PathBuf::from(url.path()), cx),
                 _ => cx.open_url(url_or_path),
             }
