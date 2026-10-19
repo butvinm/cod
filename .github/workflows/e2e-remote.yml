@@ -1,0 +1,195 @@
+# Runs the remote (SSH) end-to-end tests against the real Cod app on Linux under a headless sway, on a loopback sshd (tests/e2e/loopback_ssh.py). Story #24.
+# Optional: it never runs on pull requests and is never a required check. Building the remote server takes long, so these tests are not in the required E2E job (.github/workflows/e2e.yml).
+# Run it by hand (workflow_dispatch) on any branch; pushes to master run it too.
+# The build uses the same environment and caches as e2e.yml and the Linux release workflow.
+# The run's status is the "Run the basic remote tests" step (tests/e2e/remote_24.py). The remote multi-workspace lifecycle cases (tests/e2e/remote_tracking_24.py) run after it in a step that reports but never fails the run.
+name: E2E remote (optional)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-remote-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  e2e-remote:
+    name: e2e-remote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    # The same values as the build job of linux-release.yml. A difference makes sccache miss and rebuild everything.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable -C link-arg=-fuse-ld=mold"
+      CEF_PATH: /home/runner/cef
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # One source of truth for the CEF version: the release workflow.
+      - name: Read the CEF version
+        run: |
+          version=$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)
+          test -n "$version"
+          echo "CEF_VERSION=$version" >> "$GITHUB_ENV"
+          echo "CEF $version"
+
+      # The packages of e2e.yml, plus openssh-client and openssh-server for the loopback SSH tests.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake clang lld llvm libstdc++-14-dev \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev libva-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev mold \
+            libnss3 libnspr4 libasound2t64 libatspi2.0-0t64 libcups2t64 libdrm2 libgbm1 libgl1-mesa-dri mesa-vulkan-drivers \
+            libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
+            libwebkit2gtk-4.1-0 libfontconfig1 xz-utils util-linux \
+            sway grim dbus openssh-client openssh-server
+          # The remote workspace tests run their own sshd as the runner user on 127.0.0.1 (tests/e2e/loopback_ssh.py); sshd wants this folder to exist.
+          sudo mkdir -p /run/sshd
+
+      # The loopback SSH tests log in only as this throwaway account, never as the runner user: the runner's uid (an sshd that is not root can only log in its own uid), its own name, and a home made for this job outside the runner's home, so the remote server they install never lands in a real home. "Remove the SSH test account" deletes both at the end.
+      - name: Create the SSH test account
+        run: |
+          home=$(mktemp -d /tmp/codssh-home.XXXXXX)
+          sudo useradd --non-unique --uid "$(id -u)" --gid "$(id -g)" --no-create-home --home-dir "$home" --shell /bin/bash --password '*' --comment "Cod e2e SSH test account" codssh
+          getent passwd codssh
+          echo "COD_E2E_SSH_USER=codssh" >> "$GITHUB_ENV"
+          echo "COD_E2E_SSH_HOME=$home" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      - name: Restore the cargo registry cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-targets: false
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Restore the CEF download
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # The same command as in script/e2e, with the same environment as the release build.
+      - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+        run: |
+          echo "build started at $(date -u '+%H:%M:%S')"
+          sccache --zero-stats
+          cargo build --profile release-fast -p zed -p cod_browser
+          sccache --show-stats
+          echo "build finished at $(date -u '+%H:%M:%S')"
+
+      # The remote server for the loopback SSH tests, so Cod never downloads one. A separate cargo command, so the zed build above keeps its own feature set and cache hits.
+      - name: Build the remote server for the loopback SSH tests
+        id: remote-server
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+        run: |
+          echo "remote server build started at $(date -u '+%H:%M:%S')"
+          cargo build --profile release-fast -p remote_server
+          echo "remote server build finished at $(date -u '+%H:%M:%S')"
+
+      - name: Save the CEF download
+        if: github.ref == 'refs/heads/master' && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-linux-x86_64
+
+      # script/e2e remote_24: the basic SSH set. COD_E2E_REMOTE_SERVER names the remote server built above. COD_E2E_REQUIRE_SSH=1 makes script/e2e fail without that binary and makes every loopback SSH test fail, not skip, when ssh, sshd or the binary is missing or sshd does not start.
+      - name: Run the basic remote tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+          COD_E2E_REMOTE_SERVER: ${{ github.workspace }}/target/release-fast/remote_server
+          COD_E2E_REQUIRE_SSH: "1"
+        run: script/e2e remote_24
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-remote-artifacts-${{ github.sha }}
+          path: target/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # The remote multi-workspace lifecycle cases (tests/e2e/remote_tracking_24.py), tracked for later triage. This step never fails the run, but it prints every result, warns when a test fails, and keeps its own artifacts.
+      - name: Remote multi-workspace tracking (never fails the run)
+        id: remote-tracking
+        if: ${{ !cancelled() && steps.remote-server.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 40
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+          CARGO_BUILD_JOBS: "8"
+          COD_E2E_REMOTE_SERVER: ${{ github.workspace }}/target/release-fast/remote_server
+          COD_E2E_REQUIRE_SSH: "1"
+          COD_E2E_ARTIFACTS: ${{ github.workspace }}/target/e2e-remote-tracking-artifacts
+        run: |
+          status=0
+          script/e2e remote_tracking_24 || status=$?
+          if [ "$status" != 0 ]; then
+            echo "::warning title=Remote multi-workspace tracking::remote_tracking_24 failed with status $status (see the log above and the e2e-remote-tracking-artifacts artifact)"
+          fi
+          exit "$status"
+
+      - name: Upload remote tracking artifacts
+        if: ${{ !cancelled() && steps.remote-tracking.outcome != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-remote-tracking-artifacts-${{ github.sha }}
+          path: target/e2e-remote-tracking-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # The account shares the runner's uid, so this deletes it by name only (never pkill -u) and removes the throwaway home it logged in to.
+      - name: Remove the SSH test account
+        if: always()
+        run: |
+          if getent passwd codssh > /dev/null; then
+            # --force: userdel sees the runner's own processes under the shared uid and would refuse otherwise.
+            sudo userdel --force codssh
+          fi
+          if [ -n "${COD_E2E_SSH_HOME:-}" ] && [ -d "$COD_E2E_SSH_HOME" ]; then
+            rm -rf "$COD_E2E_SSH_HOME"
+          fi
