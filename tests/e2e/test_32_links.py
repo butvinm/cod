@@ -7,6 +7,7 @@ The driver reports page tabs under state["pages"]["open"] (see test_31_pages.py)
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import time
@@ -16,11 +17,14 @@ from typing import Any
 from unittest import mock
 
 from cod_e2e import CodTestCase
+from fake_acp_agent import fake_agent_settings
 from page_server import PageServer
 
 EDITOR_OPEN_URL = "editor: open url"
+AGENT_ID = "claude-acp"
 
 WIKI = "Billing wiki - Home"
+PAY_1234 = "PAY-1234 Fix invoice rounding"
 FTP_URL = "ftp://files.example.com/invoices/2024"
 
 # How long a page may take to open and load.
@@ -45,6 +49,10 @@ def pages(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 def page_titled(state: dict[str, Any], title: str) -> dict[str, Any] | None:
     return next((page for page in pages(state) if page["title"] == title), None)
+
+
+def chat(state: dict[str, Any]) -> dict[str, Any]:
+    return state.get("chat") or {}
 
 
 class LinksTest(CodTestCase):
@@ -127,6 +135,84 @@ class LinksTest(CodTestCase):
             LOAD_TIMEOUT,
             "the wiki page to open in a tab and load",
         )
+
+    # AC1
+    #
+    # Opening a link "by click" is not covered here: the end-to-end driver can only click chrome
+    # whose bounds it already tracks (tabs, buttons), never an arbitrary span of rendered text in
+    # a chat reply, so there is no way to simulate a mouse click on the link itself. The keyboard
+    # path below (alt-up, tab, enter, from #28) reaches the exact same handler a click would
+    # (`thread_view::open_link`, which both the mouse click and `markdown::OpenFocusedLink`
+    # dispatch to), so it is the representative acceptance path this test drives.
+
+    def test_ac1_opening_a_link_from_an_agent_reply_opens_a_page_tab(self) -> None:
+        with self.step("create billing-api and an agent script whose reply links to the fake tracker page"):
+            repo = self.make_repo(
+                "billing-api",
+                {
+                    "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
+                    "src/main.rs": 'fn main() {\n    println!("billing-api");\n}\n',
+                },
+            )
+            tracker_url = self.server.url("/tracker/PAY-1234")
+            script = self.workdir / "agent-script.json"
+            script.write_text(
+                json.dumps(
+                    {
+                        "session_ids": ["claude-session-pay-1234"],
+                        "turns": [{"steps": [{"chunk": f"The ticket is {tracker_url}."}, {"end": "end_turn"}]}],
+                    }
+                )
+            )
+            agent_servers = {AGENT_ID: fake_agent_settings(script, log=self.workdir / "agent.log")}
+
+        with self.step("start Cod on billing-api with the fake agent"):
+            self.start_cod(repo, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                30,
+                "the billing-api folder to open",
+            )
+
+        with self.step("start a chat with the fake agent and send a prompt"):
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            # The menu ends with the external agents and "Add More Agents"; the fake agent is the only external agent.
+            self.keys("up up enter")
+            self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
+            self.type("Where is the ticket?")
+            self.keys("enter")
+            self.wait_for(lambda state: tracker_url in chat(state).get("transcript", ""), 30, "the scripted reply with the link")
+
+        with self.step("move the focus from the message box into the reply, then tab to the link"):
+            self.keys("alt-up")
+            self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
+            self.keys("tab")
+            state = self.wait_for(
+                lambda state: (chat(state).get("focused_link") or {}).get("url") == tracker_url,
+                10,
+                "the focus on the tracker link",
+            )
+            transcript_before = chat(state)["transcript"]
+
+        with self.step("press enter on the link: the page opens as a tab in the editor pane"):
+            self.keys("enter")
+            state = self.wait_for(
+                lambda state: state["active_tab"] == PAY_1234 and (page_titled(state, PAY_1234) or {}).get("state") == "loaded",
+                LOAD_TIMEOUT,
+                "the tracker page to open and load",
+            )
+            page = page_titled(state, PAY_1234)
+            assert page is not None
+            self.expect_equal("page url", tracker_url, page["url"])
+            self.expect_equal("page kind", "external", page["kind"])
+            self.expect_equal("page active", True, page["active"])
+
+        with self.step("focus the agent panel again: the chat kept its transcript, so opening the page did not disturb it"):
+            self.run_command("agent: toggle focus")
+            state = self.wait_for(lambda state: state.get("agent_panel_focused") is True, 10, "the agent panel to take the focus")
+            self.expect_equal("chat transcript unchanged", transcript_before, chat(state).get("transcript"))
 
     # AC3
 
