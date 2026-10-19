@@ -114,6 +114,16 @@ pub struct MultiWorkspaceState {
     pub project_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]
     pub sidebar_state: Option<String>,
+    /// Cod (#24): the database ids of every workspace the window holds, in window order.
+    #[serde(default)]
+    pub cod_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): the window's key in the Cod window registry, created once per window.
+    #[serde(default)]
+    pub cod_window_key: Option<String>,
+    /// Cod (#24): this state was built from the Cod window registry at startup, so its id list
+    /// is the window's membership as it is (no session-binding checks apply).
+    #[serde(skip)]
+    pub cod_from_registry: bool,
 }
 
 /// The serialized state of a single MultiWorkspace window from a previous session:
@@ -122,6 +132,8 @@ pub struct MultiWorkspaceState {
 #[derive(Debug, Clone)]
 pub struct SerializedMultiWorkspace {
     pub active_workspace: SessionWorkspace,
+    /// Cod (#24): the window's other workspaces of that session, restored next to the active one.
+    pub other_workspaces: Vec<SessionWorkspace>,
     pub state: MultiWorkspaceState,
 }
 
@@ -302,7 +314,7 @@ impl SerializedPaneGroup {
             SerializedPaneGroup::Pane(serialized_pane) => {
                 let pane = workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_pane(window, cx).downgrade()
+                        workspace.cod_add_restored_pane(window, cx).downgrade()
                     })
                     .log_err()?;
                 let active = serialized_pane.active;
@@ -312,10 +324,35 @@ impl SerializedPaneGroup {
                     .context("Could not deserialize pane)")
                     .log_err()?;
 
-                if pane
+                let pane_kept = pane
                     .read_with(cx, |pane, _| pane.items_len() != 0)
-                    .log_err()?
-                {
+                    .log_err()?;
+
+                // Cod (#24): the saved items that failed to load keep their records and their
+                // place in the saved layout, so a later restore can still bring them back.
+                let unrestored = serialized_pane
+                    .children
+                    .iter()
+                    .zip(new_items.iter())
+                    .filter(|(_, item)| item.is_none())
+                    .map(|(serialized_item, _)| SerializedItem {
+                        active: false,
+                        preview: false,
+                        ..serialized_item.clone()
+                    })
+                    .collect::<Vec<_>>();
+                if !unrestored.is_empty() {
+                    let owner = pane_kept.then(|| pane.entity_id());
+                    workspace
+                        .update(cx, |workspace, _| {
+                            workspace.cod_unrestored_items.extend(
+                                unrestored.into_iter().map(|item| (owner, item)),
+                            );
+                        })
+                        .log_err();
+                }
+
+                if pane_kept {
                     let pane = pane.upgrade()?;
                     Some((
                         Member::Pane(pane.clone()),
@@ -391,7 +428,12 @@ impl SerializedPane {
 
             if let Some(item_handle) = item_handle {
                 pane.update_in(cx, |pane, window, cx| {
-                    pane.add_item(item_handle.clone(), true, true, None, window, cx);
+                    // Cod (#24): a restoring workspace adds its items without taking the focus;
+                    // the restore focuses once, after the tree and the docks are installed.
+                    let focus_item = workspace
+                        .upgrade()
+                        .is_none_or(|workspace| !workspace.read(cx).cod_restore_in_progress);
+                    pane.add_item(item_handle.clone(), true, focus_item, None, window, cx);
                 })?;
             }
         }

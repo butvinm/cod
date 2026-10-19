@@ -929,6 +929,12 @@ fn main() {
             )
         };
 
+        // Cod (#24): external opens wait for the local windows of the start, not for a remote
+        // window that may wait on a connection prompt (see `CodLocalRestoreDone`).
+        let (local_restore_tx, local_restore_rx) = oneshot::channel::<()>();
+        cx.set_global(CodLocalRestoreDone(Some(local_restore_tx)));
+        let local_restore_done = local_restore_rx.shared();
+
         let restore_task = match open_rx
             .try_recv()
             .ok()
@@ -942,10 +948,55 @@ fn main() {
                     }
                 }
             }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
-            }
+            Some(request) => cx.spawn({
+                let app_state = app_state.clone();
+                async move |cx| {
+                    // Cod (#24): a launch with folders brings the registered Cod windows back
+                    // as a plain launch does, then opens the folders as stock does.
+                    // The first start after the update builds the registry from the previous
+                    // session first, as a plain launch does, so those windows are not lost.
+                    let registry_windows =
+                        match cx.update(|cx| workspace::cod_registry_multi_workspaces(cx)) {
+                            Some(windows) => Some(windows),
+                            None => {
+                                let mut restorable =
+                                    restorable_workspaces(cx, &app_state).await;
+                                let seeded = cod_seed_registry_and_publish_session(
+                                    &mut restorable,
+                                    &app_state,
+                                    cx,
+                                )
+                                .await;
+                                match seeded {
+                                    Ok(true) => restorable,
+                                    Ok(false) => None,
+                                    Err(err) => {
+                                        log::error!("{err:#}");
+                                        None
+                                    }
+                                }
+                            }
+                        };
+                    // Cod (#24): as at a plain launch, the restore owners of the windows that
+                    // come back are installed before any of them is created, so each window is
+                    // built with its saved key and all its members (a quit during the restore
+                    // saves the window whole).
+                    let (local_windows, _) = cod_prepare_restored_windows(
+                        registry_windows.unwrap_or_default(),
+                        false,
+                        cx,
+                    );
+                    for window in local_windows {
+                        restore_multiworkspace(window, app_state.clone(), cx)
+                            .await
+                            .log_err();
+                    }
+                    cx.update(|cx| {
+                        workspace::cod_finish_registry_startup(cx);
+                        handle_open_request(request, app_state, cx);
+                    });
+                }
+            }),
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
@@ -970,12 +1021,28 @@ fn main() {
             let db = workspace::WorkspaceDb::global(cx);
             let fs = app_state.fs.clone();
             let restore_finished = restore_finished.clone();
-            async move |_cx| {
+            async move |cx| {
                 restore_finished.await;
-                db.garbage_collect_workspaces(
+                // Cod (#24): a start without a registry copy (an unreadable registry, or a
+                // first-start seed that was not written) leaves every saved workspace as it is,
+                // so the next start finds them all and seeds the registry again.
+                if cx.update(|cx| workspace::cod_registry_window_count(cx).is_none()) {
+                    log::warn!("Skipping workspace cleanup: the Cod window registry is not loaded");
+                    return anyhow::Ok(());
+                }
+                // Cod (#24): workspaces in the Cod window registry are never collected.
+                // An unreadable registry hides which workspaces it protects: skip the cleanup.
+                let Some(registered) =
+                    cx.update(|cx| workspace::cod_registered_workspace_ids(cx))
+                else {
+                    log::warn!("Skipping workspace cleanup: the Cod window registry is unreadable");
+                    return anyhow::Ok(());
+                };
+                db.cod_garbage_collect_workspaces_keeping(
                     fs.as_ref(),
                     &current_session_id,
                     last_session_id.as_deref(),
+                    &registered,
                 )
                 .await
             }
@@ -988,15 +1055,22 @@ fn main() {
 
         cx.spawn(async move |cx| {
             let _first_window_subscription = _first_window_subscription;
-            let first_window_placed = first_window_rx.shared();
+            // Cod (#24): opens wait for the whole restore, not only the first window.
+            drop(first_window_rx);
             while let Some(urls) = open_rx.next().await {
                 // On a macOS cold launch, `zed <path>` arrives here after startup already
-                // began restoring the session, so wait for a restored window to exist before
-                // matching. Otherwise this open sees no windows and spawns a redundant one (#61346).
-                futures::select_biased! {
-                    _ = restore_finished.clone() => {}
-                    _ = first_window_placed.clone() => {}
-                }
+                // began restoring the session, so wait for the restore before matching.
+                // Otherwise this open sees no windows and spawns a redundant one (#61346).
+                // Cod (#24): wait until every registered local window (with its pending
+                // members) exists, so the open matches every registered local workspace and
+                // never makes a second live copy of one whose window is not back yet. The
+                // restore of remote windows, which runs after the local ones, does not hold
+                // opens back.
+                let ready = future::select(
+                    Box::pin(restore_finished.clone()),
+                    Box::pin(local_restore_done.clone()),
+                );
+                let _ = ready.await;
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
                         handle_open_request(request, app_state.clone(), cx);
@@ -1424,14 +1498,129 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+/// Cod (#24): on the first start after the update (no Cod window registry yet) the registry is
+/// built from the windows the stock session path found, before any of them is restored, and
+/// only then is this start's session id published (`Session::new` held it back). A seed that
+/// is not written keeps the previous session id published and restores no window (restoring
+/// re-binds workspaces to this start's session), so the next start finds the same windows
+/// again. Returns whether this start seeded the registry, or an error when the seed failed.
+async fn cod_seed_registry_and_publish_session(
+    restorable: &mut Option<Vec<workspace::SerializedMultiWorkspace>>,
+    app_state: &Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
+    if !cx.update(|cx| workspace::cod_window_registry_absent(cx)) {
+        return Ok(false);
+    }
+    let mut no_windows: Vec<workspace::SerializedMultiWorkspace> = Vec::new();
+    let seeded =
+        workspace::cod_seed_window_registry(restorable.as_mut().unwrap_or(&mut no_windows), cx)
+            .await;
+    if !seeded {
+        cx.update(|cx| workspace::cod_mark_registry_seed_failed(cx));
+        anyhow::bail!(
+            "The Cod window registry was not seeded; keeping the previous session id and restoring no window"
+        );
+    }
+    let (kvp, session_id) = cx.update(|cx| {
+        (
+            KeyValueStore::global(cx),
+            app_state.session.read(cx).id().to_owned(),
+        )
+    });
+    session::cod_publish_session_id(kvp, session_id).await;
+    Ok(true)
+}
+
 pub(crate) async fn restore_or_create_workspace(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
-    if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
+    // Cod (#24): Cod windows come back from the Cod window registry, not from session
+    // bindings. Without a registry (the first start after the update) the stock session path
+    // finds the windows, and the registry is built from them before any is restored. An
+    // unreadable registry is kept as it is and the stock session path is used.
+    let registry_windows = cx.update(|cx| workspace::cod_registry_multi_workspaces(cx));
+    let restorable = match registry_windows {
+        Some(windows) => Some(windows),
+        None => {
+            let mut restorable = restorable_workspaces(cx, &app_state).await;
+            match cod_seed_registry_and_publish_session(&mut restorable, &app_state, cx).await {
+                Ok(_) => restorable,
+                // Restoring would re-bind the previous session's workspaces to this start's
+                // unpublished session; restore none, so the next start finds them all.
+                Err(err) => {
+                    log::error!("{err:#}");
+                    None
+                }
+            }
+        }
+    };
+    let result = restore_or_create_from(restorable, app_state, &kvp, cx).await;
+    cx.update(|cx| workspace::cod_finish_registry_startup(cx));
+    result
+}
+
+/// Cod (#24): fired once every local window of the start is restored and only remote windows
+/// are left, so external opens no longer wait for the restore.
+struct CodLocalRestoreDone(Option<oneshot::Sender<()>>);
+
+impl gpui::Global for CodLocalRestoreDone {}
+
+/// Cod (#24): lets external opens through before the remote windows of the start come back.
+fn cod_release_external_opens(cx: &mut App) {
+    if !cx.has_global::<CodLocalRestoreDone>() {
+        return;
+    }
+    if let Some(done) = cx.global_mut::<CodLocalRestoreDone>().0.take() {
+        done.send(()).ok();
+    }
+}
+
+/// Cod (#24): splits the windows of a start into local and remote windows and installs the
+/// restore owner of every window this start restores (saved key, complete ordered membership,
+/// each member's location and folders) before any window is created, so each restored window
+/// is built with its saved key and all its members. Without `restore_remote` the remote
+/// windows are not restored: they get no owner and none is returned.
+fn cod_prepare_restored_windows(
+    windows: Vec<workspace::SerializedMultiWorkspace>,
+    restore_remote: bool,
+    cx: &mut AsyncApp,
+) -> (
+    Vec<workspace::SerializedMultiWorkspace>,
+    Vec<workspace::SerializedMultiWorkspace>,
+) {
+    let (mut restored, remote_windows): (Vec<_>, Vec<_>) =
+        windows.into_iter().partition(|window| {
+            matches!(
+                window.active_workspace.location,
+                SerializedWorkspaceLocation::Local
+            )
+        });
+    let local_count = restored.len();
+    if restore_remote {
+        restored.extend(remote_windows);
+    }
+    cx.update(|cx| workspace::cod_install_restore_owners(&restored, cx));
+    let remote_windows = restored.split_off(local_count);
+    (restored, remote_windows)
+}
+
+async fn restore_or_create_from(
+    restorable: Option<Vec<workspace::SerializedMultiWorkspace>>,
+    app_state: Arc<AppState>,
+    kvp: &KeyValueStore,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    if let Some(multi_workspaces) = restorable {
+        // Cod (#24): the local windows come back first. A remote window may wait on its
+        // connection (a Retry/Cancel prompt), so external opens are released once only remote
+        // windows are left.
+        let (local_windows, remote_windows) =
+            cod_prepare_restored_windows(multi_workspaces, true, cx);
         let mut error_count = 0;
-        for multi_workspace in multi_workspaces {
+        for multi_workspace in local_windows.into_iter().chain(remote_windows) {
             let result = match &multi_workspace.active_workspace.location {
                 SerializedWorkspaceLocation::Local => {
                     restore_multiworkspace(multi_workspace, app_state.clone(), cx)
@@ -1439,6 +1628,7 @@ pub(crate) async fn restore_or_create_workspace(
                         .map(|_| ())
                 }
                 SerializedWorkspaceLocation::Remote(connection_options) => {
+                    cx.update(|cx| cod_release_external_opens(cx));
                     let mut connection_options = connection_options.clone();
                     if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
                         cx.update(|cx| {
@@ -1455,6 +1645,25 @@ pub(crate) async fn restore_or_create_workspace(
                         .map(PathBuf::from)
                         .collect::<Vec<_>>();
                     let state = multi_workspace.state.clone();
+                    // Cod (#24): the window's other members (local and remote) come back as
+                    // pending members of the remote window, as in a local window. They load
+                    // when first shown; a remote one over its saved connection.
+                    let cod_local_members: Vec<_> = multi_workspace
+                        .other_workspaces
+                        .iter()
+                        .filter(|other| {
+                            !other.paths.is_empty()
+                                || state.cod_workspace_ids.is_empty()
+                                || state.cod_workspace_ids.contains(&other.workspace_id)
+                        })
+                        .map(|other| {
+                            (
+                                other.workspace_id,
+                                other.location.clone(),
+                                other.paths.paths().to_vec(),
+                            )
+                        })
+                        .collect();
                     async {
                         let window = open_remote_project(
                             connection_options,
@@ -1464,6 +1673,32 @@ pub(crate) async fn restore_or_create_workspace(
                             cx,
                         )
                         .await?;
+                        // Only the window that holds this saved window's key (its restore
+                        // owner) takes them; a cancelled restore gave the key back.
+                        window
+                            .update(cx, |multi_workspace, _window, cx| {
+                                if state.cod_window_key.as_deref()
+                                    != Some(multi_workspace.cod_window_key())
+                                {
+                                    return;
+                                }
+                                for (id, location, paths) in cod_local_members {
+                                    match location {
+                                        SerializedWorkspaceLocation::Local => {
+                                            multi_workspace.cod_add_pending_workspace(id, paths)
+                                        }
+                                        SerializedWorkspaceLocation::Remote(connection) => {
+                                            multi_workspace.cod_add_pending_remote_workspace(
+                                                id, connection, paths,
+                                            )
+                                        }
+                                    }
+                                }
+                                multi_workspace.cod_finish_restore(cx);
+                                multi_workspace.serialize(cx);
+                                cx.notify();
+                            })
+                            .ok();
                         workspace::apply_restored_multiworkspace_state(
                             window,
                             &state,

@@ -31,6 +31,13 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
+    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
+};
+pub use multi_workspace::{
+    CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
+};
+pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
     NextProject, NextThread, PreviousProject, PreviousThread, ProjectGroup, ProjectGroupKey,
@@ -88,7 +95,9 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
+    CodRemoteRestoreDone, CodRestoreOwner, RecentWorkspace, WorkspaceDb,
+    cod_add_restore_owner, cod_begin_remote_restore, cod_end_remote_restore,
+    cod_remote_restore_in_progress, delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
         SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
@@ -994,6 +1003,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     theme_preview::init(cx);
     toast_layer::init(cx);
     history_manager::init(app_state.fs.clone(), cx);
+    multi_workspace::init_workspace_names(cx);
 
     cx.on_app_quit(flush_windows_serialization_on_quit).detach();
 
@@ -1654,6 +1664,17 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    /// Cod (#24): true while `load_workspace` restores this workspace. No layout is saved then
+    /// (scheduled, internal or flush), so a crash keeps the previous complete snapshot; the
+    /// restore publishes the layout itself once the items are written.
+    cod_restore_in_progress: bool,
+    /// Cod (#24): true after the restored items could not be written. The previous complete
+    /// snapshot stays on disk and no layout that points at missing item records is saved.
+    cod_layout_save_blocked: bool,
+    /// Cod (#24): saved items that failed to load in the restore, with the pane they belong to
+    /// (`None` when their whole pane failed). Every later layout keeps them and their records
+    /// are not cleaned up, so a later restore can still bring them back.
+    cod_unrestored_items: Vec<(Option<EntityId>, SerializedItem)>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1890,6 +1911,13 @@ impl Workspace {
         }
 
         cx.on_focus_lost(window, |this, window, cx| {
+            // Cod (#24): every workspace of the window listens, in the order they were made, and
+            // the last one to move the focus wins. A workspace the window does not draw must not
+            // take it: keys would go to an element outside the frame and reach no workspace
+            // action (not even the command palette) until something else moves the focus.
+            if !this.owns_window_chrome() {
+                return;
+            }
             let focus_handle = window
                 .focus_lost_restore_target(cx)
                 .unwrap_or_else(|| this.fallback_focus_handle(window, cx));
@@ -2156,11 +2184,58 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            cod_restore_in_progress: false,
+            cod_layout_save_blocked: false,
+            cod_unrestored_items: Vec::new(),
         }
     }
 
     pub fn new_local(
         abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_internal(
+            abs_paths,
+            None,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            cx,
+        )
+    }
+
+    /// Cod (#24): opens the saved workspace with this id on its folders. Several workspaces may
+    /// have the same folders, so a restore names the workspace by id, not by folders.
+    pub fn restore_local_by_id(
+        workspace_id: WorkspaceId,
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        open_mode: OpenMode,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_internal(
+            abs_paths,
+            Some(workspace_id),
+            app_state,
+            requesting_window,
+            None,
+            None,
+            open_mode,
+            cx,
+        )
+    }
+
+    fn new_local_internal(
+        abs_paths: Vec<PathBuf>,
+        restore_id: Option<WorkspaceId>,
         app_state: Arc<AppState>,
         requesting_window: Option<WindowHandle<MultiWorkspace>>,
         env: Option<HashMap<String, String>>,
@@ -2181,6 +2256,9 @@ impl Workspace {
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
+        // Cod (#24): after a failed registry seed the saved workspaces stay bound to the
+        // previous session, so a folder opened now gets a new row instead of taking over one.
+        let reuse_saved_by_roots = !cod_registry_seed_failed(cx);
         cx.spawn(async move |cx| {
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
             for path in abs_paths.into_iter() {
@@ -2191,7 +2269,22 @@ impl Workspace {
                 }
             }
 
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+            let serialized_workspace = match restore_id {
+                Some(id) => db.workspace_for_id(id),
+                None if reuse_saved_by_roots => db.workspace_for_roots(paths_to_open.as_slice()),
+                None => None,
+            };
+            // Cod (#24): a restore by id opens a local project, and its first save would write
+            // the row as local. A row saved as remote is never restored here; it stays as saved.
+            if restore_id.is_some()
+                && let Some(saved) = serialized_workspace.as_ref()
+                && matches!(saved.location, SerializedWorkspaceLocation::Remote(_))
+            {
+                anyhow::bail!(
+                    "workspace {:?} is saved as remote and is not restored as local",
+                    saved.id
+                );
+            }
 
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
                 paths_to_open = paths.ordered_paths().cloned().collect();
@@ -4850,6 +4943,36 @@ impl Workspace {
             .unwrap_or_else(|| self.active_pane.read(cx).focus_handle(cx))
     }
 
+    /// Cod (#24): the element a restored or freshly loaded workspace focuses. GPUI sends no
+    /// focus-in events while the platform window is inactive, so a focused pane does not pass the
+    /// focus on to its editor, the editor registers no text input and typed characters are lost.
+    /// Focus the active item itself; an empty pane and a zoomed panel keep the fallback.
+    pub fn cod_restored_focus_handle(&self, window: &Window, cx: &App) -> FocusHandle {
+        let fallback = self.fallback_focus_handle(window, cx);
+        let active_pane = self.active_pane.read(cx);
+        if fallback != active_pane.focus_handle(cx) {
+            return fallback;
+        }
+        active_pane
+            .active_item()
+            .map(|item| item.item_focus_handle(cx))
+            .unwrap_or(fallback)
+    }
+
+    /// Cod (#24): focuses what `cod_restored_focus_handle` names. When a modal is open, the
+    /// modal gets the focus instead, unless focus is already inside it.
+    pub fn cod_focus_restored(&self, window: &mut Window, cx: &mut App) {
+        let modal_focus_handle = self.modal_layer.read(cx).cod_active_modal_focus_handle(cx);
+        if let Some(modal_focus_handle) = modal_focus_handle {
+            if !modal_focus_handle.contains_focused(window, cx) {
+                window.focus(&modal_focus_handle, cx);
+            }
+            return;
+        }
+        let focus_handle = self.cod_restored_focus_handle(window, cx);
+        window.focus(&focus_handle, cx);
+    }
+
     fn dismiss_zoomed_items_to_reveal(
         &mut self,
         dock_to_reveal: Option<DockPosition>,
@@ -4892,6 +5015,25 @@ impl Workspace {
     }
 
     fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        self.cod_add_pane(true, window, cx)
+    }
+
+    /// Cod (#24): a pane created while a workspace restores. It never takes the focus; the
+    /// restore focuses once, after the whole tree and the docks are installed.
+    pub(crate) fn cod_add_restored_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
+        self.cod_add_pane(false, window, cx)
+    }
+
+    fn cod_add_pane(
+        &mut self,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Pane> {
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(
                 self.weak_handle(),
@@ -4910,7 +5052,11 @@ impl Workspace {
             .detach();
         self.panes.push(pane.clone());
 
-        window.focus(&pane.focus_handle(cx), cx);
+        // Cod (#24): a pane added to a workspace the window does not show stays unfocused; a
+        // focused pane that is not drawn would take the keys away from the shown workspace.
+        if focus && self.owns_window_chrome() {
+            window.focus(&pane.focus_handle(cx), cx);
+        }
 
         cx.emit(Event::PaneAdded(pane.clone()));
         pane
@@ -6669,6 +6815,17 @@ impl Workspace {
         }
     }
 
+    /// Cod (#24): whether opening panes and items may move the window focus. Only a restore
+    /// is held back: a workspace that restores while it is not shown never takes the focus,
+    /// and a shown one that restores leaves it in a modal the user has opened meanwhile. Opens
+    /// made by the user (the file finder, the project panel, a split) focus like in Zed.
+    pub(crate) fn cod_restore_may_focus(&self, cx: &App) -> bool {
+        if !self.cod_restore_in_progress {
+            return true;
+        }
+        self.owns_window_chrome() && !self.modal_layer.read(cx).has_active_modal()
+    }
+
     fn update_window_title(&mut self, window: &mut Window, cx: &mut App) {
         if !self.owns_window_chrome() {
             return;
@@ -6715,6 +6872,15 @@ impl Workspace {
             let context =
                 Self::window_title_context(&project, active_project_path.as_ref(), &needs, cx);
             title = render_window_title_format(default_template, separator, &context);
+        }
+
+        // Cod (#24): the title of a named workspace starts with its name.
+        if let Some(name) = cod_workspace_name(self, cx) {
+            title = if title.trim().is_empty() {
+                name
+            } else {
+                format!("{name}{separator}{title}")
+            };
         }
 
         if project.is_via_collab() {
@@ -7644,11 +7810,13 @@ impl Workspace {
             if removing_active_pane {
                 self.set_active_pane(focus_on, window, cx);
             }
-            focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            if self.owns_window_chrome() {
+                focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            }
         } else if removing_active_pane {
             let fallback_pane = self.panes.last().unwrap().clone();
             self.set_active_pane(&fallback_pane, window, cx);
-            if !self.has_active_modal(window, cx) {
+            if self.cod_restore_may_focus(cx) {
                 fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
             }
         }
@@ -7676,12 +7844,37 @@ impl Workspace {
     }
 
     fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
-        let Some(database_id) = self.database_id() else {
+        if self.database_id().is_none()
+            || self.cod_restore_in_progress
+            || self.cod_layout_save_blocked
+        {
             return Task::ready(());
+        }
+        let task = self.cod_serialize_workspace_checked(window, cx);
+        cx.background_spawn(async move {
+            task.await.log_err();
+        })
+    }
+
+    /// Cod (#24): saves the workspace like `serialize_workspace_internal` and resolves to Ok only
+    /// once the database acknowledged the commit, so a caller can delete old records after it.
+    fn cod_serialize_workspace_checked(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let Some(database_id) = self.database_id() else {
+            return Task::ready(Err(anyhow!("the workspace has no database id")));
         };
+        if self.cod_restore_in_progress || self.cod_layout_save_blocked {
+            return Task::ready(Err(anyhow!("layout saves are blocked")));
+        }
 
         fn build_serialized_pane_group(
             pane_group: &Member,
+            hidden_active_pane: Option<&Entity<Pane>>,
+            unrestored_items: &[(Option<EntityId>, SerializedItem)],
+            active_pane: &Entity<Pane>,
             window: &mut Window,
             cx: &mut App,
         ) -> SerializedPaneGroup {
@@ -7695,12 +7888,38 @@ impl Workspace {
                     axis: SerializedAxis(*axis),
                     children: members
                         .iter()
-                        .map(|member| build_serialized_pane_group(member, window, cx))
+                        .map(|member| {
+                            build_serialized_pane_group(
+                                member,
+                                hidden_active_pane,
+                                unrestored_items,
+                                active_pane,
+                                window,
+                                cx,
+                            )
+                        })
                         .collect::<Vec<_>>(),
                     flexes: Some(flexes.lock().clone()),
                 },
                 Member::Pane(pane_handle) => {
-                    SerializedPaneGroup::Pane(serialize_pane_handle(pane_handle, window, cx))
+                    let mut pane = serialize_pane_handle(pane_handle, window, cx);
+                    // Cod (#24): no pane of a workspace hidden behind another one has the focus,
+                    // so its active pane is the one it would focus when shown again.
+                    if let Some(active_pane) = hidden_active_pane {
+                        pane.active = pane_handle == active_pane;
+                    }
+                    // Cod (#24): items that failed to load stay in the layout of their pane (or
+                    // of the active pane when their whole pane failed), after the loaded ones.
+                    for (owner, item) in unrestored_items {
+                        let belongs_here = match owner {
+                            Some(owner) => *owner == pane_handle.entity_id(),
+                            None => pane_handle == active_pane,
+                        };
+                        if belongs_here {
+                            pane.children.push(item.clone());
+                        }
+                    }
+                    SerializedPaneGroup::Pane(pane)
                 }
             }
         }
@@ -7734,7 +7953,16 @@ impl Workspace {
                     .user_toolchains(cx)
                     .unwrap_or_default();
 
-                let center_group = build_serialized_pane_group(&self.center.root, window, cx);
+                let hidden_active_pane =
+                    (!self.owns_window_chrome()).then(|| self.active_pane.clone());
+                let center_group = build_serialized_pane_group(
+                    &self.center.root,
+                    hidden_active_pane.as_ref(),
+                    &self.cod_unrestored_items,
+                    &self.active_pane,
+                    window,
+                    cx,
+                );
                 let docks = build_serialized_docks(self, window, cx);
                 let default_docks = (paths.is_empty()
                     && location == SerializedWorkspaceLocation::Local)
@@ -7769,7 +7997,7 @@ impl Workspace {
                             .await
                             .log_err();
                     }
-                    db.save_workspace(serialized_workspace).await;
+                    db.cod_try_save_workspace(serialized_workspace).await
                 })
             }
             WorkspaceLocation::None => {
@@ -7780,6 +8008,7 @@ impl Workspace {
                     persistence::write_default_dock_state(&kvp, docks)
                         .await
                         .log_err();
+                    anyhow::Ok(())
                 })
             }
         }
@@ -7868,6 +8097,7 @@ impl Workspace {
             workspace.update(cx, |workspace, _| {
                 workspace.persisted_recent_navigation_history = recent_navigation_history;
                 workspace.restoring_workspace = true;
+                workspace.cod_restore_in_progress = true;
             })?;
             let project = workspace.read_with(cx, |workspace, _| workspace.project().clone())?;
 
@@ -7913,6 +8143,7 @@ impl Workspace {
 
             // Remove old panes from workspace panes list
             workspace.update_in(cx, |workspace, window, cx| {
+                let restored_center = center_group.is_some();
                 if let Some((center_group, active_pane)) = center_group {
                     workspace.remove_panes(workspace.center.root.clone(), window, cx);
 
@@ -7923,7 +8154,6 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }
@@ -7941,6 +8171,13 @@ impl Workspace {
                     dock.update(cx, |dock, cx| {
                         dock.restore_serialized_state(serialized_dock.clone(), window, cx);
                     });
+                }
+
+                // Cod (#24): the restored panes and items took no focus. Focus once, now that
+                // the tree and the docks are installed, and only for the shown workspace with
+                // no modal open; a workspace restored behind it focuses when it is shown.
+                if restored_center && workspace.cod_restore_may_focus(cx) {
+                    workspace.cod_focus_restored(window, cx);
                 }
 
                 workspace.restoring_workspace = false;
@@ -7972,7 +8209,69 @@ impl Workspace {
             // the database filling up, we delete items that haven't been loaded now.
             //
             // The items that have been loaded, have been saved after they've been added to the workspace.
-            let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
+            //
+            // Cod (#24): the new records of the loaded items and the panes that point at them
+            // are written before the old records go, so a crash in between keeps one complete
+            // snapshot on disk.
+            let item_save_tasks = workspace.update_in(cx, |workspace, _, cx| {
+                all_deserialized_items
+                    .iter()
+                    .filter_map(|item| {
+                        item.to_serializable_item_handle(cx)?
+                            .serialize(workspace, false, cx)
+                    })
+                    .collect::<Vec<_>>()
+            })?;
+            let mut items_saved = true;
+            for item_save_task in item_save_tasks {
+                if item_save_task.await.log_err().is_none() {
+                    items_saved = false;
+                }
+            }
+            if !items_saved {
+                // Keep the previous snapshot: its layout points at the old item records, which
+                // stay. No later layout is saved over it in this session, so a partial layout
+                // is never published.
+                log::error!("Restored items were not saved; the previous layout is kept");
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.cod_layout_save_blocked = true;
+                        workspace.cod_restore_in_progress = false;
+                        workspace.update_window_edited(window, cx);
+                    })
+                    .ok();
+                return Ok(opened_items);
+            }
+            let layout_saved = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.cod_restore_in_progress = false;
+                    workspace.cod_serialize_workspace_checked(window, cx)
+                })?
+                .await;
+            if let Err(err) = layout_saved {
+                // Cod (#24): the new layout is not committed, so the saved one still points at
+                // the old item records: they stay. They are removed by a later restore.
+                log::error!("Restored layout was not saved; old item records are kept: {err:#}");
+                workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.update_window_edited(window, cx);
+                    })
+                    .ok();
+                return Ok(opened_items);
+            }
+
+            let clean_up_tasks = workspace.update_in(cx, |workspace, window, cx| {
+                // Cod (#24): the records of items that failed to load stay; the committed
+                // layout still points at them.
+                for (item_kind, alive_items) in item_ids_by_kind.iter_mut() {
+                    alive_items.extend(
+                        workspace
+                            .cod_unrestored_items
+                            .iter()
+                            .filter(|(_, item)| &*item.kind == *item_kind)
+                            .map(|(_, item)| item.item_id),
+                    );
+                }
                 item_ids_by_kind
                     .into_iter()
                     .map(|(item_kind, loaded_items)| {
@@ -9338,10 +9637,11 @@ fn open_items(
                                 ix,
                                 workspace
                                     .update_in(cx, |workspace, window, cx| {
+                                        let focus_item = workspace.cod_restore_may_focus(cx);
                                         workspace.open_path(
                                             file_project_path,
                                             None,
-                                            true,
+                                            focus_item,
                                             window,
                                             cx,
                                         )
@@ -10253,8 +10553,29 @@ pub async fn restore_multiworkspace(
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
     let SerializedMultiWorkspace {
         active_workspace,
+        other_workspaces,
         state,
     } = multi_workspace;
+
+    // Cod (#24): restoring a member re-binds it to this session and the new window before the
+    // window saves its list under its new id. Store the full ordered list first, keyed by every
+    // member, so a crash in between still finds every member at the next start.
+    let manifest: Vec<WorkspaceId> = if state.cod_workspace_ids.is_empty() {
+        std::iter::once(active_workspace.workspace_id)
+            .chain(other_workspaces.iter().map(|other| other.workspace_id))
+            .collect()
+    } else {
+        state.cod_workspace_ids.clone()
+    };
+    let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    // A window from the registry needs no restore list: the registry keeps its members until
+    // the window itself changes them.
+    let write_manifest = manifest.len() > 1 && !state.cod_from_registry;
+    if write_manifest {
+        persistence::write_cod_restore_manifest(&kvp, &manifest)
+            .await
+            .log_err();
+    }
 
     let workspace_result = if active_workspace.paths.is_empty() {
         cx.update(|cx| {
@@ -10263,11 +10584,10 @@ pub async fn restore_multiworkspace(
         .await
     } else {
         cx.update(|cx| {
-            Workspace::new_local(
+            Workspace::restore_local_by_id(
+                active_workspace.workspace_id,
                 active_workspace.paths.paths().to_vec(),
                 app_state.clone(),
-                None,
-                None,
                 None,
                 OpenMode::Add,
                 cx,
@@ -10276,12 +10596,21 @@ pub async fn restore_multiworkspace(
         .await
         .map(|result| result.window)
     };
+    // The window built for the shown member took this window's restore owner at construction.
+    // When no window took it (the open failed), it goes now, so no later window takes it.
+    if let Some(key) = state.cod_window_key.clone() {
+        cx.update(|cx| drop(persistence::cod_take_restore_owner_by_key(&key, cx)));
+    }
 
     let window_handle = match workspace_result {
         Ok(handle) => {
             restore_native_window_state(handle, active_workspace.workspace_id, cx);
             handle
-                .update(cx, |_, window, _cx| {
+                .update(cx, |multi_workspace, window, cx| {
+                    // Cod (#24): the shown workspace's active item takes the keys even when the
+                    // platform window is not active yet.
+                    let shown = multi_workspace.workspace().clone();
+                    shown.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                     window.activate_window();
                 })
                 .ok();
@@ -10322,6 +10651,167 @@ pub async fn restore_multiworkspace(
         }
     };
 
+    // Cod (#24): find the window's other workspaces, in the order the window held them. The
+    // saved id list is the window's manifest: a member the last session never re-bound (an
+    // interrupted restore) is found by its id, and a member that is not found stays in the list
+    // for the next start.
+    let key_taken = window_handle
+        .update(cx, |multi_workspace, _window, cx| {
+            if let Some(key) = state.cod_window_key.clone() {
+                multi_workspace.cod_set_window_key(key, cx);
+            }
+            multi_workspace.cod_begin_restore(&state.cod_workspace_ids);
+        })
+        .is_ok();
+    // A window built from its restore owner has its saved key already, and closing it removed
+    // that key through the normal close path. The window is gone here when the user closed it
+    // while its shown workspace still loaded; for a window built without an owner, the close
+    // removed only its first key, so the saved key goes now too (removing it again is a no-op).
+    // The window's other members must not come back at the next start.
+    if !key_taken {
+        if let Some(key) = state.cod_window_key.clone() {
+            let removal = cx.update(|cx| persistence::cod_registry_remove(key, cx));
+            removal.await.log_err();
+        }
+        return Ok(window_handle);
+    }
+    let from_registry = state.cod_from_registry;
+    let mut other_workspaces = other_workspaces;
+    let missing_ids: Vec<WorkspaceId> = state
+        .cod_workspace_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            *id != active_workspace.workspace_id
+                && !other_workspaces
+                    .iter()
+                    .any(|other| other.workspace_id == *id)
+        })
+        .collect();
+    if !missing_ids.is_empty() {
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let (recovered, closed): (Vec<SessionWorkspace>, Vec<WorkspaceId>) = cx
+            .background_executor()
+            .spawn(async move {
+                let mut recovered = Vec::new();
+                let mut closed = Vec::new();
+                for id in missing_ids {
+                    // A workspace closed from the window has no session binding any more; a
+                    // crash before its id left the list must not bring it back. The registry
+                    // drops a closed workspace itself, so its members need no such check.
+                    let bound = if from_registry {
+                        Some(String::new())
+                    } else {
+                        db.select_row_bound::<WorkspaceId, Option<String>>(
+                            "SELECT session_id FROM workspaces WHERE workspace_id = ?",
+                        )
+                        .and_then(|mut select| select(id))
+                        .log_err()
+                        .flatten()
+                        .flatten()
+                    };
+                    if bound.is_none() {
+                        closed.push(id);
+                        continue;
+                    }
+                    match db.workspace_for_id(id) {
+                        Some(saved) => recovered.push(SessionWorkspace {
+                            workspace_id: id,
+                            location: saved.location,
+                            paths: saved.paths,
+                            window_id: None,
+                        }),
+                        None => log::error!("Saved workspace {id:?} of a window was not found"),
+                    }
+                }
+                (recovered, closed)
+            })
+            .await;
+        window_handle
+            .update(cx, |multi_workspace, _window, _cx| {
+                multi_workspace.cod_forget_closed_workspaces(&closed);
+            })
+            .ok();
+        other_workspaces.extend(recovered);
+    }
+    // Cod (#24): lazy restore. Only the shown workspace is loaded; every other member of the
+    // window becomes a pending member (id, folders, place in the order) that loads in the
+    // foreground the first time it is shown. A pending member has no live entities, so it
+    // cannot take the focus or save a layout.
+    // A remote member stays pending too, with its saved connection: it loads its exact saved
+    // row over that connection when first shown.
+    let mut pending: Vec<(WorkspaceId, Vec<PathBuf>)> = Vec::new();
+    let mut pending_remote: Vec<(WorkspaceId, RemoteConnectionOptions)> = Vec::new();
+    for other in other_workspaces {
+        // When the window saved its workspace list, a folderless workspace bound to the window
+        // but not in that list is a placeholder left by an interrupted start, not a workspace
+        // the user made (those are in the list), so it does not come back.
+        if other.paths.is_empty()
+            && !state.cod_workspace_ids.is_empty()
+            && !state.cod_workspace_ids.contains(&other.workspace_id)
+        {
+            log::info!(
+                "Not restoring folderless workspace {:?}: it is not in the window's saved list",
+                other.workspace_id
+            );
+            continue;
+        }
+        if pending.iter().any(|(id, _)| *id == other.workspace_id) {
+            continue;
+        }
+        if let SerializedWorkspaceLocation::Remote(connection) = &other.location {
+            pending_remote.push((other.workspace_id, connection.clone()));
+        }
+        pending.push((other.workspace_id, other.paths.paths().to_vec()));
+    }
+    let binding = window_handle
+        .update(cx, |multi_workspace, window, cx| {
+            for (id, paths) in &pending {
+                match pending_remote.iter().find(|(remote_id, _)| remote_id == id) {
+                    Some((_, connection)) => multi_workspace.cod_add_pending_remote_workspace(
+                        *id,
+                        connection.clone(),
+                        paths.clone(),
+                    ),
+                    None => multi_workspace.cod_add_pending_workspace(*id, paths.clone()),
+                }
+            }
+            multi_workspace.cod_finish_restore(cx);
+            cx.notify();
+            (
+                multi_workspace.workspace().read(cx).session_id(),
+                window.window_handle().window_id().as_u64(),
+            )
+        })
+        .ok();
+    // Bind the pending members to this session and window (their rows only, no layout), so
+    // the next start finds them and the database cleanup keeps them.
+    if let Some((session_id, window_id)) = binding {
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        for (id, _) in &pending {
+            db.set_session_binding(*id, session_id.clone(), Some(window_id))
+                .await
+                .log_err();
+        }
+    }
+    let saved_list = window_handle
+        .update(cx, |multi_workspace, _window, cx| {
+            multi_workspace.cod_save_workspace_list_now(cx)
+        })
+        .ok();
+    // Only once the window's list is saved under its new id may the restore list go.
+    if let Some(saved_list) = saved_list {
+        let saved = saved_list.await;
+        if let Err(err) = &saved {
+            log::error!("Failed to save the restored window's workspace list: {err:#}");
+        }
+        if saved.is_ok() && write_manifest {
+            persistence::delete_cod_restore_manifest(&kvp, &manifest)
+                .await
+                .log_err();
+        }
+    }
+
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
 
     window_handle
@@ -10331,6 +10821,203 @@ pub async fn restore_multiworkspace(
         .ok();
 
     Ok(window_handle)
+}
+
+/// Cod (#24): installs one restore owner per window this start restores, before any window is
+/// created: the saved key, the complete membership in window order, every member's id,
+/// location and folders, and the shown member. Windows without a saved key have no owner.
+pub fn cod_install_restore_owners(windows: &[SerializedMultiWorkspace], cx: &mut App) {
+    let owners = windows
+        .iter()
+        .filter_map(|window| {
+            let key = window.state.cod_window_key.clone()?;
+            let members: Vec<persistence::CodRestoreMember> =
+                std::iter::once(&window.active_workspace)
+                    .chain(window.other_workspaces.iter())
+                    .map(|member| persistence::CodRestoreMember {
+                        workspace_id: member.workspace_id,
+                        location: member.location.clone(),
+                        paths: member.paths.paths().to_vec(),
+                    })
+                    .collect();
+            let workspace_ids: Vec<WorkspaceId> = if window.state.cod_workspace_ids.is_empty() {
+                members.iter().map(|member| member.workspace_id).collect()
+            } else {
+                window.state.cod_workspace_ids.clone()
+            };
+            Some(persistence::CodRestoreOwner {
+                key,
+                workspace_ids,
+                members,
+                active_workspace_id: window.active_workspace.workspace_id,
+            })
+        })
+        .collect();
+    persistence::cod_install_restore_owners(owners, cx);
+}
+
+/// Cod (#24): whether the Cod window registry was never written in this database (the first
+/// start after the update). An unreadable registry is not absent.
+pub fn cod_window_registry_absent(cx: &App) -> bool {
+    let kvp = db::kvp::KeyValueStore::global(cx);
+    matches!(
+        persistence::read_cod_window_registry(&kvp),
+        persistence::CodWindowRegistryRead::Absent
+    )
+}
+
+/// Cod (#24): the windows of the Cod window registry, ready to restore (the shown member by id,
+/// the others as pending members), or `None` when there is no readable registry and the caller
+/// takes the stock session path. A present but empty registry gives no windows. Takes the
+/// registry as this start's copy, so windows that do not come back keep their entries.
+pub fn cod_registry_multi_workspaces(cx: &mut App) -> Option<Vec<SerializedMultiWorkspace>> {
+    let kvp = db::kvp::KeyValueStore::global(cx);
+    let entries = match persistence::read_cod_window_registry(&kvp) {
+        persistence::CodWindowRegistryRead::Present(entries) => entries,
+        _ => return None,
+    };
+    persistence::cod_registry_start(entries.clone(), cx);
+    let db = WorkspaceDb::global(cx);
+    let mut windows = Vec::new();
+    for entry in entries {
+        let mut members: Vec<SessionWorkspace> = Vec::new();
+        for id in &entry.workspace_ids {
+            match db.workspace_for_id(*id) {
+                Some(saved) => members.push(SessionWorkspace {
+                    workspace_id: *id,
+                    location: saved.location,
+                    paths: saved.paths,
+                    window_id: None,
+                }),
+                None => log::error!("Workspace {id:?} of a registered window was not found"),
+            }
+        }
+        let index = entry
+            .active_workspace_id
+            .and_then(|active| {
+                members
+                    .iter()
+                    .position(|member| member.workspace_id == active)
+            })
+            .unwrap_or(0);
+        if index >= members.len() {
+            continue;
+        }
+        let active_workspace = members.remove(index);
+        windows.push(SerializedMultiWorkspace {
+            state: MultiWorkspaceState {
+                active_workspace_id: Some(active_workspace.workspace_id),
+                cod_workspace_ids: entry.workspace_ids.clone(),
+                cod_window_key: Some(entry.key.clone()),
+                cod_from_registry: true,
+                ..Default::default()
+            },
+            active_workspace,
+            other_workspaces: members,
+        });
+    }
+    Some(windows)
+}
+
+/// Cod (#24): the first start after the update builds the registry from the windows the stock
+/// session path found, before any of them is restored (restoring re-binds their workspaces),
+/// and waits until it is written. Each window keeps its saved key or gets a new one. Returns
+/// whether the registry was written.
+pub async fn cod_seed_window_registry(
+    windows: &mut [SerializedMultiWorkspace],
+    cx: &mut AsyncApp,
+) -> bool {
+    let mut entries = Vec::new();
+    for window in windows.iter_mut() {
+        let key = window
+            .state
+            .cod_window_key
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        window.state.cod_window_key = Some(key.clone());
+        let workspace_ids: Vec<WorkspaceId> = if window.state.cod_workspace_ids.is_empty() {
+            std::iter::once(window.active_workspace.workspace_id)
+                .chain(
+                    window
+                        .other_workspaces
+                        .iter()
+                        .map(|other| other.workspace_id),
+                )
+                .collect()
+        } else {
+            window.state.cod_workspace_ids.clone()
+        };
+        entries.push(persistence::CodWindowEntry {
+            key,
+            workspace_ids,
+            active_workspace_id: Some(window.active_workspace.workspace_id),
+        });
+    }
+    cx.update(|cx| persistence::cod_registry_start(entries, cx));
+    // A failed write is tried again; the caller publishes the new session only once the seed
+    // is written, so a seed that never lands leaves the previous session to be found again.
+    for attempt in 1..=3 {
+        let write = cx.update(|cx| persistence::cod_registry_write_now(cx));
+        match write.await {
+            Ok(()) => return true,
+            Err(err) => {
+                log::error!("Failed to seed the Cod window registry (attempt {attempt}): {err:#}")
+            }
+        }
+    }
+    // Nothing writes a registry that was never seeded; the caller restores no window (which
+    // would re-bind workspaces to an unpublished session), so the next start seeds again.
+    cx.update(|cx| persistence::cod_registry_unload(cx));
+    false
+}
+
+/// Cod (#24): the start restored its windows. Every open window that is not closing saves its
+/// entry now (entries of windows that did not come back stay).
+pub fn cod_finish_registry_startup(cx: &mut App) {
+    persistence::cod_registry_set_writable(cx);
+    if !persistence::cod_registry_is_writable(cx) {
+        return;
+    }
+    for window in cx.windows() {
+        if let Some(window) = window.downcast::<MultiWorkspace>() {
+            window
+                .update(cx, |multi_workspace, _window, cx| {
+                    // A window that is closing keeps out of the registry.
+                    if persistence::cod_registry_is_closed(multi_workspace.cod_window_key(), cx) {
+                        return;
+                    }
+                    multi_workspace.serialize(cx);
+                })
+                .ok();
+        }
+    }
+}
+
+/// Cod (#24): set when this start could not seed the Cod window registry.
+struct CodRegistrySeedFailed;
+
+impl Global for CodRegistrySeedFailed {}
+
+/// Cod (#24): records that the registry seed of this start failed. Until the next start, an
+/// opened folder never reuses a saved workspace row, so every saved row keeps its session.
+pub fn cod_mark_registry_seed_failed(cx: &mut App) {
+    cx.set_global(CodRegistrySeedFailed);
+}
+
+/// Cod (#24): whether the registry seed of this start failed.
+pub fn cod_registry_seed_failed(cx: &App) -> bool {
+    cx.has_global::<CodRegistrySeedFailed>()
+}
+
+/// Cod (#24): the number of windows in the registry copy of this start, if it has one.
+pub fn cod_registry_window_count(cx: &App) -> Option<usize> {
+    persistence::cod_registry_window_count(cx)
+}
+
+/// Cod (#24): every workspace id the stored registry holds; the database cleanup keeps them.
+/// `None` when the registry is present but unreadable, so the cleanup must not run.
+pub fn cod_registered_workspace_ids(cx: &App) -> Option<Vec<WorkspaceId>> {
+    persistence::cod_registered_workspace_ids(&db::kvp::KeyValueStore::global(cx))
 }
 
 pub async fn apply_restored_multiworkspace_state(
@@ -10905,6 +11592,81 @@ pub async fn find_existing_workspace(
             }
         });
 
+        // Cod (#24): a registered workspace that is still pending in its restored window and
+        // matches these paths under the requested matching policy is loaded and shown there,
+        // instead of a second copy or an unrelated window picked as a fallback.
+        if best_match.is_none() {
+            let path_list = PathList::new(abs_paths);
+            let (candidates, fs) = cx.update(|cx| {
+                let mut candidates = Vec::new();
+                for window in workspace_windows_for_location(location, cx) {
+                    if let Ok(multi_workspace) = window.read(cx) {
+                        for (id, roots) in multi_workspace.cod_pending_members() {
+                            candidates.push((window, id, roots));
+                        }
+                    }
+                }
+                (candidates, <dyn Fs>::global(cx))
+            });
+            // A member with exactly these folders first, then the policy used for live ones.
+            // Like live routing, `MatchSubpaths` never matches a root itself.
+            let exact_roots_match =
+                open_options.workspace_matching != WorkspaceMatching::MatchSubpaths;
+            let mut selected: Option<(WindowHandle<MultiWorkspace>, WorkspaceId)> = candidates
+                .iter()
+                .filter(|_| exact_roots_match)
+                .find(|(_, _, roots)| PathList::new(roots) == path_list)
+                .map(|(window, id, _)| (*window, *id));
+            if selected.is_none() {
+                'candidates: for (window, id, roots) in &candidates {
+                    for path in abs_paths {
+                        for root in roots {
+                            let Ok(relative) = path.strip_prefix(root) else {
+                                continue;
+                            };
+                            let is_subpath = !relative.as_os_str().is_empty();
+                            let contains = match open_options.workspace_matching {
+                                WorkspaceMatching::None => false,
+                                WorkspaceMatching::MatchExact => {
+                                    !is_subpath || !fs.is_dir(path).await
+                                }
+                                WorkspaceMatching::MatchSubpaths => is_subpath,
+                                WorkspaceMatching::MatchSubdirectory => true,
+                            };
+                            if contains {
+                                selected = Some((*window, *id));
+                                break 'candidates;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((window, id)) = selected {
+                let show = window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.cod_show_pending(id, window, cx)
+                    })
+                    .ok();
+                if let Some(show) = show {
+                    if show.await.log_err().is_some() {
+                        // The workspace with the requested id, never whichever one is active.
+                        let shown = cx.update(|cx| {
+                            let workspace = window
+                                .read(cx)
+                                .ok()?
+                                .workspaces()
+                                .find(|workspace| workspace.read(cx).database_id() == Some(id))
+                                .cloned()?;
+                            Some((window, workspace))
+                        });
+                        if shown.is_some() {
+                            existing = shown;
+                        }
+                    }
+                }
+            }
+        }
+
         let all_paths_are_files = existing
             .as_ref()
             .and_then(|(_, target_workspace)| {
@@ -11060,7 +11822,10 @@ pub fn open_workspace_by_id(
                     workspace.centered_layout = centered_layout;
                     workspace
                 });
-                multi_workspace.add(workspace.clone(), &*window, cx);
+                // Cod (#24): the only caller with a window shows a pending member that loads
+                // on its first show, so the workspace is shown before its items restore and
+                // never restores hidden.
+                multi_workspace.activate(workspace.clone(), None, window, cx);
                 workspace
             })?;
             (window, workspace)
@@ -11204,23 +11969,21 @@ pub fn open_paths(
                         &SerializedWorkspaceLocation::Local,
                         cx,
                     );
-                    let window = cx
-                        .active_window()
+                    // Cod (#24): a window keeps its workspaces whatever the AI setting, so the
+                    // target window does not depend on it.
+                    cx.active_window()
                         .and_then(|window| window.downcast::<MultiWorkspace>())
                         .filter(|window| windows.contains(window))
-                        .or_else(|| windows.into_iter().next());
-                    window.filter(|window| {
-                        window
-                            .read(cx)
-                            .is_ok_and(|mw| mw.multi_workspace_enabled(cx))
-                    })
+                        .or_else(|| windows.into_iter().next())
                 });
 
                 if let Some(window) = target_window {
                     open_options.requesting_window = Some(window);
                     window
                         .update(cx, |multi_workspace, _, cx| {
-                            if AgentSettings::get_global(cx).threads_sidebar.auto_open {
+                            if multi_workspace.multi_workspace_enabled(cx)
+                                && AgentSettings::get_global(cx).threads_sidebar.auto_open
+                            {
                                 multi_workspace.open_sidebar(cx);
                             } else {
                                 // Opening the sidebar is also what pins the
@@ -11422,12 +12185,19 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    restore_id: Option<WorkspaceId>,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
+    // Cod (#24): `restore_id` is the saved row of the restoration this open is (the shown
+    // member of the restore owner it reserved), `None` for an ordinary open.
     cx.spawn(async move |cx| {
-        let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(remote_connection.connection_options(), paths.clone(), cx)
-                .await?;
+        let (workspace_id, serialized_workspace) = deserialize_remote_project(
+            remote_connection.connection_options(),
+            paths.clone(),
+            restore_id,
+            cx,
+        )
+        .await?;
 
         let session = match cx
             .update(|cx| {
@@ -11486,7 +12256,8 @@ pub fn open_remote_project_with_existing_connection(
 ) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
         let (workspace_id, serialized_workspace) =
-            deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
+            deserialize_remote_project(connection_options.clone(), paths.clone(), None, cx)
+                .await?;
 
         open_remote_project_inner(
             project,
@@ -11563,7 +12334,13 @@ async fn open_remote_project_inner(
                 cx,
             );
         } else {
+            // Cod (#24): the empty local workspace the window showed while it connected leaves
+            // as soon as the remote workspace is shown, in a new window or the window Cod
+            // started with. Only a workspace with no saved id, no folder and no item goes
+            // (`cod_drop_connection_placeholder`): one the user made or named has a saved id.
+            let cod_placeholder = multi_workspace.workspace().clone();
             multi_workspace.activate(new_workspace.clone(), source_workspace, window, cx);
+            multi_workspace.cod_drop_connection_placeholder(&cod_placeholder, cx);
         }
         new_workspace
     })?;
@@ -11621,15 +12398,38 @@ async fn open_remote_project_inner(
 fn deserialize_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
+    restore_id: Option<WorkspaceId>,
     cx: &AsyncApp,
 ) -> Task<Result<(WorkspaceId, Option<SerializedWorkspace>)>> {
     let db = cx.update(|cx| WorkspaceDb::global(cx));
+    // Cod (#24): after a failed registry seed the saved remote workspaces stay bound to the
+    // previous session, so a remote project opened now gets a new row instead of taking over one.
+    let reuse_saved_by_roots = cx.update(|cx| !cod_registry_seed_failed(cx));
     cx.background_spawn(async move {
+        let identity = remote_connection_identity(&connection_options);
         let remote_connection_id = db
             .get_or_create_remote_connection(connection_options)
             .await?;
 
-        let serialized_workspace = db.remote_workspace_for_roots(&paths, remote_connection_id);
+        // Cod (#24): a restore names its saved row by id. It is used only when that row is
+        // remote on this same connection and has these folders; otherwise the open selects its
+        // row as an ordinary open does.
+        let restored = restore_id.and_then(|id| db.workspace_for_id(id)).filter(|saved| {
+            let same_connection = match &saved.location {
+                SerializedWorkspaceLocation::Remote(options) => {
+                    remote_connection_identity(options) == identity
+                }
+                SerializedWorkspaceLocation::Local => false,
+            };
+            same_connection && saved.paths == PathList::new(&paths)
+        });
+        let serialized_workspace = if restored.is_some() {
+            restored
+        } else if reuse_saved_by_roots {
+            db.remote_workspace_for_roots(&paths, remote_connection_id)
+        } else {
+            None
+        };
 
         let workspace_id = if let Some(workspace_id) =
             serialized_workspace.as_ref().map(|workspace| workspace.id)
@@ -11822,7 +12622,38 @@ pub async fn prepare_windows_to_quit(
     // session_id/window_id are up-to-date in the database.
     flush_windows_serialization(workspace_windows, cx).await;
 
+    // Cod (#24): the final registry write is on disk before quit completes. A failed write is
+    // retried a few times. When it still fails, the failure is logged and the previous committed
+    // document stays as it is: each write replaces the whole document in one statement, so no
+    // partial document is ever written.
+    if !cod_flush_registry_for_quit(cx).await {
+        log::error!(
+            "The Cod window registry could not be written before quit; the previous saved window list stays"
+        );
+    }
+
     true
+}
+
+/// Cod (#24): writes the window registry again while it is dirty, up to a few attempts. True once
+/// the registry is known to be on disk.
+async fn cod_flush_registry_for_quit(cx: &mut AsyncApp) -> bool {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let flush = cx.update(|cx| crate::persistence::cod_registry_flush(cx));
+        match flush.await {
+            Ok(()) => return true,
+            Err(err) => log::error!(
+                "Writing the Cod window registry before quit failed (attempt {attempt} of {ATTEMPTS}): {err:#}"
+            ),
+        }
+        if attempt < ATTEMPTS {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+    }
+    false
 }
 
 pub(crate) async fn prepare_window_to_close(

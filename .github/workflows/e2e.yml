@@ -3,6 +3,7 @@
 # The tests run through script/e2e, the same command a developer runs locally; its own cargo build finds nothing to do.
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 # Pushes to master run it too, which keeps the caches warm: only master writes them.
+# The job's status is the "Run end-to-end tests" step: every test_*.py, all local. The remote (SSH) tests need the remote server, which takes long to build, so they run only in the optional workflow "E2E remote (optional)" (e2e-remote.yml).
 name: E2E
 
 on:
@@ -152,7 +153,7 @@ jobs:
           path: ${{ env.CEF_PATH }}
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
-      # Exactly script/e2e. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do. Nothing here changes what the tests do.
+      # Exactly script/e2e: every test_*.py; the remote (SSH) tests are not test_*.py files. The build variables repeat the Build step's, so the cargo build inside script/e2e has nothing to do.
       - name: Run end-to-end tests
         if: steps.changes.outputs.code == 'true'
         env:

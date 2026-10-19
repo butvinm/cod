@@ -25,6 +25,13 @@ class MessagesTest(unittest.TestCase):
             "expected active tab 'ledger.rs', actual 'invoice.rs'",
         )
 
+    def test_differences_name_each_differing_value(self) -> None:
+        self.assertEqual(
+            cod_e2e.differences("workspace A", {"split": "vertical", "active_tab": "ledger.rs", "cursor": None}, {"split": None, "active_tab": "ledger.rs"}),
+            ["expected workspace A split 'vertical', actual None"],
+        )
+        self.assertEqual(cod_e2e.differences("workspace A", {"split": None}, {"split": None}), [])
+
     def test_failure_message_shows_a_missing_value(self) -> None:
         self.assertEqual(cod_e2e.failure_message("active tab", "invoice.rs", None), "expected active tab 'invoice.rs', actual None")
 
@@ -169,6 +176,22 @@ class StartCommandTest(unittest.TestCase):
             ["dbus-run-session", "--", "/run/cod/cod-wayland.sh", "", "/tmp/billing-api"],
         )
 
+    def test_cod_starts_without_a_folder_to_restore_its_session(self) -> None:
+        self.assertEqual(
+            cod_e2e.cod_command(Path("/run/cod"), None),
+            ["dbus-run-session", "--", "/run/cod/cod-wayland.sh", ""],
+        )
+
+    def test_a_persistent_start_keeps_zed_state(self) -> None:
+        base = {"PATH": "/usr/bin", "ZED_STATELESS": "1"}
+        env = cod_e2e.cod_environment(base, Path("/tmp/data"), Path("/tmp/driver/cod.sock"), Path("/tmp/home"), persistent=True)
+        self.assertNotIn("ZED_STATELESS", env)
+        self.assertEqual(env["COD_PREVIEW_DIR"], "/tmp/data")
+        self.assertEqual(env["COD_E2E_SOCKET"], "/tmp/driver/cod.sock")
+        self.assertEqual(base["ZED_STATELESS"], "1")
+        stateless = cod_e2e.cod_environment({"PATH": "/usr/bin"}, Path("/tmp/data"), Path("/tmp/driver/cod.sock"), Path("/tmp/home"))
+        self.assertEqual(stateless["ZED_STATELESS"], "1")
+
     def test_environment(self) -> None:
         base = {
             "DISPLAY": ":0",
@@ -208,6 +231,242 @@ class StartCommandTest(unittest.TestCase):
         self.assertIs(settings["auto_update"], False)
         self.assertEqual(settings["telemetry"], {"diagnostics": False, "metrics": False})
         self.assertEqual(json.loads(json.dumps(settings)), settings)
+
+    def test_settings_use_zeds_own_pickers_and_a_palette_without_history(self) -> None:
+        settings = cod_e2e.cod_settings()
+        # The headless sway has no desktop portal: Zed's own path picker and prompts must render (assets/settings/default.json).
+        self.assertIs(settings["use_system_path_prompts"], False)
+        self.assertIs(settings["use_system_prompts"], False)
+        # Without history the palette ranks by the query alone, so earlier commands of a test never change which row a command name highlights.
+        self.assertEqual(settings["command_palette"], {"use_command_history": False})
+
+
+class PaletteTest(unittest.TestCase):
+    def state(self, modal: str | None, selection: str | None, query: str = "workspace: new workspace", matches: int = 1) -> dict:
+        return {
+            "modal": modal,
+            "palette_selection": selection,
+            "palette": {"query": query, "match_count": matches, "selected_index": 0} if modal == "command_palette" else None,
+        }
+
+    def test_ready_when_the_palette_highlights_exactly_the_command(self) -> None:
+        self.assertIsNone(cod_e2e.palette_problem("workspace: new workspace", self.state("command_palette", "workspace: new workspace")))
+
+    def test_a_near_match_is_refused_with_expected_and_actual(self) -> None:
+        problem = cod_e2e.palette_problem("workspace: new workspace", self.state("command_palette", "workspace: new window"))
+        self.assertEqual(
+            problem,
+            "expected palette selection 'workspace: new workspace', actual 'workspace: new window' "
+            "(query 'workspace: new workspace', 1 matches, highlighted row 0)",
+        )
+
+    def test_no_selection_and_a_closed_palette_are_refused(self) -> None:
+        problem = cod_e2e.palette_problem("workspace: new workspace", self.state("command_palette", None, matches=0))
+        self.assertTrue(problem.startswith("expected palette selection 'workspace: new workspace', actual None"), problem)
+        self.assertEqual(
+            cod_e2e.palette_problem("workspace: new workspace", self.state(None, None)), "expected modal 'command_palette', actual None"
+        )
+
+
+class StubDriver:
+    """Answers like the driver from a list of states; records keys and typed text."""
+
+    def __init__(self, states: list[dict]) -> None:
+        self.states = states
+        self.actions: list[tuple[str, str]] = []
+
+    def keys(self, keys: str) -> None:
+        self.actions.append(("keys", keys))
+
+    def type(self, text: str) -> None:
+        self.actions.append(("type", text))
+
+    def state(self) -> dict:
+        return dict(self.states.pop(0) if len(self.states) > 1 else self.states[0])
+
+
+class RunCommandTest(unittest.TestCase):
+    class Sample(cod_e2e.CodTestCase):
+        def test_sample(self) -> None:
+            pass
+
+    def sample(self, states: list[dict]) -> tuple[cod_e2e.CodTestCase, StubDriver]:
+        sample = self.Sample("test_sample")
+        driver = StubDriver(states)
+        sample.cod = mock.Mock(driver=driver)
+        patcher = mock.patch.object(sample, "compositor_windows", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sample, driver
+
+    def test_runs_the_command_once_the_palette_highlights_it(self) -> None:
+        palette = {"modal": "command_palette", "palette_selection": None, "palette": None}
+        ready = {"modal": "command_palette", "palette_selection": "workspace: new workspace", "palette": None}
+        closed = {"modal": None, "palette_selection": None, "palette": None}
+        sample, driver = self.sample([palette, palette, ready, closed])
+        sample.run_command("workspace: new workspace", timeout=5)
+        self.assertEqual(driver.actions, [("keys", "ctrl-shift-p"), ("type", "workspace: new workspace"), ("keys", "enter")])
+
+    def test_state_adds_what_sway_shows(self) -> None:
+        sample, _ = self.sample([{"modal": None}])
+        windows = [{"id": 7, "title": "billing-api", "focused": False}, {"id": 9, "title": "docs-site", "focused": True}]
+        with mock.patch.object(sample, "compositor_windows", return_value=windows):
+            state = sample.state()
+        self.assertEqual(state, {"modal": None, "window_title": "docs-site", "sway_windows": [7, 9]})
+
+    def test_wait_for_values_returns_the_first_state_with_every_value(self) -> None:
+        early = {"split": None, "panes": [{"tabs": ["invoice.rs"]}]}
+        done = {"split": "vertical", "panes": [{"tabs": ["invoice.rs"]}, {"tabs": ["ledger.rs"]}]}
+        sample, _ = self.sample([early, early, done])
+        state = sample.wait_for_values("workspace A", {"split": "vertical", "panes": done["panes"]}, lambda state: state, timeout=5)
+        self.assertEqual(state["split"], "vertical")
+
+    def test_wait_for_values_names_every_value_that_differs(self) -> None:
+        sample, _ = self.sample([{"split": None, "active_tab": "ledger.rs", "cursor": None}])
+        with self.assertRaises(AssertionError) as caught:
+            sample.wait_for_values(
+                "workspace A", {"split": "vertical", "active_tab": "ledger.rs", "cursor": {"row": 18}}, lambda state: state, timeout=0.2
+            )
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("timed out after 0.2 s waiting for workspace A: "), message)
+        self.assertIn("expected workspace A split 'vertical', actual None; expected workspace A cursor {'row': 18}, actual None", message)
+        self.assertNotIn("workspace A active_tab", message)
+
+    def test_never_presses_enter_on_another_command(self) -> None:
+        near = {
+            "modal": "command_palette",
+            "palette_selection": "workspace: new window",
+            "palette": {"query": "workspace: new workspace", "match_count": 1, "selected_index": 0},
+        }
+        sample, driver = self.sample([near])
+        with self.assertRaises(AssertionError) as caught:
+            sample.run_command("workspace: new workspace", timeout=0.3)
+        self.assertIn("expected palette selection 'workspace: new workspace', actual 'workspace: new window'", str(caught.exception))
+        self.assertNotIn(("keys", "enter"), driver.actions)
+
+
+class RestartTest(unittest.TestCase):
+    class Sample(cod_e2e.CodTestCase):
+        def test_sample(self) -> None:
+            pass
+
+    def test_restart_needs_a_running_persistent_cod(self) -> None:
+        sample = self.Sample("test_sample")
+        sample.cod = None
+        with self.assertRaises(RuntimeError) as caught:
+            sample.restart_cod()
+        self.assertIn("call start_cod first", str(caught.exception))
+        sample.cod = mock.Mock(process=object(), persistent=False)
+        with self.assertRaises(RuntimeError) as caught:
+            sample.restart_cod()
+        self.assertIn("persistent=True", str(caught.exception))
+        sample.cod.quit.assert_not_called()
+
+    def test_restart_quits_and_starts_again_without_a_folder(self) -> None:
+        sample = self.Sample("test_sample")
+        cod = mock.Mock(process=object(), persistent=True, folder=Path("/tmp/billing-api"))
+        sample.cod = cod
+        sample.restart_cod(timeout=7)
+        self.assertEqual([call[0] for call in cod.method_calls], ["quit", "start", "connect"])
+        self.assertIsNone(cod.folder)
+        cod.connect.assert_called_once_with(7)
+
+
+class StopTest(unittest.TestCase):
+    """Cod.stop() kills the processes of a test that left its process group, including one that shows up after a first empty scan."""
+
+    def stopped_cod(self) -> cod_e2e.Cod:
+        cod = cod_e2e.Cod.__new__(cod_e2e.Cod)
+        cod.driver = None
+        cod.socket_path = Path("/tmp/cod-e2e-stop/driver/cod.sock")
+        cod.process = mock.Mock(pid=4242)
+        return cod
+
+    def test_a_helper_that_appears_after_an_empty_scan_is_killed(self) -> None:
+        cod = self.stopped_cod()
+        scans = iter([[], [57680], [], []])
+        with (
+            mock.patch.object(cod_e2e, "processes_with_marker", side_effect=lambda marker: next(scans, [])),
+            mock.patch.object(cod_e2e.os, "killpg") as killpg,
+            mock.patch.object(cod_e2e.os, "kill") as kill,
+            mock.patch.object(cod_e2e, "STOP_SETTLE_INTERVAL", 0.01),
+            mock.patch.object(cod_e2e, "POLL_INTERVAL", 0.01),
+        ):
+            cod.stop()
+        killpg.assert_called_once()
+        kill.assert_called_once_with(57680, cod_e2e.signal.SIGKILL)
+        self.assertIsNone(cod.process)
+
+    def test_a_helper_that_stays_fails_with_its_command_line(self) -> None:
+        cod = self.stopped_cod()
+        me = os.getpid()
+        with (
+            mock.patch.object(cod_e2e, "processes_with_marker", return_value=[me]),
+            mock.patch.object(cod_e2e.os, "killpg"),
+            mock.patch.object(cod_e2e.os, "kill"),
+            mock.patch.object(cod_e2e, "STOP_LEFTOVER_TIMEOUT", 0.1),
+            mock.patch.object(cod_e2e, "POLL_INTERVAL", 0.01),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                cod.stop()
+        message = str(caught.exception)
+        self.assertIn("still running 0.1 s after Cod was stopped", message)
+        self.assertIn(f"{me} (", message)
+        self.assertIn("python", message)
+
+    def test_describe_processes_names_a_gone_process(self) -> None:
+        self.assertEqual(cod_e2e.describe_processes([0]), "0 (gone)")
+
+
+class SwayTest(unittest.TestCase):
+    TREE = {
+        "type": "root",
+        "nodes": [
+            {
+                "type": "output",
+                "nodes": [
+                    {
+                        "type": "workspace",
+                        "nodes": [
+                            {"type": "con", "pid": 41, "name": "billing-api - invoice.rs", "focused": False, "nodes": []},
+                            {"type": "con", "pid": 99, "name": "someone else", "focused": True, "nodes": []},
+                        ],
+                        "floating_nodes": [{"type": "floating_con", "pid": 42, "name": "docs-site", "focused": True, "nodes": []}],
+                    }
+                ],
+            }
+        ],
+    }
+
+    def test_compositor_windows_of_the_cod_processes_with_their_ids(self) -> None:
+        tree = json.loads(json.dumps(self.TREE))
+        tree["nodes"][0]["nodes"][0]["nodes"][0]["id"] = 12
+        tree["nodes"][0]["nodes"][0]["floating_nodes"][0]["id"] = 15
+        self.assertEqual(
+            cod_e2e.compositor_windows(tree, {41, 42}),
+            [{"id": 12, "title": "billing-api - invoice.rs", "focused": False}, {"id": 15, "title": "docs-site", "focused": True}],
+        )
+        self.assertEqual(cod_e2e.compositor_windows(tree, {7}), [])
+
+    def test_window_titles_of_the_cod_processes(self) -> None:
+        self.assertEqual(
+            cod_e2e.window_titles(self.TREE, {41, 42}), [("billing-api - invoice.rs", False), ("docs-site", True)]
+        )
+        self.assertEqual(cod_e2e.window_titles(self.TREE, {7}), [])
+
+    def test_window_title_prefers_the_focused_window(self) -> None:
+        self.assertEqual(cod_e2e.window_title([("a", False), ("b", True)]), "b")
+        self.assertEqual(cod_e2e.window_title([("a", False)]), "a")
+        self.assertIsNone(cod_e2e.window_title([("a", False), ("b", False)]))
+        self.assertIsNone(cod_e2e.window_title([]))
+
+    def test_sway_socket(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="cod-e2e-unit-") as folder:
+            runtime = Path(folder)
+            self.assertIsNone(cod_e2e.sway_socket(runtime))
+            (runtime / "wayland-1").touch()
+            (runtime / "sway-ipc.1000.4242.sock").touch()
+            self.assertEqual(cod_e2e.sway_socket(runtime), runtime / "sway-ipc.1000.4242.sock")
 
 
 class ArtifactsTest(unittest.TestCase):

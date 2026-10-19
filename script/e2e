@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Runs Cod's end-to-end tests (tests/e2e) against the real app under a private headless sway, the same way CI does.
 # Usage: script/e2e [unittest arguments]
-#   script/e2e                                  all tests
+#   script/e2e                                  all local tests (every test_*.py), as the required CI job runs them
 #   script/e2e test_22_open_file                one story file (more names or Class.method names work too)
 #   script/e2e -k file_finder                   tests whose name contains "file_finder"
+#   script/e2e remote_24                        the basic remote (SSH) workspace tests; never in the default run (the file name does not match test_*.py)
+#   script/e2e remote_tracking_24               the remote multi-workspace lifecycle cases; never in the default run either
+# The remote tests need the remote server binary and a throwaway SSH account (below). CI runs them only in the optional workflow "E2E remote (optional)" (.github/workflows/e2e-remote.yml), by hand or on pushes to master.
 # Optional environment:
 #   COD_E2E_BIN        a prebuilt zed binary with cod-browser next to it; skips the cargo build
 #   COD_CEF_DIR        the folder with libcef.so; found automatically when not set (see tests/e2e/README.md)
 #   COD_E2E_ARTIFACTS  where tests save a screenshot and logs; default target/e2e-artifacts
+#   COD_E2E_REMOTE_SERVER  the remote_server binary for the loopback SSH tests (cargo build --profile release-fast -p remote_server); default the one next to the zed binary when it exists.
+#                      Those tests run their own sshd on 127.0.0.1 as you, log in as the account COD_E2E_SSH_USER names, and copy the binary to ~/.zed_server/ in that account's home. Without sshd, the binary or that account they report skipped with the reason.
+#   COD_E2E_SSH_USER       a dedicated throwaway account for the loopback SSH tests, never your own: your uid, another name, and a home that is a throwaway folder outside your home, for example
+#                      sudo useradd --non-unique --uid "$(id -u)" --gid "$(id -g)" --no-create-home --home-dir "$(mktemp -d /tmp/codssh-home.XXXXXX)" --shell /bin/bash --password '*' codssh
+#                      and later sudo userdel --force codssh, then remove its home. CI does the same (.github/workflows/e2e-remote.yml). Unset, the tests write nothing and report skipped.
+#   COD_E2E_REQUIRE_SSH    1 (set in the remote CI workflow): the loopback SSH tests must run; a missing ssh, sshd or remote server binary, or an sshd that does not start, fails them instead of skipping.
 # Exits with the status of the tests: 0 when all passed. It fails with status 5 when the selection runs no test, and it fails when a process of this run is still running after the tests.
 set -euo pipefail
 
@@ -58,6 +67,18 @@ browser_bin="$(dirname "$zed_bin")/cod-browser"
 for binary in "$zed_bin" "$browser_bin"; do
     [ -x "$binary" ] || { say "$binary is missing or not executable"; exit 2; }
 done
+if [ -z "${COD_E2E_REMOTE_SERVER:-}" ] && [ -x "$(dirname "$zed_bin")/remote_server" ]; then
+    COD_E2E_REMOTE_SERVER="$(dirname "$zed_bin")/remote_server"
+fi
+if [ -n "${COD_E2E_REMOTE_SERVER:-}" ]; then
+    export COD_E2E_REMOTE_SERVER
+    say "remote server for the loopback SSH tests: $COD_E2E_REMOTE_SERVER"
+elif [ "${COD_E2E_REQUIRE_SSH:-}" = 1 ]; then
+    say "COD_E2E_REQUIRE_SSH=1 but no remote server binary: set COD_E2E_REMOTE_SERVER (cargo build --profile release-fast -p remote_server)"
+    exit 2
+else
+    say "no remote server binary: the loopback SSH tests will report skipped"
+fi
 
 # 3. The CEF runtime. The version has one source of truth: CEF_VERSION in the release workflow.
 cef_version=${CEF_VERSION:-$(sed -n 's/^ *CEF_VERSION: *//p' .github/workflows/linux-release.yml | head -n 1)}

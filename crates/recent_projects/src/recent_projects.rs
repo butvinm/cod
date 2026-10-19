@@ -284,6 +284,11 @@ pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
 }
 
 pub fn init(cx: &mut App) {
+    // Cod (#24): a pending remote member of a window loads its saved row over its connection.
+    workspace::cod_set_remote_member_opener(
+        std::sync::Arc::new(remote_connections::cod_open_remote_member),
+        cx,
+    );
     #[cfg(target_os = "windows")]
     cx.on_action(|open_wsl: &zed_actions::wsl_actions::OpenFolderInWsl, cx| {
         let create_new_window = open_wsl

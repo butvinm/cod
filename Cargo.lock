@@ -3430,13 +3430,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "command_palette",
+ "editor",
  "file_finder",
  "futures 0.3.34",
  "gpui",
  "libc",
  "log",
+ "open_path_prompt",
+ "picker",
+ "project_panel",
  "serde",
  "serde_json",
+ "settings",
+ "ui_prompt",
  "workspace",
 ]
 
@@ -14785,6 +14791,7 @@ dependencies = [
  "client",
  "collections",
  "criterion",
+ "db",
  "editor",
  "file_icons",
  "fs",

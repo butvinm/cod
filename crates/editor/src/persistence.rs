@@ -3,6 +3,7 @@ use db::{
     query,
     sqlez::{
         bindable::{Bind, Column, StaticColumnCount},
+        connection::Connection,
         domain::Domain,
         statement::Statement,
     },
@@ -233,6 +234,42 @@ db::static_connection!(EditorDb, [WorkspaceDb]);
 // > which defaults to <..> 32766 for SQLite versions after 3.32.0.
 const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
+/// Replaces the saved selections of one editor. Runs on the write connection; the caller
+/// wraps it in a savepoint so the delete and the inserts commit together. An empty list
+/// leaves the saved selections as they are, as before.
+fn write_editor_selections(
+    conn: &Connection,
+    editor_id: ItemId,
+    workspace_id: WorkspaceId,
+    selections: &[(usize, usize)],
+) -> Result<()> {
+    if selections.is_empty() {
+        return Ok(());
+    }
+    let mut statement = Statement::prepare(
+        conn,
+        "DELETE FROM editor_selections WHERE editor_id = ?1 AND workspace_id = ?2",
+    )?;
+    statement.bind(&editor_id, 1)?;
+    statement.bind(&workspace_id, 2)?;
+    statement.exec()?;
+    for chunk in selections.chunks(MAX_QUERY_PLACEHOLDERS / 4) {
+        let placeholders = std::iter::repeat_n("(?1, ?2, ?, ?)", chunk.len()).join(", ");
+        let query = format!(
+            "INSERT OR IGNORE INTO editor_selections (editor_id, workspace_id, start, end) VALUES {placeholders}"
+        );
+        let mut statement = Statement::prepare(conn, query)?;
+        statement.bind(&editor_id, 1)?;
+        let mut next_index = statement.bind(&workspace_id, 2)?;
+        for (start, end) in chunk {
+            next_index = statement.bind(start, next_index)?;
+            next_index = statement.bind(end, next_index)?;
+        }
+        statement.exec()?;
+    }
+    Ok(())
+}
+
 impl EditorDb {
     query! {
         pub fn get_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
@@ -326,49 +363,56 @@ impl EditorDb {
         selections: Vec<(usize, usize)>,
     ) -> Result<()> {
         log::debug!("Saving selections for editor {editor_id} in workspace {workspace_id:?}");
-        let mut first_selection;
-        let mut last_selection = 0_usize;
-        for (count, placeholders) in std::iter::once("(?1, ?2, ?, ?)")
-            .cycle()
-            .take(selections.len())
-            .chunks(MAX_QUERY_PLACEHOLDERS / 4)
-            .into_iter()
-            .map(|chunk| {
-                let mut count = 0;
-                let placeholders = chunk
-                    .inspect(|_| {
-                        count += 1;
-                    })
-                    .join(", ");
-                (count, placeholders)
+        // Cod (#24): the old rows are deleted and the new ones inserted in one transaction.
+        // Without it the delete committed on its own, and a kill before the insert left the
+        // editor of the saved layout with no cursor.
+        self.write(move |conn| {
+            conn.with_savepoint("save_editor_selections", || {
+                write_editor_selections(conn, editor_id, workspace_id, &selections)
             })
-            .collect::<Vec<_>>()
-        {
-            first_selection = last_selection;
-            last_selection = last_selection + count;
-            let query = format!(
-                r#"
-DELETE FROM editor_selections WHERE editor_id = ?1 AND workspace_id = ?2;
+        })
+        .await
+    }
 
-INSERT OR IGNORE INTO editor_selections (editor_id, workspace_id, start, end)
-VALUES {placeholders};
-"#
-            );
-
-            let selections = selections[first_selection..last_selection].to_vec();
-            self.write(move |conn| {
-                let mut statement = Statement::prepare(conn, query)?;
-                statement.bind(&editor_id, 1)?;
-                let mut next_index = statement.bind(&workspace_id, 2)?;
-                for (start, end) in selections {
-                    next_index = statement.bind(&start, next_index)?;
-                    next_index = statement.bind(&end, next_index)?;
+    /// Cod (#24): writes the editor record and its selections in one transaction, so the
+    /// record of a restored editor is never on disk without its cursor.
+    pub async fn cod_save_serialized_editor_with_selections(
+        &self,
+        item_id: ItemId,
+        workspace_id: WorkspaceId,
+        serialized_editor: SerializedEditor,
+        selections: Option<Vec<(usize, usize)>>,
+    ) -> Result<()> {
+        log::debug!("Saving editor {item_id} with its selections in workspace {workspace_id:?}");
+        self.write(move |conn| {
+            conn.with_savepoint("save_serialized_editor", || {
+                let mut statement = Statement::prepare(
+                    conn,
+                    "INSERT INTO editors
+                        (item_id, workspace_id, path, buffer_path, contents, language, mtime_seconds, mtime_nanos)
+                    VALUES
+                        (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    ON CONFLICT DO UPDATE SET
+                        item_id = ?1,
+                        workspace_id = ?2,
+                        path = ?3,
+                        buffer_path = ?4,
+                        contents = ?5,
+                        language = ?6,
+                        mtime_seconds = ?7,
+                        mtime_nanos = ?8",
+                )?;
+                statement.bind(&item_id, 1)?;
+                let next_index = statement.bind(&workspace_id, 2)?;
+                statement.bind(&serialized_editor, next_index)?;
+                statement.exec()?;
+                if let Some(selections) = selections {
+                    write_editor_selections(conn, item_id, workspace_id, &selections)?;
                 }
-                statement.exec()
+                Ok(())
             })
-            .await?;
-        }
-        Ok(())
+        })
+        .await
     }
 
     pub async fn save_file_folds(
@@ -494,6 +538,72 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(have, serialized_editor);
+    }
+
+    // Cod (#24): the record and its selections are written together, a second write
+    // replaces the selections, and a list longer than one insert chunk is kept whole.
+    #[gpui::test]
+    async fn test_save_serialized_editor_with_selections(cx: &mut gpui::TestAppContext) {
+        let db = cx.update(|cx| workspace::WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        let editor_db = cx.update(|cx| EditorDb::global(cx));
+
+        let serialized_editor = SerializedEditor {
+            abs_path: Some(PathBuf::from("ledger.rs")),
+            contents: None,
+            language: None,
+            mtime: None,
+        };
+
+        editor_db
+            .cod_save_serialized_editor_with_selections(
+                77,
+                workspace_id,
+                serialized_editor.clone(),
+                Some(vec![(110, 110)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            editor_db.get_serialized_editor(77, workspace_id).unwrap(),
+            Some(serialized_editor.clone())
+        );
+        assert_eq!(editor_db.get_editor_selections(77, workspace_id).unwrap(), vec![(110, 110)]);
+
+        editor_db
+            .cod_save_serialized_editor_with_selections(
+                77,
+                workspace_id,
+                serialized_editor.clone(),
+                Some(vec![(5, 9), (20, 20)]),
+            )
+            .await
+            .unwrap();
+        let mut have = editor_db.get_editor_selections(77, workspace_id).unwrap();
+        have.sort();
+        assert_eq!(have, vec![(5, 9), (20, 20)]);
+
+        // No selections given: the saved ones stay.
+        editor_db
+            .cod_save_serialized_editor_with_selections(
+                77,
+                workspace_id,
+                serialized_editor.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut have = editor_db.get_editor_selections(77, workspace_id).unwrap();
+        have.sort();
+        assert_eq!(have, vec![(5, 9), (20, 20)]);
+
+        let many = (0..(MAX_QUERY_PLACEHOLDERS / 4 + 10))
+            .map(|offset| (offset * 2, offset * 2 + 1))
+            .collect::<Vec<_>>();
+        editor_db.save_editor_selections(77, workspace_id, many.clone()).await.unwrap();
+        let mut have = editor_db.get_editor_selections(77, workspace_id).unwrap();
+        have.sort();
+        assert_eq!(have, many);
     }
 
     // NOTE: The fingerprint search logic (finding content at new offsets when file

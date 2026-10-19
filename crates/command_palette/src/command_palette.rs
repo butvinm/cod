@@ -507,6 +507,22 @@ impl CommandPaletteDelegate {
         self.commands.get(action_ix)
     }
 
+    /// Test hook for Cod's end-to-end driver (read-only): the name of the command on the highlighted row, as `render_match` draws it, or None when no row is highlighted.
+    pub fn highlighted_command_name(&self) -> Option<&SharedString> {
+        let highlighted = self.matches.get(self.selected_ix)?;
+        self.commands
+            .get(highlighted.candidate_id)
+            .map(|command| &command.name)
+    }
+
+    /// Test hook for Cod's end-to-end driver (read-only): the query the listed rows were matched against (after command aliases), or None while newer rows are still being matched.
+    pub fn listed_query(&self) -> Option<&str> {
+        if self.updating_matches.is_some() {
+            return None;
+        }
+        Some(self.latest_query.as_str())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn seed_history(&mut self, queries: &[&str]) {
         self.query_history.history = Some(queries.iter().map(|s| s.to_string()).collect());

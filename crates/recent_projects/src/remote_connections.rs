@@ -125,6 +125,76 @@ impl Settings for RemoteSettings {
     }
 }
 
+/// Cod (#24): one remote open's hold on the saved window it restores: the restore owner it
+/// reserved (kept only when the remote workspace came up), the window built for it, and the
+/// sender that ends the reservation once the owner is settled.
+#[derive(Default)]
+struct CodRemoteAttempt {
+    owner: Option<workspace::CodRestoreOwner>,
+    window: Option<WindowHandle<MultiWorkspace>>,
+    done: Option<oneshot::Sender<()>>,
+    /// The saved row of a pending remote member that this open loads into its window, which
+    /// keeps its restore owner (the open reserves none).
+    pending_restore_id: Option<workspace::WorkspaceId>,
+}
+
+/// Cod (#24): loads the pending remote member `id` of `window`: its exact saved row over its
+/// saved connection, as a new member of that window. Registered as the workspace crate's
+/// remote member opener.
+pub fn cod_open_remote_member(
+    id: workspace::WorkspaceId,
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    app_state: Arc<AppState>,
+    window: WindowHandle<MultiWorkspace>,
+    cx: &mut gpui::App,
+) -> gpui::Task<Result<()>> {
+    // As at start: the saved SSH connection gets its settings (user, port forwards, ...).
+    let mut connection_options = connection_options;
+    if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
+        RemoteSettings::get_global(cx).fill_connection_options_from_settings(options);
+    }
+    cx.spawn(async move |cx| {
+        let open_options = OpenOptions {
+            requesting_window: Some(window),
+            workspace_matching: workspace::WorkspaceMatching::None,
+            ..Default::default()
+        };
+        let mut attempt = CodRemoteAttempt {
+            pending_restore_id: Some(id),
+            ..Default::default()
+        };
+        let result = cod_open_remote_project_attempt(
+            connection_options,
+            paths,
+            app_state,
+            open_options,
+            &mut attempt,
+            cx,
+        )
+        .await;
+        cod_give_back_restore_owner(&mut attempt, cx);
+        drop(attempt.done.take());
+        result.map(|_| ())
+    })
+}
+
+/// Cod (#24): an attempt that did not bring its remote workspace up (cancelled, failed, or
+/// stopped early) gives its restore owner back to the application, and its window gives back
+/// the saved key, so the saved window stays whole for a later attempt or the next start. Does
+/// nothing once the owner was kept or given back.
+fn cod_give_back_restore_owner(attempt: &mut CodRemoteAttempt, cx: &mut AsyncApp) {
+    let Some(owner) = attempt.owner.take() else {
+        return;
+    };
+    if let Some(window) = attempt.window {
+        window
+            .update(cx, |multi_workspace, _, _| multi_workspace.cod_release_restore_owner())
+            .ok();
+    }
+    cx.update(|cx| workspace::cod_add_restore_owner(owner, cx));
+}
+
 pub async fn open_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
@@ -132,7 +202,48 @@ pub async fn open_remote_project(
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
+    // Cod (#24): whatever way the attempt ends (including early errors), an owner it did not
+    // keep goes back before the reservation ends, so a waiting open finds it and reserves it.
+    let mut attempt = CodRemoteAttempt::default();
+    let result = cod_open_remote_project_attempt(
+        connection_options,
+        paths,
+        app_state,
+        open_options,
+        &mut attempt,
+        cx,
+    )
+    .await;
+    cod_give_back_restore_owner(&mut attempt, cx);
+    drop(attempt.done.take());
+    result
+}
+
+async fn cod_open_remote_project_attempt(
+    connection_options: RemoteConnectionOptions,
+    paths: Vec<PathBuf>,
+    app_state: Arc<AppState>,
+    open_options: workspace::OpenOptions,
+    cod_attempt: &mut CodRemoteAttempt,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
     let created_new_window = open_options.requesting_window.is_none();
+    log::info!(
+        "opening a remote project with {} path(s), new window: {created_new_window}",
+        paths.len()
+    );
+
+    // Cod (#24): a restoration of this remote workspace is connecting. Wait for it, then use
+    // the workspace it brought back (found below) instead of connecting a second time, so no
+    // second live workspace takes the same saved one. Unrelated opens do not wait.
+    if let Some((restore_id, restore_done)) = cx.update(|cx| {
+        workspace::cod_remote_restore_in_progress(&connection_options, &paths, cx)
+    }) {
+        log::info!("remote open: waiting for the restore of the same remote workspace");
+        restore_done.await.ok();
+        log::info!("remote open: the restore of the same remote workspace ended");
+        cx.update(|cx| workspace::cod_end_remote_restore(restore_id, cx));
+    }
 
     let (existing, open_visible) = find_existing_workspace(
         &paths,
@@ -141,6 +252,7 @@ pub async fn open_remote_project(
         cx,
     )
     .await;
+    log::info!("remote open: an open workspace matches: {}", existing.is_some());
 
     if let Some((existing_window, existing_workspace)) = existing {
         let remote_connection = cx.update(|cx| {
@@ -201,6 +313,72 @@ pub async fn open_remote_project(
         );
     }
 
+    // Cod (#24): an ordinary open of a workspace that a window holds as a pending remote member
+    // (same connection and folders) shows that member in its window: it loads its saved row by
+    // id. Selecting the row by its folders here would give that row a second live claim. The
+    // load of a pending member itself goes on below.
+    if cod_attempt.pending_restore_id.is_none()
+        && let Some((pending_window, pending_id)) = cx.update(|cx| {
+            workspace::cod_pending_remote_member(&connection_options, &paths, cx)
+        })
+    {
+        let shown = pending_window.update(cx, |multi_workspace, window, cx| {
+            window.activate_window();
+            multi_workspace.cod_show_pending(pending_id, window, cx)
+        })?;
+        shown.await?;
+        return Ok(pending_window);
+    }
+
+    // Cod (#24): a new window for a remote workspace that this start restores takes that
+    // window's restore owner, and the restoration is registered before connecting, so a
+    // matching open waits for it. It is done when the attempt ends (`cod_attempt.done`
+    // drops, after an owner the attempt did not keep went back).
+    // Joining and reserving happen in one step: when a matching restoration began after this
+    // open stopped waiting, this open waits for it too and then starts over, so two opens never
+    // both restore the same saved workspace.
+    let (cod_restore_owner, cod_restore_done) = if created_new_window {
+        let step = cx.update(|cx| {
+            match workspace::cod_remote_restore_in_progress(&connection_options, &paths, cx) {
+                Some(in_progress) => Err(in_progress),
+                None => Ok(workspace::cod_begin_remote_restore(
+                    &connection_options,
+                    &paths,
+                    cx,
+                )),
+            }
+        });
+        match step {
+            Ok(Some((owner, done))) => (Some(owner), Some(done)),
+            Ok(None) => (None, None),
+            Err((restore_id, restore_done)) => {
+                restore_done.await.ok();
+                cx.update(|cx| workspace::cod_end_remote_restore(restore_id, cx));
+                // Nothing is reserved yet, so the attempt starts over as it is.
+                return Box::pin(cod_open_remote_project_attempt(
+                    connection_options,
+                    paths,
+                    app_state,
+                    open_options,
+                    cod_attempt,
+                    cx,
+                ))
+                .await;
+            }
+        }
+    } else {
+        (None, None)
+    };
+    // A cancelled or failed restoration gives its owner back, so a later attempt restores the
+    // same saved window with its complete membership. The saved row this attempt restores
+    // belongs to the attempt, not to the window.
+    cod_attempt.owner = cod_restore_owner.clone();
+    cod_attempt.done = cod_restore_done;
+    let cod_restore_id = cod_restore_owner
+        .as_ref()
+        .map(|owner| owner.active_workspace_id)
+        .or(cod_attempt.pending_restore_id);
+
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()
@@ -237,13 +415,22 @@ pub async fn open_remote_project(
                 workspace.centered_layout = workspace_position.centered_layout;
                 workspace
             });
-            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            cx.new(|cx| {
+                let mut multi_workspace = MultiWorkspace::new(workspace, window, cx);
+                // Cod (#24): a restored remote window has its saved key and full membership
+                // before it can save itself.
+                if let Some(owner) = cod_restore_owner {
+                    multi_workspace.cod_adopt_restore_owner(owner);
+                }
+                multi_workspace
+            })
         })?;
         let workspace = window.update(cx, |multi_workspace, _, _cx| {
             multi_workspace.workspace().clone()
         })?;
         (window, workspace)
     };
+    cod_attempt.window = Some(window);
 
     loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
@@ -295,6 +482,10 @@ pub async fn open_remote_project(
                         ui.update(cx, |modal, cx| modal.finished(cx))
                     }
                 });
+                // Cod (#24): the restore was cancelled and the window stays without its
+                // members. It gives back the saved key, so closing it keeps the saved window
+                // for the next start.
+                cod_give_back_restore_owner(cod_attempt, cx);
 
                 break;
             },
@@ -335,6 +526,9 @@ pub async fn open_remote_project(
                     continue;
                 }
 
+                // Cod (#24): a failed restoration keeps the saved window: the window gives back
+                // its saved key before it goes, and the owner goes back to the application.
+                cod_give_back_restore_owner(cod_attempt, cx);
                 if created_new_window {
                     window
                         .update(cx, |_, window, _| window.remove_window())
@@ -356,6 +550,7 @@ pub async fn open_remote_project(
                     delegate.clone(),
                     app_state.clone(),
                     paths.clone(),
+                    cod_restore_id,
                     cx,
                 )
             })
@@ -395,6 +590,9 @@ pub async fn open_remote_project(
                     continue;
                 }
 
+                // Cod (#24): a failed restoration keeps the saved window: the window gives back
+                // its saved key before it goes, and the owner goes back to the application.
+                cod_give_back_restore_owner(cod_attempt, cx);
                 if created_new_window {
                     window
                         .update(cx, |_, window, _| window.remove_window())
@@ -411,9 +609,32 @@ pub async fn open_remote_project(
                 });
             }
 
-            Ok((_, items)) => {
+            // Cod (#24): only a remote workspace that came up keeps the restore owner.
+            Ok((Some(_), items)) => {
+                // The empty workspace this new window showed while connecting goes now that
+                // the remote workspace is shown: it is not a member of the window.
+                if created_new_window {
+                    let placeholder = initial_workspace.clone();
+                    window
+                        .update(cx, |multi_workspace, _window, cx| {
+                            multi_workspace.cod_drop_connection_placeholder(&placeholder, cx)
+                        })
+                        .ok();
+                }
+                // The saved local members of the restored window join it as pending members
+                // (they load when first shown), on a later retry as at start.
+                if let Some(owner) = cod_attempt.owner.take() {
+                    window
+                        .update(cx, |multi_workspace, _window, cx| {
+                            multi_workspace.cod_join_restored_members(owner, cx)
+                        })
+                        .ok();
+                }
                 navigate_to_positions(&window, items, &paths_with_positions, cx);
             }
+            // Cancelled while the remote client started: nothing came up, so the owner goes
+            // back when the attempt ends.
+            Ok((None, _)) => {}
         }
 
         break;

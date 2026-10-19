@@ -25,6 +25,16 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+mod cod_workspaces;
+pub use cod_workspaces::{
+    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
+};
+pub use cod_workspaces::{
+    CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
+};
+pub(crate) use cod_workspaces::init_workspace_names;
+
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -290,6 +300,9 @@ pub struct ProjectGroupState {
 pub enum RemovalIntent {
     KeepProject,
     CloseProject,
+    /// Cod (#24): the project moves to another window ("Open Project in New Window"). Like
+    /// `CloseProject` for this window, but its workspaces keep their names.
+    MoveProject,
 }
 
 /// One row per workspace held by this window. The displayed workspace is
@@ -300,6 +313,16 @@ struct HeldWorkspace {
     workspace: Entity<Workspace>,
     pinned: bool,
     activated_at: Option<u64>,
+}
+
+/// Cod (#24): a project group moving to a new window: the key reserved for that window, the
+/// complete group membership in window order, the member shown here, and the members that are
+/// not loaded.
+struct CodGroupMove {
+    key: String,
+    ids: Vec<WorkspaceId>,
+    active: Option<WorkspaceId>,
+    pending_ids: Vec<WorkspaceId>,
 }
 
 pub struct MultiWorkspace {
@@ -317,6 +340,42 @@ pub struct MultiWorkspace {
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
+    /// Cod (#24): ids from the saved workspace list that this window has not brought back yet
+    /// (still restoring, or failed to restore). They stay in the saved list so the next start
+    /// retries them.
+    cod_unrestored_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): ids of workspaces removed from this window whose session binding is not
+    /// cleared yet. They stay in the saved list until it is.
+    cod_removing_workspace_ids: Vec<WorkspaceId>,
+    /// Cod (#24): the window's workspace list as it was saved, so a pending member keeps its
+    /// place among the others.
+    cod_saved_order: Vec<WorkspaceId>,
+    /// Cod (#24): members of this window that are not loaded yet (lazy restore), with the
+    /// folders of each. A pending member loads in the foreground the first time it is shown.
+    cod_pending: std::collections::HashMap<WorkspaceId, Vec<PathBuf>>,
+    /// Cod (#24): the saved connection of each pending member that is remote. A pending member
+    /// not listed here is local.
+    cod_pending_remote: std::collections::HashMap<WorkspaceId, RemoteConnectionOptions>,
+    /// Cod (#24): true while a pending member loads; other activation requests wait for it.
+    cod_materializing: bool,
+    /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
+    /// key it was saved under.
+    cod_window_key: String,
+    /// Cod (#24): workspaces moving to a new window, each with the registry key reserved for
+    /// that one window. Only the window opened for the move takes the key.
+    cod_move_keys: std::collections::HashMap<gpui::EntityId, String>,
+    /// Cod (#24): next (true) and previous (false) switches asked for while a pending member
+    /// loads; they run in order once it is shown.
+    cod_queued_cycles: Vec<bool>,
+    /// Cod (#24): activation requests by workspace id that arrived while another pending member
+    /// loaded; each is woken once that load ends and then loads or shows its own member.
+    cod_materialize_waiters: Vec<futures::channel::oneshot::Sender<()>>,
+    /// Cod (#24): a project group move waiting for consent. The first member that leaves after
+    /// consent moves the whole group in one registry edit.
+    cod_group_move: Option<CodGroupMove>,
+    /// Cod (#24): ids that left this window with a group move; this window's saves leave them
+    /// out while the move detaches its members.
+    cod_moving_ids: Vec<WorkspaceId>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
@@ -353,12 +412,25 @@ impl MultiWorkspace {
                 && AgentSettings::get_global(cx).enabled;
             move |this, window, cx| {
                 let multi_workspace_enabled = this.multi_workspace_enabled(cx);
-                if previous_multi_workspace_enabled && !multi_workspace_enabled {
-                    this.collapse_to_single_workspace(window, cx);
+                // Cod (#24): the window keeps its workspaces whatever the AI setting; only the
+                // threads sidebar goes away with AI.
+                if previous_multi_workspace_enabled && !multi_workspace_enabled && this.sidebar_open
+                {
+                    this.close_sidebar(window, cx);
                 }
                 previous_multi_workspace_enabled = multi_workspace_enabled;
             }
         });
+        // Cod (#24): a window restored from the registry takes its saved key and complete
+        // membership here, before it can save itself, so no save writes the window under
+        // another key or without its other members. Closing it removes that saved key.
+        let first_workspace_id = workspace.read(cx).database_id();
+        let restore_owner = first_workspace_id
+            .and_then(|id| crate::persistence::cod_take_restore_owner(id, cx));
+        let (cod_window_key, cod_saved_order) = match restore_owner {
+            Some(owner) => (owner.key, owner.workspace_ids),
+            None => (crate::persistence::cod_new_window_key(), Vec::new()),
+        };
         Self::subscribe_to_workspace(&workspace, window, cx);
         let weak_self = cx.weak_entity();
         let active_workspace_id = Rc::new(Cell::new(workspace.entity_id()));
@@ -378,6 +450,22 @@ impl MultiWorkspace {
             sidebar_open: false,
             sidebar_overlay: None,
             pending_removal_tasks: Vec::new(),
+            // Every saved member counts as not back until this window holds it.
+            cod_unrestored_workspace_ids: cod_saved_order.clone(),
+            cod_removing_workspace_ids: Vec::new(),
+            cod_saved_order,
+            cod_pending: std::collections::HashMap::new(),
+            cod_pending_remote: std::collections::HashMap::new(),
+            cod_materializing: false,
+            // Cod (#24): a restored window has its saved key from its restore owner; a window
+            // opened for a moving project takes its reserved key after it is built
+            // (`cod_set_window_key`).
+            cod_window_key,
+            cod_move_keys: std::collections::HashMap::new(),
+            cod_queued_cycles: Vec::new(),
+            cod_materialize_waiters: Vec::new(),
+            cod_group_move: None,
+            cod_moving_ids: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
@@ -566,6 +654,26 @@ impl MultiWorkspace {
             }
 
             crate::flush_windows_serialization(&[window_handle], cx).await;
+
+            // Cod (#24): the user agreed to close the window, so it leaves the registry (quit
+            // keeps it there).
+            let registry_removal = window_handle
+                .update(cx, |this, _window, cx| {
+                    crate::persistence::cod_registry_remove(this.cod_window_key.clone(), cx)
+                })
+                .ok();
+            if let Some(registry_removal) = registry_removal
+                && let Err(err) = registry_removal.await
+            {
+                // The window stays open, so it may save its entry again.
+                window_handle
+                    .update(cx, |this, _window, cx| {
+                        crate::persistence::cod_registry_reopen(&this.cod_window_key, cx);
+                        this.serialize(cx);
+                    })
+                    .ok();
+                return Err(err.context("removing the window from the Cod window registry"));
+            }
 
             window_handle
                 .update(cx, |_, window, _cx| {
@@ -948,6 +1056,16 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        self.remove_project_group_with_intent(group_key, RemovalIntent::CloseProject, window, cx)
+    }
+
+    fn remove_project_group_with_intent(
+        &mut self,
+        group_key: &ProjectGroupKey,
+        intent: RemovalIntent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<bool>> {
         // The active workspace can remain unpinned while the sidebar is
         // closed. Pin it first: this puts it in the removal set below, and
         // stops `activate` from pinning it while switching to the
@@ -963,7 +1081,7 @@ impl MultiWorkspace {
 
         let workspaces = self.workspaces_for_project_group(group_key, cx);
 
-        let task = self.remove(workspaces, RemovalIntent::CloseProject, window, cx);
+        let task = self.remove(workspaces, intent, window, cx);
 
         self.project_groups.retain(|group| group.key != *group_key);
         cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
@@ -1037,20 +1155,187 @@ impl MultiWorkspace {
             }));
         }
 
-        let remove_task = self.remove_project_group(key, window, cx);
+        // Cod (#24): the moving workspaces go, in order, to the registry entry of the window
+        // opened below, under a key reserved for that window only. The window opens each of
+        // them by its id, so two workspaces on the same folder both arrive.
+        let move_key = crate::persistence::cod_new_window_key();
+        let mut moving: Vec<Entity<Workspace>> = workspaces.clone();
+        let active_workspace = self.workspace().clone();
+        if active_workspace.read(cx).project_group_key(cx) == *key
+            && !moving.iter().any(|workspace| workspace == &active_workspace)
+        {
+            moving.insert(0, active_workspace.clone());
+        }
+        for workspace in &moving {
+            self.cod_move_keys
+                .insert(workspace.entity_id(), move_key.clone());
+        }
+        // The complete group membership in window order: the loaded members that move and the
+        // pending (not loaded) members of the group. Pending members are local only.
+        let mut moved_ids: Vec<WorkspaceId> = Vec::new();
+        let mut pending_ids: Vec<WorkspaceId> = Vec::new();
+        let group_is_local = key.host().is_none();
+        for member in self.cod_members(cx) {
+            match member {
+                CodMember::Live(workspace) => {
+                    if !moving.iter().any(|moving| *moving == workspace) {
+                        continue;
+                    }
+                    if let Some(id) = workspace.read(cx).database_id()
+                        && !moved_ids.contains(&id)
+                    {
+                        moved_ids.push(id);
+                    }
+                }
+                CodMember::Pending(id) => {
+                    // The same identity as a loaded member's group key: a linked worktree
+                    // belongs to the group of its main repository.
+                    let in_group = group_is_local
+                        && !self.cod_pending_remote.contains_key(&id)
+                        && (self
+                            .cod_pending
+                            .get(&id)
+                            .is_some_and(|paths| PathList::new(paths) == *key.path_list())
+                            || self
+                                .cod_pending_group_paths(id)
+                                .is_some_and(|paths| paths == *key.path_list()));
+                    if in_group && !moved_ids.contains(&id) {
+                        moved_ids.push(id);
+                        pending_ids.push(id);
+                    }
+                }
+            }
+        }
+        // A loaded member that is not in the window order yet still moves.
+        for workspace in &moving {
+            if let Some(id) = workspace.read(cx).database_id()
+                && !moved_ids.contains(&id)
+            {
+                moved_ids.push(id);
+            }
+        }
+        // The destination shows the member that was shown here, when it moves.
+        let shown_id = active_workspace.read(cx).database_id();
+        // Cod (#24): the whole group (loaded and pending members, in order, and the shown
+        // member) moves in one registry edit, made by the first member that leaves after the
+        // consent prompts (`cod_commit_group_move`). Pending members stay bound until the
+        // destination binds them to itself.
+        self.cod_group_move = Some(CodGroupMove {
+            key: move_key.clone(),
+            ids: moved_ids.clone(),
+            active: shown_id,
+            pending_ids,
+        });
+        let remove_task =
+            self.remove_project_group_with_intent(key, RemovalIntent::MoveProject, window, cx);
 
-        cx.spawn(async move |_this, cx| {
+        cx.spawn(async move |this, cx| {
             futures::future::join_all(serialization_tasks).await;
 
-            let removed = remove_task.await?;
-            if !removed {
+            let removed = remove_task.await;
+            let removed_any = matches!(removed, Ok(true));
+            // A reserved key that no detached workspace used goes with this move. A group move
+            // that no leaving member committed (no member had a saved id) commits now when the
+            // group left, and is dropped when the user cancelled.
+            let cleanup_key = move_key.clone();
+            let late_commit = this
+                .update(cx, |this, cx| {
+                    this.cod_move_keys.retain(|_, key| *key != cleanup_key);
+                    let armed = this
+                        .cod_group_move
+                        .as_ref()
+                        .is_some_and(|plan| plan.key == cleanup_key);
+                    let late_commit = if armed && removed_any {
+                        this.cod_commit_group_move(cx)
+                    } else {
+                        if armed {
+                            this.cod_group_move = None;
+                        }
+                        None
+                    };
+                    this.cod_moving_ids.clear();
+                    late_commit
+                })
+                .ok()
+                .flatten();
+            if let Some(late_commit) = late_commit {
+                // A failed write keeps the registry dirty; the next save writes it again.
+                late_commit.await.log_err();
+            }
+            if !removed? {
                 return Ok(());
             }
 
-            cx.update(|cx| {
-                Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
-            })
-            .await?;
+            let db = cx.update(|cx| crate::persistence::WorkspaceDb::global(cx));
+            let mut members: Vec<crate::persistence::model::SessionWorkspace> = Vec::new();
+            for id in &moved_ids {
+                match db.workspace_for_id(*id) {
+                    // Cod (#24): a remote member is not opened as a local project, which would
+                    // save its row as local. It stays in the destination's saved list as saved.
+                    Some(saved)
+                        if matches!(
+                            saved.location,
+                            crate::persistence::model::SerializedWorkspaceLocation::Remote(_)
+                        ) =>
+                    {
+                        log::info!("Moved remote workspace {id:?} keeps its saved row");
+                    }
+                    Some(saved) => members.push(crate::persistence::model::SessionWorkspace {
+                        workspace_id: *id,
+                        location: saved.location,
+                        paths: saved.paths,
+                        window_id: None,
+                    }),
+                    None => log::error!("Moved workspace {id:?} was not found"),
+                }
+            }
+
+            // Nothing saved to open by id: open the folders as a new window, as stock does. The
+            // window still takes the reserved key, together with the complete moved membership
+            // (remote members included), so its first save under that key keeps every moved id.
+            if members.is_empty() {
+                let moved_membership = cx
+                    .update(|cx| crate::persistence::cod_take_restore_owner_by_key(&move_key, cx))
+                    .map(|owner| owner.workspace_ids)
+                    .unwrap_or_else(|| moved_ids.clone());
+                let opened = cx
+                    .update(|cx| {
+                        Workspace::new_local(
+                            paths,
+                            app_state,
+                            None,
+                            None,
+                            None,
+                            OpenMode::NewWindow,
+                            cx,
+                        )
+                    })
+                    .await?;
+                opened
+                    .window
+                    .update(cx, |multi_workspace, _window, cx| {
+                        multi_workspace.cod_adopt_moved_group(move_key, moved_membership, cx);
+                        multi_workspace.serialize(cx);
+                    })
+                    .ok();
+                return Ok(());
+            }
+            let shown_index = shown_id
+                .and_then(|shown| members.iter().position(|member| member.workspace_id == shown))
+                .unwrap_or(0);
+            let active_workspace = members.remove(shown_index);
+            let serialized = crate::persistence::model::SerializedMultiWorkspace {
+                state: crate::persistence::model::MultiWorkspaceState {
+                    active_workspace_id: Some(active_workspace.workspace_id),
+                    cod_workspace_ids: moved_ids,
+                    cod_window_key: Some(move_key),
+                    cod_from_registry: true,
+                    ..Default::default()
+                },
+                active_workspace,
+                other_workspaces: members,
+            };
+            crate::restore_multiworkspace(serialized, app_state, cx).await?;
 
             Ok(())
         })
@@ -1122,6 +1407,27 @@ impl MultiWorkspace {
                 cx,
             );
         };
+
+        // Cod (#24): a pending remote member of this window with the same connection and
+        // folders loads its saved row by id and is shown, so the row never gets a second live
+        // claim through a selection by folders.
+        if let Some(pending_id) =
+            self.cod_pending_remote_id_for(&connection_options, paths.paths())
+        {
+            let shown = self.cod_show_pending(pending_id, window, cx);
+            return cx.spawn(async move |this, cx| {
+                shown.await?;
+                this.update(cx, |this, cx| {
+                    this.held
+                        .iter()
+                        .map(|held| held.workspace.clone())
+                        .find(|workspace| workspace.read(cx).database_id() == Some(pending_id))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("workspace {pending_id:?} did not load")
+                        })
+                })?
+            });
+        }
 
         let app_state = self.workspace().read(cx).app_state().clone();
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();
@@ -1321,19 +1627,17 @@ impl MultiWorkspace {
 
         let old_active_workspace = self.workspace().clone();
         let old_active_was_retained = self.active_workspace_is_retained();
-        let should_retain_workspaces = self.multi_workspace_enabled(cx);
-
-        if should_retain_workspaces && !old_active_was_retained {
+        // Cod (#24): a window always keeps the workspaces it switches between, whatever the AI
+        // setting.
+        if !old_active_was_retained {
             let key = old_active_workspace.read(cx).project_group_key(cx);
             let index = self.hold(old_active_workspace.clone(), window, cx);
             self.pin(index, key, cx);
         }
 
         let displayed = self.hold(workspace.clone(), window, cx);
-        if should_retain_workspaces {
-            let key = workspace.read(cx).project_group_key(cx);
-            self.pin(displayed, key, cx);
-        }
+        let key = workspace.read(cx).project_group_key(cx);
+        self.pin(displayed, key, cx);
 
         // Publish the new active workspace before anyone reads the shared cell
         // to decide who owns the window chrome.
@@ -1346,10 +1650,6 @@ impl MultiWorkspace {
             .max()
             .map_or(0, |max| max + 1);
         self.held[displayed].activated_at = Some(stamp);
-
-        if !should_retain_workspaces && !old_active_was_retained {
-            self.detach_workspace(&old_active_workspace, cx);
-        }
 
         // The platform window is shared across all workspaces in this window.
         // The previously-active workspace left the title and edited indicator
@@ -1379,31 +1679,22 @@ impl MultiWorkspace {
         cx.notify();
     }
 
-    /// Collapses to a single workspace, discarding all groups.
-    /// Used when multi-workspace is disabled by settings.
-    fn collapse_to_single_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sidebar_open {
-            self.close_sidebar(window, cx);
-        }
-
-        let displayed_workspace = self.workspace().clone();
-        for workspace in self.workspaces().cloned().collect::<Vec<_>>() {
-            if workspace != displayed_workspace {
-                self.detach_workspace(&workspace, cx);
-            }
-        }
-
-        for held in &mut self.held {
-            held.pinned = false;
-        }
-        self.project_groups.clear();
-        cx.notify();
-    }
-
     /// Detaches a workspace: clears session state, DB binding, cached
     /// group key, and emits `WorkspaceRemoved`. The DB row is preserved
     /// so the workspace still appears in the recent-projects list.
     fn detach_workspace(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
+        self.detach_workspace_with_intent(workspace, RemovalIntent::CloseProject, cx);
+    }
+
+    /// Like `detach_workspace`; with `RemovalIntent::MoveProject` the workspace keeps its name
+    /// because it goes on in another window.
+    fn detach_workspace_with_intent(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        intent: RemovalIntent,
+        cx: &mut Context<Self>,
+    ) {
+        let keep_name = intent == RemovalIntent::MoveProject;
         if let Some(index) = self.held_index(workspace) {
             assert_ne!(
                 index,
@@ -1421,12 +1712,74 @@ impl MultiWorkspace {
 
         if let Some(workspace_id) = workspace.read(cx).database_id() {
             let db = crate::persistence::WorkspaceDb::global(cx);
+            // Cod (#24): a removed workspace loses its name on every removal path (palette close,
+            // sidebar, discarded empty workspace). The steps run in one awaited sequence off the
+            // GPUI thread: the window's registry entry without it goes first, since the registry
+            // alone decides what a start restores, then the session binding, then the name. A
+            // crash between steps never brings back a removed workspace.
+            // A project moving to a new window goes to that window's registry entry in the same
+            // edit that takes it out of this window, so no written registry has it in no window
+            // or in two.
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            if !keep_name {
+                cod_workspaces::forget_workspace_name(workspace_id, cx);
+            }
+            self.cod_unrestored_workspace_ids
+                .retain(|id| *id != workspace_id);
+            let move_key = if keep_name {
+                self.cod_move_keys.remove(&workspace.entity_id())
+            } else {
+                None
+            };
+            // The first member of a group move that leaves after consent moves the whole group
+            // in one edit; the other members of that group went with it.
+            let moved = match move_key {
+                Some(move_key)
+                    if self
+                        .cod_group_move
+                        .as_ref()
+                        .is_some_and(|plan| plan.key == move_key) =>
+                {
+                    self.cod_commit_group_move(cx)
+                }
+                Some(_) if self.cod_moving_ids.contains(&workspace_id) => None,
+                Some(move_key) => Some(crate::persistence::cod_registry_move_to_window(
+                    vec![workspace_id],
+                    move_key,
+                    cx,
+                )),
+                None => None,
+            };
+            let membership = self.serialize_now(cx);
             self.pending_removal_tasks.retain(|task| !task.is_ready());
             self.pending_removal_tasks
-                .push(cx.background_spawn(async move {
+                .push(cx.spawn(async move |_this, _cx| {
+                    // The registry without this workspace must be on disk before its binding
+                    // and name go. When it is not, the workspace stays bound (and named), so a
+                    // later start still finds it; the registry stays dirty and the next save
+                    // writes it again.
+                    if let Some(moved) = moved
+                        && let Err(err) = moved.await
+                    {
+                        log::error!(
+                            "Moving workspace {workspace_id:?} in the Cod window registry failed, keeping it bound: {err:#}"
+                        );
+                        return;
+                    }
+                    if let Err(err) = membership.await {
+                        log::error!(
+                            "Removing workspace {workspace_id:?} from the Cod window registry failed, keeping it bound: {err:#}"
+                        );
+                        return;
+                    }
                     db.set_session_binding(workspace_id, None, None)
                         .await
                         .log_err();
+                    if !keep_name {
+                        cod_workspaces::delete_stored_workspace_name(&kvp, workspace_id)
+                            .await
+                            .log_err();
+                    }
                 }));
         }
     }
@@ -1441,15 +1794,24 @@ impl MultiWorkspace {
     }
 
     pub fn serialize(&mut self, cx: &mut Context<Self>) {
+        // Cod (#24): while a pending member loads it is held out of its place in the order;
+        // the window's list is saved once the member is put back.
+        if self.cod_materializing {
+            return;
+        }
         self._serialize_task = Some(cx.spawn(async move |this, cx| {
             let Ok(task) = this.update(cx, |this, cx| this.serialize_now(cx)) else {
                 return;
             };
-            task.await;
+            // A failed registry write keeps the registry dirty; the next save writes it again.
+            task.await.log_err();
         }));
     }
 
-    fn serialize_now(&mut self, cx: &mut Context<Self>) -> impl Future<Output = ()> + use<> {
+    fn serialize_now(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = Result<()>> + use<> {
         let state = MultiWorkspaceState {
             active_workspace_id: self.workspace().read(cx).database_id(),
             project_groups: self
@@ -1464,12 +1826,182 @@ impl MultiWorkspace {
                 .collect::<Vec<_>>(),
             sidebar_open: self.sidebar_open,
             sidebar_state: self.sidebar.as_ref().and_then(|s| s.serialized_state(cx)),
+            cod_workspace_ids: self.cod_saved_workspace_ids(cx),
+            cod_window_key: Some(self.cod_window_key.clone()),
+            cod_from_registry: false,
         };
+        // Cod (#24): the registry entry of this window follows its saved list. Ids are database
+        // ids, so their workspace rows are already saved.
+        let registry_entry = crate::persistence::CodWindowEntry {
+            key: self.cod_window_key.clone(),
+            workspace_ids: state.cod_workspace_ids.clone(),
+            active_workspace_id: state.active_workspace_id,
+        };
+        let registry_write = crate::persistence::cod_registry_upsert(registry_entry, cx);
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
+        // Resolves to the result of the registry write, which alone decides what a start
+        // restores.
         async move {
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
+            registry_write.await
         }
+    }
+
+    /// Cod (#24): this window's key in the Cod window registry.
+    pub fn cod_window_key(&self) -> &str {
+        &self.cod_window_key
+    }
+
+    /// Cod (#24): a restored window, or a window opened for a moving project, takes the
+    /// registry key it was saved or reserved under. Members the window saved under its first
+    /// key join that entry in the same edit (queued at once, so the returned acknowledgement
+    /// need not be awaited).
+    pub fn cod_set_window_key(&mut self, key: String, cx: &mut App) {
+        if self.cod_window_key == key {
+            return;
+        }
+        let first_key = std::mem::replace(&mut self.cod_window_key, key.clone());
+        drop(crate::persistence::cod_registry_rename(first_key, key, cx));
+    }
+
+    /// Cod (#24): a window opened for a moving group whose members could not be opened by id
+    /// (remote members, or rows not found) takes the reserved key and the complete moved
+    /// membership in the same step, so every save under that key keeps each moved id. The
+    /// moved members stay saved and not loaded; the window's own workspace stays a member.
+    pub fn cod_adopt_moved_group(
+        &mut self,
+        key: String,
+        workspace_ids: Vec<WorkspaceId>,
+        cx: &mut App,
+    ) {
+        self.cod_set_window_key(key, cx);
+        for id in &workspace_ids {
+            if !self.cod_unrestored_workspace_ids.contains(id) {
+                self.cod_unrestored_workspace_ids.push(*id);
+            }
+        }
+        self.cod_saved_order = workspace_ids;
+    }
+
+    /// Cod (#24): a window just built for a remote restore (its first workspace is a placeholder)
+    /// takes the saved key and complete membership of its restore owner, before it can save
+    /// itself. Its first key was never written, so nothing moves in the registry.
+    pub fn cod_adopt_restore_owner(&mut self, owner: crate::persistence::CodRestoreOwner) {
+        self.cod_window_key = owner.key;
+        self.cod_unrestored_workspace_ids = owner.workspace_ids.clone();
+        self.cod_saved_order = owner.workspace_ids;
+    }
+
+    /// Cod (#24): a remote restoration that came up (at start or on a later retry) adds the
+    /// saved local members of its window as pending members; they load when first shown.
+    pub fn cod_join_restored_members(
+        &mut self,
+        owner: crate::persistence::CodRestoreOwner,
+        cx: &mut Context<Self>,
+    ) {
+        for member in owner.members {
+            if member.workspace_id != owner.active_workspace_id
+                && owner.workspace_ids.contains(&member.workspace_id)
+            {
+                match member.location {
+                    crate::persistence::model::SerializedWorkspaceLocation::Local => {
+                        self.cod_add_pending_workspace(member.workspace_id, member.paths);
+                    }
+                    // A remote companion stays recoverable: it loads by its saved id over its
+                    // saved connection when it is first shown.
+                    crate::persistence::model::SerializedWorkspaceLocation::Remote(options) => {
+                        self.cod_add_pending_remote_workspace(
+                            member.workspace_id,
+                            options,
+                            member.paths,
+                        );
+                    }
+                }
+            }
+        }
+        self.cod_finish_restore(cx);
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    /// Cod (#24): after consent, a project group move transfers its complete ordered
+    /// membership and shown member to the reserved key in one registry edit, taking them out
+    /// of this window in the same step (loaded and pending members alike). The destination's
+    /// restore owner is installed in the application, so the destination is built with its key
+    /// and members whatever happens to this window.
+    fn cod_commit_group_move(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::persistence::CodRegistryWriteDone> {
+        let plan = self.cod_group_move.take()?;
+        self.cod_pending
+            .retain(|id, _| !plan.pending_ids.contains(id));
+        self.cod_unrestored_workspace_ids
+            .retain(|id| !plan.ids.contains(id));
+        self.cod_saved_order.retain(|id| !plan.ids.contains(id));
+        self.cod_moving_ids.extend(plan.ids.iter().copied());
+        if let Some(active) = plan
+            .active
+            .filter(|active| plan.ids.contains(active))
+            .or_else(|| plan.ids.first().copied())
+        {
+            crate::persistence::cod_add_restore_owner(
+                crate::persistence::CodRestoreOwner {
+                    key: plan.key.clone(),
+                    workspace_ids: plan.ids.clone(),
+                    members: Vec::new(),
+                    active_workspace_id: active,
+                },
+                cx,
+            );
+        }
+        let moved =
+            crate::persistence::cod_registry_move_group(plan.ids, plan.active, plan.key, cx);
+        cx.notify();
+        Some(moved)
+    }
+
+    /// Cod (#24): a window built for a remote open shows an empty local workspace while it
+    /// connects. Once the remote workspace it was built for is shown, that placeholder leaves
+    /// the window: it is not kept, not saved and not listed. A placeholder that is shown, has
+    /// a saved id, folders or open items stays.
+    pub fn cod_drop_connection_placeholder(
+        &mut self,
+        placeholder: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace() == placeholder || self.held_index(placeholder).is_none() {
+            return;
+        }
+        let is_empty = {
+            let workspace = placeholder.read(cx);
+            workspace.database_id().is_none()
+                && workspace
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .is_none()
+                && workspace.items(cx).next().is_none()
+        };
+        if !is_empty {
+            return;
+        }
+        self.detach_workspace(placeholder, cx);
+        self.serialize(cx);
+        cx.notify();
+    }
+
+    /// Cod (#24): a remote restore that was cancelled before its workspace joined the window.
+    /// The window takes a new key and drops the saved membership, so closing it leaves the
+    /// saved window in the registry for the next start.
+    pub fn cod_release_restore_owner(&mut self) {
+        self.cod_window_key = crate::persistence::cod_new_window_key();
+        self.cod_unrestored_workspace_ids.clear();
+        self.cod_saved_order.clear();
+        self.cod_pending.clear();
+        self.cod_pending_remote.clear();
     }
 
     /// Used by the quit handler to ensure pending DB writes
@@ -1477,7 +2009,9 @@ impl MultiWorkspace {
     pub fn flush_serialization(&mut self, cx: &mut Context<Self>) -> Task<()> {
         self._serialize_task.take();
         let serialization = self.serialize_now(cx);
-        cx.spawn(async move |_, _| serialization.await)
+        cx.spawn(async move |_, _| {
+            serialization.await.log_err();
+        })
     }
 
     pub fn flush_pending_serialization(
@@ -1496,9 +2030,12 @@ impl MultiWorkspace {
         tasks
     }
 
+    /// Cod (#24): focuses the active item itself (or a zoomed panel), not the pane around it, so
+    /// typing works after a switch even while the platform window is inactive. An open modal
+    /// keeps its focus.
     pub fn focus_active_workspace(&self, window: &mut Window, cx: &mut App) {
-        let focus_handle = self.workspace().read(cx).fallback_focus_handle(window, cx);
-        window.focus(&focus_handle, cx);
+        let workspace = self.workspace().clone();
+        workspace.update(cx, |workspace, cx| workspace.cod_focus_restored(window, cx));
     }
 
     pub fn panel<T: Panel>(&self, cx: &App) -> Option<Entity<T>> {
@@ -1825,7 +2362,7 @@ impl MultiWorkspace {
                         continue;
                     }
                     if this.held_index(workspace).is_some() {
-                        this.detach_workspace(workspace, cx);
+                        this.detach_workspace_with_intent(workspace, intent, cx);
                         removed_any = true;
                     }
                 }
@@ -1875,7 +2412,7 @@ impl MultiWorkspace {
                         });
 
                     this.activate(replacement, None, window, cx);
-                    this.detach_workspace(&displayed_workspace, cx);
+                    this.detach_workspace_with_intent(&displayed_workspace, intent, cx);
                     removed_any = true;
                 } else if *this.workspace() != original_active
                     && !workspaces.contains(&original_active)
@@ -1915,11 +2452,13 @@ impl MultiWorkspace {
     pub fn open_project(
         &mut self,
         paths: Vec<PathBuf>,
-        open_mode: OpenMode,
+        _open_mode: OpenMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if self.multi_workspace_enabled(cx) {
+        // Cod (#24): the window always keeps its workspaces, whatever the AI setting, so opening
+        // a project adds a workspace and never runs the replacement close on a retained one.
+        {
             let empty_workspace = if self
                 .workspace()
                 .read(cx)
@@ -1970,24 +2509,6 @@ impl MultiWorkspace {
                 }
 
                 Ok(new_workspace)
-            })
-        } else {
-            let workspace = self.workspace().clone();
-            cx.spawn_in(window, async move |_this, cx| {
-                let should_continue = workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        workspace.prepare_to_close(crate::CloseIntent::ReplaceWindow, window, cx)
-                    })?
-                    .await?;
-                if should_continue {
-                    workspace
-                        .update_in(cx, |workspace, window, cx| {
-                            workspace.open_workspace_for_paths(open_mode, paths, window, cx)
-                        })?
-                        .await
-                } else {
-                    Ok(workspace)
-                }
             })
         }
     }
@@ -2079,6 +2600,11 @@ impl Render for MultiWorkspace {
                 .font(ui_font)
                 .text_color(text_color)
                 .on_action(cx.listener(Self::close_window))
+                .on_action(cx.listener(Self::new_workspace))
+                .on_action(cx.listener(Self::rename_workspace))
+                .on_action(cx.listener(Self::next_workspace))
+                .on_action(cx.listener(Self::previous_workspace))
+                .on_action(cx.listener(Self::close_workspace))
                 .when(self.multi_workspace_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
