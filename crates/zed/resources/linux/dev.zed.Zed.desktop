@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Cod
+GenericName=Text Editor
+Comment=A desktop workspace for agent-driven development.
+TryExec=cod-wayland.sh
+Exec=cod-wayland.sh
+Icon=cod
+StartupNotify=true
+StartupWMClass=dev.zed.Zed
+Categories=Utility;TextEditor;Development;IDE;
+Keywords=cod;

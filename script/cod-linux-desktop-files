@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# Puts Cod's launcher and icons into the Linux package folder given as the only argument (issue #57).
+# The layout follows stock Zed's Linux bundle: share/icons/hicolor/<size>/apps/cod.png and share/applications/<app id>.desktop.
+# The desktop file is named after the app id (dev.zed.Zed, the Wayland app_id and X11 WM_CLASS of a stable build),
+# so desktops match the running window to the launcher, and Icon=cod resolves to the hicolor icons.
+# The icons come from script/cod-app-icons and are checked in CI by .github/workflows/app-icons.yml.
+set -eu
+
+[ $# -eq 1 ] || { echo "usage: $0 <package folder>" >&2; exit 2; }
+dest=$1
+resources=$(cd "$(dirname "$0")/../crates/zed/resources" && pwd)
+
+mkdir -p "$dest/share/icons" "$dest/share/applications"
+cp -R "$resources/linux/hicolor" "$dest/share/icons/"
+cp "$resources/linux/dev.zed.Zed.desktop" "$dest/share/applications/dev.zed.Zed.desktop"
+chmod 755 "$dest/share/applications/dev.zed.Zed.desktop"
+find "$dest/share" -type f | sort
