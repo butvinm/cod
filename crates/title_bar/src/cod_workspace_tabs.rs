@@ -29,14 +29,22 @@ pub struct CodTabInfo {
     pub tooltip: String,
     /// Where the tab was drawn, None before it was drawn.
     pub bounds: Option<Bounds<Pixels>>,
+    /// Whether the last frame cut the name: the text after the "[ID]" was wider than the room
+    /// it got. A tab is cut both at the maximum width and when the title bar is too narrow for
+    /// all tabs at their full width.
+    pub cut: bool,
 }
 
 impl CodTabInfo {
-    /// Whether the name is cut: the tab is as wide as a tab gets.
+    /// Whether the name is cut in the last drawn frame.
     pub fn truncated(&self) -> bool {
-        self.bounds
-            .is_some_and(|bounds| f32::from(bounds.size.width) >= COD_TAB_MAX_WIDTH - 0.5)
+        self.cut
     }
+}
+
+/// Whether text of `text_width` is cut in a box of `room` (half a pixel of rounding allowed).
+fn is_cut(text_width: Pixels, room: Pixels) -> bool {
+    f32::from(text_width) > f32::from(room) + 0.5
 }
 
 /// The tabs and the "+" button as they were last drawn.
@@ -148,18 +156,66 @@ pub fn render_cod_workspace_tabs(
             status: Some(status),
             tooltip: name.clone(),
             bounds: None,
+            cut: false,
         });
 
         let (id, rest) = split_workspace_name(&name);
         let text_color = if is_active { active_text } else { inactive_text };
         let weak = weak.clone();
+        // The dot, the "[ID]" and the rest of the name. After layout the rest is measured
+        // against the room it got, to report whether the name was cut.
+        let rest_text: SharedString = rest.to_string().into();
+        let measured_layout = layout.clone();
+        let content = h_flex()
+            .min_w_0()
+            .gap_1()
+            .children(status_dot(status, index))
+            .when_some(id, |content, id| {
+                content.child(
+                    div()
+                        .flex_none()
+                        .child(Label::new(id.to_string()).color(Color::Custom(text_color))),
+                )
+            })
+            .when(!rest.is_empty(), |content| {
+                content.child(
+                    div().min_w_0().overflow_x_hidden().child(
+                        Label::new(rest_text.clone())
+                            .color(Color::Custom(text_color))
+                            .truncate(),
+                    ),
+                )
+            })
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(room) = bounds.last().filter(|_| !rest_text.is_empty()) else {
+                    return;
+                };
+                let style = window.text_style();
+                let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
+                let text_width = window
+                    .text_system()
+                    .shape_line(
+                        rest_text.clone(),
+                        font_size,
+                        &[gpui::TextRun {
+                            len: rest_text.len(),
+                            font: style.font(),
+                            color: style.color,
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                    .width();
+                if let Some(tab) = measured_layout.borrow_mut().tabs.get_mut(index) {
+                    tab.cut = is_cut(text_width, room.size.width);
+                }
+            });
         let tab = h_flex()
             .id(("cod-workspace-tab", index))
             .h_full()
             .min_w_0()
             .max_w(px(COD_TAB_MAX_WIDTH))
             .px_2()
-            .gap_1()
             .border_x_1()
             .text_color(text_color)
             .when(is_active, |tab| tab.bg(active_bg).border_color(border))
@@ -168,23 +224,7 @@ pub fn render_cod_workspace_tabs(
                     .hover(move |style| style.bg(hover_bg))
             })
             .cursor_pointer()
-            .children(status_dot(status, index))
-            .when_some(id, |tab, id| {
-                tab.child(
-                    div()
-                        .flex_none()
-                        .child(Label::new(id.to_string()).color(Color::Custom(text_color))),
-                )
-            })
-            .when(!rest.is_empty(), |tab| {
-                tab.child(
-                    div().min_w_0().overflow_x_hidden().child(
-                        Label::new(rest.to_string())
-                            .color(Color::Custom(text_color))
-                            .truncate(),
-                    ),
-                )
-            })
+            .child(content)
             .tooltip(Tooltip::text(name.clone()))
             .on_click(move |_, window, cx| {
                 weak.update(cx, |multi_workspace, cx| {
@@ -238,6 +278,14 @@ mod tests {
             (None, "Fix [PAY-1] later")
         );
         assert_eq!(split_workspace_name("[open"), (None, "[open"));
+    }
+
+    #[test]
+    fn text_wider_than_its_room_is_cut() {
+        assert!(is_cut(px(400.), px(80.)));
+        assert!(!is_cut(px(80.), px(80.)));
+        assert!(!is_cut(px(80.4), px(80.)));
+        assert!(is_cut(px(81.), px(80.)));
     }
 
     #[test]
