@@ -510,6 +510,8 @@ pub struct Markdown {
     context_menu_selected_markdown: Option<SharedString>,
     search_highlights: Rc<[Range<usize>]>,
     active_search_highlight: Option<usize>,
+    /// The link that has the keyboard focus (Cod #28), only used by elements with keyboard links.
+    focused_link: Option<RenderedLink>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -569,7 +571,13 @@ actions!(
         /// Copies the selected text to the clipboard.
         Copy,
         /// Copies the selected text as markdown to the clipboard.
-        CopyAsMarkdown
+        CopyAsMarkdown,
+        /// Moves the keyboard focus to the next link, in reading order (markdown with keyboard links only).
+        FocusNextLink,
+        /// Moves the keyboard focus to the previous link, in reading order (markdown with keyboard links only).
+        FocusPreviousLink,
+        /// Opens the link that has the keyboard focus, the same way a click on it does.
+        OpenFocusedLink
     ]
 );
 
@@ -705,6 +713,7 @@ impl Markdown {
             context_menu_selected_markdown: None,
             search_highlights: Rc::default(),
             active_search_highlight: None,
+            focused_link: None,
         };
         this.parse(cx);
         this
@@ -1128,6 +1137,37 @@ impl Markdown {
 
     pub fn active_search_highlight(&self) -> Option<usize> {
         self.active_search_highlight
+    }
+
+    /// The destination of the link that has the keyboard focus, if any (Cod #28).
+    pub fn focused_link_url(&self) -> Option<SharedString> {
+        self.focused_link
+            .as_ref()
+            .map(|link| link.destination_url.clone())
+    }
+
+    /// The source text of the link that has the keyboard focus, if any (Cod #28).
+    pub fn focused_link_text(&self) -> Option<&str> {
+        self.focused_link
+            .as_ref()
+            .and_then(|link| self.source.get(link.source_range.clone()))
+    }
+
+    /// Moves the keyboard focus to the next or previous link of `links` (in reading order).
+    /// The first move goes to the first link (forward) or the last one (backward); at either end the focus stays.
+    /// Returns false when there is no link to move to.
+    fn move_link_focus(&mut self, links: &[RenderedLink], forward: bool) -> bool {
+        let Some(next) = next_link_index(
+            links,
+            self.focused_link.as_ref().map(|link| &link.source_range),
+            forward,
+        ) else {
+            return false;
+        };
+        let link = links[next].clone();
+        self.autoscroll_request = Some(link.source_range.start);
+        self.focused_link = Some(link);
+        true
     }
 
     fn copy(&self, text: &RenderedText, _: &mut Window, cx: &mut Context<Self>) {
@@ -1725,6 +1765,8 @@ pub struct MarkdownElement {
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
     code_span_link: Option<CodeSpanLinkCallback>,
+    text_mention_link: Option<CodeSpanLinkCallback>,
+    keyboard_links: bool,
     on_source_click: Option<SourceClickCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
@@ -1752,6 +1794,8 @@ impl MarkdownElement {
             on_url_click: None,
             on_url_hover: None,
             code_span_link: None,
+            text_mention_link: None,
+            keyboard_links: false,
             on_source_click: None,
             on_checkbox_toggle: None,
             on_mermaid_zoom: None,
@@ -1826,6 +1870,21 @@ impl MarkdownElement {
         self
     }
 
+    /// Resolves plain-text tokens that look like file mentions (for example `src/invoice.rs:18`, outside code and links) to links, the way `on_code_span_link` does for inline code (Cod #28).
+    pub fn on_text_mention_link(
+        mut self,
+        callback: impl Fn(&str, &App) -> Option<SharedString> + 'static,
+    ) -> Self {
+        self.text_mention_link = Some(Arc::new(callback));
+        self
+    }
+
+    /// Lets the keyboard move between the links in reading order while the markdown has the focus (`markdown::FocusNextLink`, `FocusPreviousLink`, `OpenFocusedLink` in the `Markdown && keyboard_links` context), with a focus ring on the focused link (Cod #28).
+    pub fn keyboard_links(mut self) -> Self {
+        self.keyboard_links = true;
+        self
+    }
+
     pub fn on_source_click(
         mut self,
         handler: impl Fn(usize, usize, &mut Window, &mut App) -> bool + 'static,
@@ -1866,6 +1925,52 @@ impl MarkdownElement {
     pub fn scroll_handle(mut self, scroll_handle: ScrollHandle) -> Self {
         self.autoscroll = AutoscrollBehavior::Controlled(scroll_handle);
         self
+    }
+
+    /// Pushes a plain text run, turning the file mentions in it into links when `on_text_mention_link` resolves them (Cod #28).
+    fn push_markdown_text(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        text: &str,
+        range: Range<usize>,
+        cx: &App,
+    ) {
+        let callback = self.text_mention_link.as_ref().filter(|_| {
+            builder.code_block_stack.is_empty()
+                && builder.link_depth == 0
+                && !self.style.prevent_mouse_interaction
+        });
+        let Some(callback) = callback else {
+            builder.push_text(text, range);
+            return;
+        };
+        let mut cursor = 0;
+        for candidate in path_mention_candidates(text) {
+            let Some(url) = callback(&text[candidate.clone()], cx) else {
+                continue;
+            };
+            if candidate.start > cursor {
+                builder.push_text(
+                    &text[cursor..candidate.start],
+                    range.start + cursor..range.start + candidate.start,
+                );
+            }
+            let source_range = range.start + candidate.start..range.start + candidate.end;
+            builder.push_link(url.clone(), source_range.clone());
+            let link_style = self
+                .style
+                .link_callback
+                .as_ref()
+                .and_then(|callback| callback(url.as_ref(), cx))
+                .unwrap_or_else(|| self.style.link.clone());
+            builder.push_text_style(link_style);
+            builder.push_text(&text[candidate.clone()], source_range);
+            builder.pop_text_style();
+            cursor = candidate.end;
+        }
+        if cursor == 0 || cursor < text.len() {
+            builder.push_text(&text[cursor..], range.start + cursor..range.end);
+        }
     }
 
     fn push_markdown_code_span(
@@ -3223,7 +3328,12 @@ impl Element for MarkdownElement {
                     _ => log::debug!("unsupported markdown tag end: {:?}", tag),
                 },
                 MarkdownEvent::Text => {
-                    builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
+                    self.push_markdown_text(
+                        &mut builder,
+                        &parsed_markdown.source[range.clone()],
+                        range.clone(),
+                        cx,
+                    );
                 }
                 MarkdownEvent::SubstitutedText(text) => {
                     builder.push_text(text, range.clone());
@@ -3356,6 +3466,9 @@ impl Element for MarkdownElement {
     ) {
         let mut context = KeyContext::default();
         context.add("Markdown");
+        if self.keyboard_links {
+            context.add("keyboard_links");
+        }
         window.set_key_context(context);
 
         let markdown_focus_handle = self.markdown.read(cx).focus_handle.clone();
@@ -3393,8 +3506,92 @@ impl Element for MarkdownElement {
             }
         });
 
+        if self.keyboard_links {
+            self.paint_keyboard_link_listeners(&rendered_markdown.text, window);
+        }
+
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+
+        if self.keyboard_links {
+            self.paint_link_focus_ring(&rendered_markdown.text, window, cx);
+        }
+    }
+}
+
+impl MarkdownElement {
+    /// The actions of keyboard links (Cod #28). Without links, or without a focused link for `OpenFocusedLink`, the action goes on to the parents, so their keys keep working.
+    fn paint_keyboard_link_listeners(&self, text: &RenderedText, window: &mut Window) {
+        for (action, forward) in [
+            (std::any::TypeId::of::<crate::FocusNextLink>(), true),
+            (std::any::TypeId::of::<crate::FocusPreviousLink>(), false),
+        ] {
+            let entity = self.markdown.clone();
+            let links = text.links.clone();
+            window.on_action(action, move |_, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let moved = entity.update(cx, |markdown, cx| {
+                    let moved = markdown.move_link_focus(&links, forward);
+                    if moved {
+                        cx.notify();
+                    }
+                    moved
+                });
+                if !moved {
+                    cx.propagate();
+                }
+            });
+        }
+
+        let entity = self.markdown.clone();
+        let links = text.links.clone();
+        let on_open_url = self.on_url_click.clone();
+        window.on_action(
+            std::any::TypeId::of::<crate::OpenFocusedLink>(),
+            move |_, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let focused = entity.read(cx).focused_link.clone();
+                let Some(link) = focused.filter(|focused| links.contains(focused)) else {
+                    cx.propagate();
+                    return;
+                };
+                if let Some(on_open_url) = on_open_url.as_ref() {
+                    on_open_url(link.destination_url, window, cx);
+                } else {
+                    cx.open_url(&link.destination_url);
+                }
+            },
+        );
+    }
+
+    /// A ring around the link that has the keyboard focus, while the markdown has the focus (Cod #28).
+    fn paint_link_focus_ring(&self, text: &RenderedText, window: &mut Window, cx: &mut App) {
+        let markdown = self.markdown.read(cx);
+        if !markdown.focus_handle.is_focused(window) {
+            return;
+        }
+        let Some(link) = markdown
+            .focused_link
+            .as_ref()
+            .filter(|focused| text.links.contains(focused))
+        else {
+            return;
+        };
+        let ring_color = cx.theme().colors().border_focused;
+        for bounds in text.bounds_for_source_range(link.source_range.clone()) {
+            window.paint_quad(quad(
+                bounds.dilate(px(1.)),
+                px(2.),
+                Hsla::transparent_black(),
+                Edges::all(px(1.)),
+                ring_color,
+                BorderStyle::Solid,
+            ));
+        }
     }
 }
 
@@ -4755,6 +4952,58 @@ struct WrappedLineSegment {
 struct RenderedLink {
     source_range: Range<usize>,
     destination_url: SharedString,
+}
+
+/// The index of the link the keyboard focus moves to from the link at `current` (Cod #28).
+/// Without a focused link, forward starts at the first link and backward at the last; at either end the focus stays.
+fn next_link_index(
+    links: &[RenderedLink],
+    current: Option<&Range<usize>>,
+    forward: bool,
+) -> Option<usize> {
+    let last = links.len().checked_sub(1)?;
+    let position =
+        current.and_then(|range| links.iter().position(|link| &link.source_range == range));
+    Some(match (position, forward) {
+        (None, true) => 0,
+        (None, false) => last,
+        (Some(index), true) => (index + 1).min(last),
+        (Some(index), false) => index.saturating_sub(1),
+    })
+}
+
+/// The ranges of the tokens of a plain text run that may be file mentions, like `src/invoice.rs:18` (Cod #28).
+/// Surrounding brackets, quotes and trailing punctuation are left out. The caller resolves each candidate against the project, so only tokens that name a file become links.
+fn path_mention_candidates(text: &str) -> Vec<Range<usize>> {
+    const LEADING: &[char] = &['(', '[', '{', '<', '"', '\'', '`'];
+    const TRAILING: &[char] = &[
+        '.', ',', ';', ':', ')', ']', '}', '>', '"', '\'', '`', '!', '?',
+    ];
+    let mut candidates = Vec::new();
+    for token in text.split_whitespace() {
+        let start = token.as_ptr() as usize - text.as_ptr() as usize;
+        let without_leading = token.trim_start_matches(LEADING);
+        let lead = token.len() - without_leading.len();
+        let trimmed = without_leading.trim_end_matches(TRAILING);
+        if is_path_mention(trimmed) {
+            candidates.push(start + lead..start + lead + trimmed.len());
+        }
+    }
+    candidates
+}
+
+fn is_path_mention(token: &str) -> bool {
+    if token.len() < 3 || token.contains("://") {
+        return false;
+    }
+    if !token
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '\\' | ':' | '~' | '+' | '@'))
+    {
+        return false;
+    }
+    let path = token.split(':').next().unwrap_or_default();
+    (path.contains('/') || path.contains('.')) && path.chars().any(|c| c.is_alphabetic())
 }
 
 #[derive(Clone)]
@@ -7262,6 +7511,90 @@ mod tests {
 
         assert_eq!(rendered.links.len(), 1);
         assert_eq!(rendered.links[0].destination_url, "https://example.com");
+    }
+
+    #[test]
+    fn test_path_mention_candidates() {
+        let text = "Rounding is in src/invoice.rs:18, see (README.md) at 12:30 or e.g. https://example.com/a.rs.";
+        let candidates: Vec<&str> = path_mention_candidates(text)
+            .into_iter()
+            .map(|range| &text[range])
+            .collect();
+        assert_eq!(candidates, ["src/invoice.rs:18", "README.md", "e.g"]);
+        assert!(path_mention_candidates("plain words only").is_empty());
+        assert_eq!(
+            path_mention_candidates("`src/main.rs:10:5`."),
+            [1..17],
+            "quotes and trailing punctuation are left out"
+        );
+    }
+
+    #[test]
+    fn test_next_link_index_moves_in_reading_order_and_stops_at_the_ends() {
+        let link = |start: usize| RenderedLink {
+            source_range: start..start + 3,
+            destination_url: "https://example.com".into(),
+        };
+        let links = [link(0), link(10), link(20)];
+        assert_eq!(next_link_index(&links, None, true), Some(0));
+        assert_eq!(next_link_index(&links, None, false), Some(2));
+        assert_eq!(next_link_index(&links, Some(&(0..3)), true), Some(1));
+        assert_eq!(next_link_index(&links, Some(&(10..13)), true), Some(2));
+        assert_eq!(next_link_index(&links, Some(&(20..23)), true), Some(2));
+        assert_eq!(next_link_index(&links, Some(&(10..13)), false), Some(0));
+        assert_eq!(next_link_index(&links, Some(&(0..3)), false), Some(0));
+        assert_eq!(next_link_index(&[], None, true), None);
+    }
+
+    struct TextMentionTestView {
+        markdown: Entity<Markdown>,
+        rendered_text: Rc<RefCell<Option<RenderedText>>>,
+    }
+
+    impl Render for TextMentionTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            CapturingMarkdownElement {
+                markdown_element: MarkdownElement::new(
+                    self.markdown.clone(),
+                    MarkdownStyle::default(),
+                )
+                .on_text_mention_link(|text, _cx| {
+                    (text == "src/invoice.rs:18").then(|| "file:///repo/src/invoice.rs#L18".into())
+                }),
+                rendered_text: self.rendered_text.clone(),
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_plain_text_file_mentions_become_links_in_reading_order(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "Rounding is in src/invoice.rs:18. See https://tracker.example.com/PAY-1234.\n\n```\nsrc/invoice.rs:18\n```\n";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+        let rendered_text = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let rendered_text = rendered_text.clone();
+            move |_, _| TextMentionTestView {
+                markdown,
+                rendered_text,
+            }
+        });
+        cx.run_until_parked();
+        let rendered = rendered_text.borrow().clone().expect("markdown should render");
+
+        let mention = source.find("src/invoice.rs:18").unwrap();
+        assert_eq!(rendered.links.len(), 2, "the mention in the code block is no link");
+        assert_eq!(rendered.links[0].destination_url, "file:///repo/src/invoice.rs#L18");
+        assert_eq!(rendered.links[0].source_range, mention..mention + 17);
+        assert_eq!(
+            rendered.links[1].destination_url,
+            "https://tracker.example.com/PAY-1234"
+        );
+        assert_eq!(
+            rendered.text_for_range(0..source.find(" See").unwrap()),
+            "Rounding is in src/invoice.rs:18."
+        );
     }
 
     #[gpui::test]

@@ -14,6 +14,7 @@ path = "src/cod_e2e_driver.rs"
 doctest = false
 
 [dependencies]
+agent_ui.workspace = true
 anyhow.workspace = true
 command_palette.workspace = true
 editor.workspace = true

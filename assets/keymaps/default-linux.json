@@ -178,6 +178,21 @@
     },
   },
   {
+    // Cod #28: links in agent replies are reachable and openable from the keyboard.
+    "context": "Markdown && keyboard_links",
+    "bindings": {
+      "tab": "markdown::FocusNextLink",
+      "shift-tab": "markdown::FocusPreviousLink",
+      "enter": "markdown::OpenFocusedLink",
+    },
+  },
+  {
+    "context": "AcpThread > Markdown",
+    "bindings": {
+      "escape": "agent::FocusMessageEditor",
+    },
+  },
+  {
     "context": "Editor && jupyter",
     "bindings": {
       "ctrl-shift-enter": "repl::Run",
@@ -598,6 +613,13 @@
       "ctrl-alt-shift-c": "editor::DisplayCursorNames",
       "alt-.": "editor::GoToHunk",
       "alt-,": "editor::GoToPreviousHunk",
+    },
+  },
+  {
+    // Cod #28: from the agent message box up into the newest reply (after "Editor", so it wins over editor::MoveLineUp), like git_panel::FocusChanges from the commit message.
+    "context": "AcpThread > Editor",
+    "bindings": {
+      "alt-up": "agent::FocusLastReply",
     },
   },
   {

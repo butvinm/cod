@@ -7331,6 +7331,53 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// The markdown of the newest agent reply in the transcript (Cod #28).
+    pub fn cod_last_reply_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::AssistantMessage(message) => {
+                    message.chunks.iter().rev().find_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            block.markdowns().last().cloned()
+                        }
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                }
+                _ => None,
+            })
+    }
+
+    /// Moves the keyboard focus into the newest agent reply, so Tab and Shift-Tab reach its links (Cod #28).
+    /// Without a reply the action goes on to the parents.
+    fn focus_last_reply(
+        &mut self,
+        _: &FocusLastReply,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(markdown) = self.cod_last_reply_markdown(cx) else {
+            cx.propagate();
+            return;
+        };
+        self.list_state.scroll_to_end();
+        window.focus(&markdown.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn focus_message_editor(
+        &mut self,
+        _: &FocusMessageEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.message_editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
     fn scroll_output_line_up(
         &mut self,
         _: &ScrollOutputLineUp,
@@ -12749,6 +12796,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::open_add_context_menu))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
+            .on_action(cx.listener(Self::focus_last_reply))
+            .on_action(cx.listener(Self::focus_message_editor))
             .on_action(cx.listener(Self::scroll_output_line_up))
             .on_action(cx.listener(Self::scroll_output_line_down))
             .on_action(cx.listener(Self::scroll_output_to_top))

@@ -43,6 +43,8 @@ pub use multi_workspace::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
 pub use multi_workspace::cod_set_workspace_name;
+// Cod (#28): agent chats of a closed workspace, and the fresh chat of a new workspace.
+pub use multi_workspace::{cod_set_workspace_removed_hook, cod_take_fresh_chat};
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,

@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+pub mod cod_chat_status;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -71,7 +72,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CodChatSnapshot, CodFocusedLink,
+    TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -307,6 +309,10 @@ actions!(
         ScrollOutputPageUp,
         /// Scroll the output by one page down.
         ScrollOutputPageDown,
+        /// Moves the keyboard focus from the message box into the newest agent reply, where Tab and Shift-Tab move between its links (Cod #28).
+        FocusLastReply,
+        /// Moves the keyboard focus back to the message box.
+        FocusMessageEditor,
         /// Scroll the output up by three lines.
         ScrollOutputLineUp,
         /// Scroll the output down by three lines.
@@ -615,6 +621,17 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    // Cod (#28): a workspace that leaves its window for good takes its agent chats with it.
+    workspace::cod_set_workspace_removed_hook(
+        |workspace_id, cx| {
+            if let Some(store) = thread_metadata_store::ThreadMetadataStore::try_global(cx) {
+                store.update(cx, |store, cx| {
+                    store.cod_delete_workspace_chats(i64::from(workspace_id), cx)
+                });
+            }
+        },
+        cx,
+    );
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

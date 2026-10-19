@@ -40,6 +40,8 @@ pub use cod_workspaces::{
 };
 pub(crate) use cod_workspaces::init_workspace_names;
 pub use cod_workspaces::cod_set_workspace_name;
+// Cod (#28): agent chats of a closed workspace, and the fresh chat of a new workspace.
+pub use cod_workspaces::{cod_set_workspace_removed_hook, cod_take_fresh_chat};
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
@@ -1730,6 +1732,8 @@ impl MultiWorkspace {
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
                 cod_status::cod_forget_workspace_status(workspace_id, cx);
+                // Cod (#28): the workspace's agent chats go with it.
+                cod_workspaces::run_workspace_removed_hook(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);

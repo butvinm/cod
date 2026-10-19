@@ -107,6 +107,34 @@ use workspace::{
 const AGENT_PANEL_KEY: &str = "agent_panel";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
 const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
+
+/// What the active chat of a panel shows (`AgentPanel::cod_chat_snapshot`), for Cod's end-to-end driver (Cod #28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodChatSnapshot {
+    /// The id of the chat's agent, for example `claude-acp`.
+    pub agent: String,
+    /// The provider's own session id of the chat.
+    pub session_id: String,
+    /// What the chat is doing (Cod's local status until the status contract of PR #65 lands).
+    pub status: crate::cod_chat_status::CodChatStatus,
+    /// The thread title, once there is one.
+    pub title: Option<String>,
+    /// The whole transcript as markdown.
+    pub transcript: String,
+    /// Whether an agent reply holds the keyboard focus.
+    pub reply_focused: bool,
+    /// The link of that reply that has the keyboard focus.
+    pub focused_link: Option<CodFocusedLink>,
+}
+
+/// The link of an agent reply that has the keyboard focus (Cod #28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodFocusedLink {
+    /// The link as the reply's markdown source writes it, for example `src/invoice.rs:18`.
+    pub text: String,
+    /// Where it leads, for example a `file://` url with the line.
+    pub url: String,
+}
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1140,6 +1168,9 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+    /// Cod (#28): the fresh chat of a new workspace waits for the workspace's first folder.
+    cod_fresh_chat_pending: bool,
+    _cod_fresh_chat_subscription: Option<Subscription>,
 }
 
 impl AgentPanel {
@@ -1207,6 +1238,23 @@ impl AgentPanel {
             .draft_thread
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
+
+        // Cod (#28): the active chat belongs to this panel's workspace, keyed by the provider's
+        // session id. Drafts have no session id yet and are assigned at a later save.
+        if let Some(session_id) = last_active_thread
+            .as_ref()
+            .and_then(|thread| thread.session_id.clone())
+            && let Some(store) = ThreadMetadataStore::try_global(cx)
+        {
+            store
+                .read(cx)
+                .cod_assign_chat(
+                    &acp::SessionId::new(session_id),
+                    i64::from(workspace_id),
+                    cx,
+                )
+                .detach_and_log_err(cx);
+        }
 
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
@@ -1441,6 +1489,21 @@ impl AgentPanel {
                 panel
             })?;
 
+            // Cod (#28): a workspace made by "workspace: new workspace" opens with a fresh chat of
+            // the default agent in its agent panel, so opening the panel lands in it ready for
+            // typing. It never takes the focus: the user may already be in the command palette,
+            // the path picker or another panel of the new workspace (#24).
+            let fresh_chat = cx
+                .update(|_window, cx| workspace::cod_take_fresh_chat(workspace.entity_id(), cx))
+                .unwrap_or(false);
+            if fresh_chat {
+                panel
+                    .update_in(cx, |panel, window, cx| {
+                        panel.cod_watch_for_fresh_chat(window, cx)
+                    })
+                    .ok();
+            }
+
             Ok(panel)
         })
     }
@@ -1561,6 +1624,8 @@ impl AgentPanel {
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
             is_active: false,
+            cod_fresh_chat_pending: false,
+            _cod_fresh_chat_subscription: None,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -2938,6 +3003,45 @@ impl AgentPanel {
         self.project.read(cx).visible_worktrees(cx).next().is_some()
     }
 
+    /// Cod (#28): starts the fresh chat of a new workspace now if its project has a folder, else
+    /// as soon as the first folder is added. Zed's agent panel holds chats only for a project
+    /// with a folder, and a new workspace opens without folders (#24).
+    fn cod_watch_for_fresh_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cod_fresh_chat_pending = true;
+        if self.cod_start_fresh_chat(window, cx) {
+            return;
+        }
+        let project = self.project.clone();
+        self._cod_fresh_chat_subscription = Some(cx.subscribe_in(
+            &project,
+            window,
+            |this, _project, event: &project::Event, window, cx| match event {
+                project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeOrderChanged
+                | project::Event::WorktreePathsChanged { .. } => {
+                    this.cod_start_fresh_chat(window, cx);
+                }
+                _ => {}
+            },
+        ));
+    }
+
+    /// Cod (#28): opens the pending fresh chat of the selected agent without moving the focus.
+    /// Returns false while the project has no folder yet.
+    fn cod_start_fresh_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.cod_fresh_chat_pending {
+            return true;
+        }
+        if !self.has_open_project(cx) {
+            return false;
+        }
+        self.cod_fresh_chat_pending = false;
+        self._cod_fresh_chat_subscription = None;
+        self.activate_draft(false, AgentThreadSource::AgentPanel, window, cx);
+        cx.notify();
+        true
+    }
+
     fn ensure_native_agent_connection(&self, cx: &mut Context<Self>) {
         if !self.has_open_project(cx) {
             return;
@@ -4124,6 +4228,49 @@ impl AgentPanel {
             }
             _ => None,
         }
+    }
+
+    /// What the active chat shows, read only, for Cod's end-to-end driver (Cod #28).
+    pub fn cod_chat_snapshot(&self, window: &Window, cx: &App) -> Option<CodChatSnapshot> {
+        let thread = self.active_agent_thread(cx)?;
+        let thread = thread.read(cx);
+        let focused_markdown = thread
+            .entries()
+            .iter()
+            .flat_map(|entry| match entry {
+                acp_thread::AgentThreadEntry::AssistantMessage(message) => message
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| match chunk {
+                        acp_thread::AssistantMessageChunk::Message { block, .. }
+                        | acp_thread::AssistantMessageChunk::Thought { block, .. } => {
+                            block.markdowns().cloned().collect::<Vec<_>>()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .find(|markdown| markdown.read(cx).focus_handle(cx).is_focused(window));
+        let focused_link = focused_markdown.as_ref().and_then(|markdown| {
+            let markdown = markdown.read(cx);
+            Some(CodFocusedLink {
+                text: markdown.focused_link_text()?.to_string(),
+                url: markdown.focused_link_url()?.to_string(),
+            })
+        });
+        let agent = self
+            .active_conversation_view()
+            .map(|conversation| conversation.read(cx).agent_key().id().0.to_string())
+            .unwrap_or_default();
+        Some(CodChatSnapshot {
+            agent,
+            session_id: thread.session_id().0.to_string(),
+            status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
+            title: thread.title().map(|title| title.to_string()),
+            transcript: thread.to_markdown(cx),
+            reply_focused: focused_markdown.is_some(),
+            focused_link,
+        })
     }
 
     pub fn is_retained_thread(&self, id: &ThreadId) -> bool {
