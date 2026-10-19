@@ -252,7 +252,11 @@ impl OffscreenView {
             view
         });
         pages::register(page_id, &view, cx);
-        view.update(cx, |view, cx| view.publish_status(cx));
+        // Deferred: a page is often built inside an update of its workspace (opening a link), and the workspace cannot be read until that update ends.
+        cx.defer({
+            let view = view.clone();
+            move |cx| view.update(cx, |view, cx| view.publish_status(cx))
+        });
         view
     }
 
