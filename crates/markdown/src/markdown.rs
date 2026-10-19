@@ -512,6 +512,18 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
     /// The link that has the keyboard focus (Cod #28), only used by elements with keyboard links.
     focused_link: Option<RenderedLink>,
+    /// The links of the last painted frame with their window bounds, for the end-to-end driver's
+    /// click target (Cod #32). Kept independent of `keyboard_links`, which only some surfaces opt
+    /// into (a chat reply, not the markdown preview).
+    cod_link_bounds: Vec<CodLinkBounds>,
+}
+
+/// One link's destination and the window bounds it was drawn at in the last painted frame, None
+/// before the first paint (Cod #32 end-to-end driver, see `Markdown::cod_link_bounds`).
+#[derive(Debug, Clone)]
+pub struct CodLinkBounds {
+    pub url: SharedString,
+    pub bounds: Option<Bounds<Pixels>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -714,6 +726,7 @@ impl Markdown {
             search_highlights: Rc::default(),
             active_search_highlight: None,
             focused_link: None,
+            cod_link_bounds: Vec::new(),
         };
         this.parse(cx);
         this
@@ -1137,6 +1150,14 @@ impl Markdown {
 
     pub fn active_search_highlight(&self) -> Option<usize> {
         self.active_search_highlight
+    }
+
+    /// The links of the last painted frame with their window bounds, keyed by destination URL
+    /// (Cod #32). The end-to-end driver has no other way to find where a link was drawn inside a
+    /// chat reply or a markdown preview, so this is its click target for a real mouse click on
+    /// the link, as opposed to invoking its handler directly.
+    pub fn cod_link_bounds(&self) -> &[CodLinkBounds] {
+        &self.cod_link_bounds
     }
 
     /// The destination of the link that has the keyboard focus, if any (Cod #28).
@@ -3516,6 +3537,7 @@ impl Element for MarkdownElement {
         if self.keyboard_links {
             self.paint_link_focus_ring(&rendered_markdown.text, window, cx);
         }
+        self.record_cod_link_bounds(&rendered_markdown.text, cx);
     }
 }
 
@@ -3592,6 +3614,25 @@ impl MarkdownElement {
                 BorderStyle::Solid,
             ));
         }
+    }
+
+    /// Records where each link was drawn, for the end-to-end driver's click target in a chat
+    /// reply (#32 AC1) and the markdown preview (#32 AC2). A link can wrap onto more than one
+    /// visual line; its bounds are the union of all of them, wide enough to click anywhere on it.
+    fn record_cod_link_bounds(&self, text: &RenderedText, cx: &mut App) {
+        let links: Vec<CodLinkBounds> = text
+            .links
+            .iter()
+            .map(|link| CodLinkBounds {
+                url: link.destination_url.clone(),
+                bounds: text
+                    .bounds_for_source_range(link.source_range.clone())
+                    .into_iter()
+                    .reduce(|a, b| a.union(&b)),
+            })
+            .collect();
+        self.markdown
+            .update(cx, |markdown, _cx| markdown.cod_link_bounds = links);
     }
 }
 

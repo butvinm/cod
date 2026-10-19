@@ -127,6 +127,13 @@ enum PreviewLinkTarget {
 }
 
 impl MarkdownPreviewView {
+    /// The links of the last painted frame with their window bounds (Cod #32): the end-to-end
+    /// driver's click target for a real mouse click on a link the preview draws, since it has no
+    /// other way to find where the link was drawn.
+    pub fn cod_link_bounds(&self, cx: &App) -> Vec<markdown::CodLinkBounds> {
+        self.markdown.read(cx).cod_link_bounds().to_vec()
+    }
+
     pub fn register(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         cx.default_global::<SuppressedAutoPreviews>();
         let workspace_entity = cx.entity();
