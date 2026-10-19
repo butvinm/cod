@@ -34,6 +34,8 @@ pub use cod_workspaces::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
 pub(crate) use cod_workspaces::init_workspace_names;
+// Cod (#28): agent chats of a closed workspace.
+pub use cod_workspaces::cod_set_workspace_removed_hook;
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
@@ -1723,6 +1725,8 @@ impl MultiWorkspace {
             let kvp = db::kvp::KeyValueStore::global(cx);
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
+                // Cod (#28): the workspace's agent chats go with it.
+                cod_workspaces::run_workspace_removed_hook(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);

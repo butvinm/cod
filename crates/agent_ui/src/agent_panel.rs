@@ -1232,6 +1232,23 @@ impl AgentPanel {
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
 
+        // Cod (#28): the active chat belongs to this panel's workspace, keyed by the provider's
+        // session id. Drafts have no session id yet and are assigned at a later save.
+        if let Some(session_id) = last_active_thread
+            .as_ref()
+            .and_then(|thread| thread.session_id.clone())
+            && let Some(store) = ThreadMetadataStore::try_global(cx)
+        {
+            store
+                .read(cx)
+                .cod_assign_chat(
+                    &acp::SessionId::new(session_id),
+                    i64::from(workspace_id),
+                    cx,
+                )
+                .detach_and_log_err(cx);
+        }
+
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(

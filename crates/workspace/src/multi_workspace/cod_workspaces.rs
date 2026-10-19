@@ -219,6 +219,30 @@ pub(super) async fn delete_stored_workspace_name(
     kvp.scoped(NAMES_SCOPE).delete(name_key(id)).await
 }
 
+/// Cod (#28) hook: what else goes when a workspace leaves its window for good, next to its name.
+/// The agent panel registers the deletion of the workspace's chats (agent_ui crate).
+struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(WorkspaceId, &mut App)>);
+
+impl Global for CodWorkspaceRemovedHook {}
+
+/// Cod (#28): registers what runs when a workspace leaves its window for good.
+pub fn cod_set_workspace_removed_hook(
+    hook: impl Fn(WorkspaceId, &mut App) + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(CodWorkspaceRemovedHook(std::rc::Rc::new(hook)));
+}
+
+/// Cod (#28): runs the registered hook for a workspace that left its window for good.
+pub(super) fn run_workspace_removed_hook(id: WorkspaceId, cx: &mut App) {
+    if let Some(hook) = cx
+        .try_global::<CodWorkspaceRemovedHook>()
+        .map(|hook| hook.0.clone())
+    {
+        hook(id, cx);
+    }
+}
+
 /// The field of "workspace: rename workspace": it proposes the current name, enter saves the
 /// typed text, escape keeps the old name.
 pub struct RenameWorkspaceModal {

@@ -37,6 +37,8 @@ pub use multi_workspace::{
 pub use multi_workspace::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
+// Cod (#28): agent chats of a closed workspace.
+pub use multi_workspace::cod_set_workspace_removed_hook;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,

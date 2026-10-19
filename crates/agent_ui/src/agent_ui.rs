@@ -620,6 +620,17 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
+    // Cod (#28): a workspace that leaves its window for good takes its agent chats with it.
+    workspace::cod_set_workspace_removed_hook(
+        |workspace_id, cx| {
+            if let Some(store) = thread_metadata_store::ThreadMetadataStore::try_global(cx) {
+                store.update(cx, |store, cx| {
+                    store.cod_delete_workspace_chats(i64::from(workspace_id), cx)
+                });
+            }
+        },
+        cx,
+    );
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
