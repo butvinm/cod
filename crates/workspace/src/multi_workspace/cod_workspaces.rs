@@ -255,7 +255,7 @@ pub(super) fn run_workspace_removed_hook(id: WorkspaceId, cx: &mut App) {
         .try_global::<CodWorkspaceRemovedHook>()
         .map(|hook| hook.0.clone())
     {
-        hook(id, cx);
+        (*hook)(id, cx);
     }
 }
 
