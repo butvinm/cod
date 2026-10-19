@@ -259,6 +259,42 @@ pub(super) fn run_workspace_removed_hook(id: WorkspaceId, cx: &mut App) {
     }
 }
 
+/// Cod (#25 review): each window's most recent explicit "show this workspace" request, as a
+/// stamp that grows by one on every such request, whether it names a pending member to load or
+/// a loaded one to switch to, and whether or not it changes which workspace ends up shown.
+///
+/// `MultiWorkspace::active_workspace_id` alone cannot tell a fresh request apart from no request
+/// at all: a click on the workspace that is already active leaves it unchanged (`activate` returns
+/// early without touching it). A pending member's background load must still be able to tell
+/// whether some request, for it or any other member, arrived while it ran, so that request's
+/// completion (also when it wakes from waiting its turn behind another member's load, and however
+/// it was asked for: a tab click, a path opened from the CLI, or a saved window being restored)
+/// can tell a stale load from the newest one and never override the newest request's result
+/// (`cod_show_member`, `cod_activate_pending`; #25 AC5,
+/// `test_ac5_newest_click_wins_over_a_still_loading_tabs_completion`). Keyed by the window's
+/// `MultiWorkspace` entity, since each window's requests are independent.
+#[derive(Default)]
+struct CodActivationIntents(RefCell<HashMap<gpui::EntityId, u64>>);
+
+impl Global for CodActivationIntents {}
+
+impl CodActivationIntents {
+    /// Records a fresh activation request for `window` and returns its stamp.
+    fn bump(cx: &mut App, window: gpui::EntityId) -> u64 {
+        let mut map = cx.default_global::<CodActivationIntents>().0.borrow_mut();
+        let next = map.get(&window).copied().unwrap_or(0) + 1;
+        map.insert(window, next);
+        next
+    }
+
+    /// The stamp of the most recent activation request for `window`, 0 when none was made yet.
+    fn current(cx: &App, window: gpui::EntityId) -> u64 {
+        cx.try_global::<CodActivationIntents>()
+            .map(|intents| intents.0.borrow().get(&window).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
 /// The field of "workspace: rename workspace": it proposes the current name, enter saves the
 /// typed text, escape keeps the old name.
 pub struct RenameWorkspaceModal {
@@ -611,12 +647,16 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
+        // Cod (#25 review): this call is itself a fresh "show this workspace" request, however
+        // it was asked for (a tab click through `cod_show_member`, a path opened from the CLI,
+        // or retrying a queued request once its turn comes around below): bump the window's
+        // activation intent and keep this request's own stamp, so its completion can tell
+        // whether a still newer request (for this id again, or any other) arrived first.
+        let window_entity = cx.entity_id();
+        let activation_intent = CodActivationIntents::bump(cx, window_entity);
         if self.cod_materializing {
             // Another member is loading: wait for it, then load or show this one by its id.
             // Success is never reported for a member that was not shown.
-            // Cod (#25 review): the window's active workspace right now, so that waking up does
-            // not switch to this one's workspace if a newer activation ran while it waited.
-            let activation_intent = self.active_workspace_id.get();
             let (done_tx, done_rx) = futures::channel::oneshot::channel();
             self.cod_materialize_waiters.push(done_tx);
             return cx.spawn_in(window, async move |this, cx| {
@@ -632,7 +672,8 @@ impl MultiWorkspace {
                         .find(|workspace| workspace.read(cx).database_id() == Some(id));
                     match loaded {
                         Some(workspace) => {
-                            if this.active_workspace_id.get() == activation_intent
+                            let window_entity = cx.entity_id();
+                            if CodActivationIntents::current(cx, window_entity) == activation_intent
                                 && *this.workspace() != workspace
                             {
                                 this.activate(workspace, None, window, cx);
@@ -654,10 +695,6 @@ impl MultiWorkspace {
         };
         let order: Vec<WorkspaceId> = self.cod_saved_workspace_ids(cx);
         let app_state = self.workspace().read(cx).app_state().clone();
-        // Cod (#25 review): the window's active workspace right now, so the load's completion
-        // can tell whether a newer user intent (a click on another, already loaded workspace)
-        // arrived while this one was loading.
-        let activation_intent = self.active_workspace_id.get();
         self.cod_materializing = true;
         cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = if let Some(connection) = remote {
@@ -711,10 +748,14 @@ impl MultiWorkspace {
                         this.cod_unrestored_workspace_ids
                             .retain(|other| *other != id);
                         this.cod_order_workspaces(&order, cx);
-                        // Cod (#25 review): keep the newest user intent. A click on another,
-                        // already loaded workspace may have run while this one was loading; stay
-                        // there instead of switching back to the one that just finished loading.
-                        if this.active_workspace_id.get() == activation_intent {
+                        // Cod (#25 review): keep the newest user intent. A request for another
+                        // workspace (one already loaded, so `activate`'s early return left
+                        // `active_workspace_id` unchanged even if it names the one already shown,
+                        // or another pending one now loading in its place) may have run while
+                        // this one was loading; stay there instead of switching back to the one
+                        // that just finished loading.
+                        let window_entity = cx.entity_id();
+                        if CodActivationIntents::current(cx, window_entity) == activation_intent {
                             if *this.workspace() != workspace {
                                 this.activate(workspace.clone(), None, window, cx);
                             }
@@ -979,6 +1020,12 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Cod (#25 review): a fresh request even when `member` is the one already shown, so a
+        // pending member loading elsewhere knows a newer request came in (see
+        // `CodActivationIntents` and `cod_activate_pending`, which bumps again for its own
+        // request when `member` is pending: that is still the authoritative stamp for its load).
+        let window_entity = cx.entity_id();
+        CodActivationIntents::bump(cx, window_entity);
         match member {
             CodMember::Live(workspace) => self.activate(workspace, None, window, cx),
             CodMember::Pending(id) => self
