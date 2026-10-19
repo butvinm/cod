@@ -32,6 +32,10 @@ url.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[dev-dependencies]
+# The page table's `static_connection!` declares `open_test_db` under cfg(test), which needs the helper of `db`.
+db = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
 # The spike driver checks which modal opened.
