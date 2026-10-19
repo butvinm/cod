@@ -366,6 +366,19 @@ impl OffscreenView {
         }
     }
 
+    /// Starts the browser of a page that is not drawn, hidden, so it loads without painting. It shows, without a reload, when its tab is drawn.
+    fn start_hidden(&mut self, bounds: Bounds<Pixels>, scale: f32, cx: &mut Context<Self>) {
+        if self.browser_started {
+            return;
+        }
+        self.hidden.set(true);
+        self.start_browser(bounds, scale);
+        if let Some(page) = &self.page {
+            page.set_hidden(true);
+        }
+        cx.notify();
+    }
+
     pub fn page_id(&self) -> &PageId {
         &self.page_id
     }
@@ -475,6 +488,10 @@ impl OffscreenView {
                 log::info!("web_view: browser view created");
                 if let Some(page) = &self.page {
                     page.set_focus(self.focus_handle.is_focused(window));
+                    // A hide sent before the view existed was dropped by the helper: send it again.
+                    if self.hidden.get() {
+                        page.set_hidden(true);
+                    }
                 }
             }
             PageEvent::Closed => {}
@@ -698,6 +715,33 @@ fn function_key_number(key: &str) -> Option<i32> {
     (1..=12).contains(&number).then_some(number)
 }
 
+/// When a page is drawn, its workspace is the one shown: start the browsers of the workspace's other page tabs that have none yet, hidden (#31 AC5).
+/// So the inactive page tabs of a restored workspace load again like the ones in front, while pages of workspaces that are not shown still start none.
+fn start_pages_beside(page: &Entity<OffscreenView>, bounds: Bounds<Pixels>, scale: f32, cx: &mut App) {
+    let Some(workspace) = page
+        .read(cx)
+        .workspace
+        .as_ref()
+        .and_then(|workspace| workspace.upgrade())
+    else {
+        return;
+    };
+    let waiting: Vec<Entity<OffscreenView>> = workspace
+        .read(cx)
+        .panes()
+        .iter()
+        .flat_map(|pane| pane.read(cx).items_of_type::<OffscreenView>().collect::<Vec<_>>())
+        .filter(|other| other != page && !other.read(cx).browser_started)
+        .collect();
+    for other in waiting {
+        log::info!(
+            "web_view: {} is a tab of the shown workspace, starting its browser hidden",
+            other.read(cx).page_id
+        );
+        other.update(cx, |other, cx| other.start_hidden(bounds, scale, cx));
+    }
+}
+
 fn page_point(position: Point<Pixels>, bounds: Bounds<Pixels>) -> (i32, i32) {
     (
         f32::from(position.x - bounds.origin.x) as i32,
@@ -913,6 +957,7 @@ impl Render for OffscreenView {
                         let page = page.clone();
                         let pane_bounds = pane_bounds.clone();
                         move |bounds, window, cx| {
+                            let mut drawn_first = false;
                             if needs_browser
                                 && bounds.size.width > px(0.0)
                                 && bounds.size.height > px(0.0)
@@ -923,6 +968,7 @@ impl Render for OffscreenView {
                                     cx.notify();
                                 })
                                 .log_err();
+                                drawn_first = true;
                             }
                             if pane_bounds.get() != bounds {
                                 log::info!(
@@ -932,11 +978,19 @@ impl Render for OffscreenView {
                                 );
                                 pane_bounds.set(bounds);
                             }
-                            if hidden.replace(false) {
+                            let shown_again = hidden.replace(false);
+                            if shown_again {
                                 log::info!("web_view: tab shown, page visible");
                                 if let Some(page) = &page {
                                     page.set_hidden(false);
                                 }
+                            }
+                            if (drawn_first || shown_again)
+                                && bounds.size.width > px(0.0)
+                                && bounds.size.height > px(0.0)
+                                && let Some(this) = this.upgrade()
+                            {
+                                start_pages_beside(&this, bounds, window.scale_factor(), cx);
                             }
                             if let Some(page) = &page {
                                 page.resize(
