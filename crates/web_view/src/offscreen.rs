@@ -517,7 +517,7 @@ impl OffscreenView {
         self.failure.as_deref()
     }
 
-    pub(crate) fn is_hidden(&self) -> bool {
+    pub fn is_hidden(&self) -> bool {
         self.hidden.get()
     }
 
@@ -529,11 +529,11 @@ impl OffscreenView {
         &self.console
     }
 
-    pub(crate) fn is_loading(&self) -> bool {
+    pub fn is_loading(&self) -> bool {
         self.loading
     }
 
-    pub(crate) fn current_url(&self) -> &str {
+    pub fn current_url(&self) -> &str {
         &self.url
     }
 
@@ -541,7 +541,7 @@ impl OffscreenView {
         self.pane_bounds.get()
     }
 
-    pub(crate) fn title(&self) -> Option<&str> {
+    pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
 

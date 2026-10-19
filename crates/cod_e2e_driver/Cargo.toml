@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 ui_prompt.workspace = true
+web_view.workspace = true
 workspace.workspace = true
 
 [target.'cfg(unix)'.dependencies]

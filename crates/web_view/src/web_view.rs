@@ -30,6 +30,8 @@ pub use web_view_item::*;
 
 #[cfg(target_os = "linux")]
 pub use offscreen::{OffscreenView, PageItemEvent, PageState, open_or_focus_page};
+#[cfg(target_os = "linux")]
+pub use open_page_modal::OpenPageModal;
 
 gpui::actions!(
     web,

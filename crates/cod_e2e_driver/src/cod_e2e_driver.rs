@@ -38,6 +38,8 @@ use workspace::{
     CodMember, ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
 };
 
+mod cod_pages_state;
+
 /// The environment variable that names the driver socket.
 pub const SOCKET_ENV: &str = "COD_E2E_SOCKET";
 
@@ -788,6 +790,7 @@ fn read_state(
         "window_active": window_active,
         "focus": focus,
         "prompt": prompt,
+        "pages": cod_pages_state::state(multi_workspace, window, cx),
     }))
 }
 
