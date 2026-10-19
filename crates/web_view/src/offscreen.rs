@@ -19,7 +19,8 @@ use smallvec::SmallVec;
 use ui::prelude::*;
 use util::ResultExt as _;
 use workspace::{
-    ItemId, MultiWorkspaceEvent, SplitDirection, Workspace, WorkspaceId, delete_unloaded_items,
+    CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, ItemId, MultiWorkspaceEvent,
+    SplitDirection, Workspace, WorkspaceId, delete_unloaded_items,
     item::{Item, ItemEvent, SerializableItem},
 };
 
@@ -251,6 +252,7 @@ impl OffscreenView {
             view
         });
         pages::register(page_id, &view, cx);
+        view.update(cx, |view, cx| view.publish_status(cx));
         view
     }
 
@@ -304,6 +306,16 @@ impl OffscreenView {
             }),
             cx.on_release(|this, cx| {
                 pages::unregister(&this.page_id, cx);
+                if let Some(workspace_id) = this
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.upgrade())
+                    .and_then(|workspace| workspace.read(cx).database_id())
+                    && let Some(store) = CodStatusStore::try_global(cx)
+                {
+                    let key = this.page_id.to_string();
+                    store.update(cx, |store, cx| store.remove_entry(workspace_id, &key, cx));
+                }
                 if let Some(image) = this.image.take() {
                     cx.drop_image(image, None);
                 }
@@ -416,6 +428,51 @@ impl OffscreenView {
         }
     }
 
+    /// Publishes this page as a `CodEntry` of kind `Page` in its workspace's status store (#26), so the overview lists it and Enter on its row focuses this tab. Without a workspace, or before the workspace has a saved id, nothing is published yet; the next change (a loaded title, a failed load) tries again.
+    fn publish_status(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_ref().and_then(|workspace| workspace.upgrade())
+        else {
+            return;
+        };
+        let Some(workspace_id) = workspace.read(cx).database_id() else {
+            return;
+        };
+        let status = if self.state() == PageState::Failed {
+            CodStatus::Error
+        } else {
+            CodStatus::Idle
+        };
+        let title = self.title.clone().unwrap_or_else(|| self.url.clone());
+        let page_id = self.page_id.clone();
+        let open: CodEntryOpen = Rc::new(move |window, cx| {
+            let Some(view) = pages::find(&page_id, cx) else {
+                return;
+            };
+            let Some(workspace) = view.read(cx).workspace().and_then(|workspace| workspace.upgrade())
+            else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.activate_item(&view, true, true, window, cx);
+            });
+        });
+        CodStatusStore::global(cx).update(cx, |store, cx| {
+            store.set_entry(
+                workspace_id,
+                CodEntry {
+                    key: SharedString::from(self.page_id.to_string()),
+                    kind: CodEntryKind::Page,
+                    title,
+                    status,
+                    context: SharedString::from(page_context(&self.url)),
+                    updated_at: std::time::SystemTime::now(),
+                    open: Some(open),
+                },
+                cx,
+            );
+        });
+    }
+
     /// Back, forward or reload (`protocol::NAVIGATE_*`). A page whose browser has not started yet ignores it.
     pub(crate) fn navigate(&mut self, action: u8, _cx: &mut Context<Self>) {
         if let Some(page) = &self.page {
@@ -520,6 +577,7 @@ impl OffscreenView {
                 self.failure = Some(reason);
             }
         }
+        self.publish_status(cx);
         cx.notify();
     }
 
@@ -632,6 +690,14 @@ impl OffscreenView {
             modifier_flags(&event.keystroke.modifiers, None),
         );
         cx.stop_propagation();
+    }
+}
+
+/// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
+fn page_context(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => format!("{}{}", parsed.host_str().unwrap_or_default(), parsed.path()),
+        Err(_) => url.to_string(),
     }
 }
 
@@ -1146,6 +1212,13 @@ mod tests {
             key: key.into(),
             key_char: None,
         }
+    }
+
+    #[test]
+    fn the_overview_context_is_the_host_and_path() {
+        assert_eq!(page_context("https://tracker.example.com/PAY-1234"), "tracker.example.com/PAY-1234");
+        assert_eq!(page_context("http://127.0.0.1:8000/wiki/Home"), "127.0.0.1/wiki/Home");
+        assert_eq!(page_context("not a url"), "not a url");
     }
 
     #[test]
