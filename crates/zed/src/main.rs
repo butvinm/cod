@@ -364,7 +364,19 @@ fn main() {
     } else {
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
         {
-            crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
+            let listening = crate::zed::listen_for_cli_connections(open_listener.clone());
+            if let Err(error) = &listening {
+                // Cod (#24): the Cod preview ships this app as `cod`, without Zed's `zed`
+                // command line tool, so a second `cod <path or url>` hands its paths and urls
+                // to the running Cod, as `zed <path or url>` does in stock Zed.
+                log::info!("Cod is already running ({error:#}); forwarding the open to it");
+                let forwarded = crate::zed::cod_forward_to_running_instance(&args.paths_or_urls);
+                match forwarded {
+                    Ok(count) => log::info!("forwarded {count} open(s) to the running Cod"),
+                    Err(error) => log::error!("could not forward the open: {error:#}"),
+                }
+            }
+            listening.is_err()
         }
 
         #[cfg(target_os = "windows")]
@@ -1062,11 +1074,13 @@ fn main() {
                 // never makes a second live copy of one whose window is not back yet. The
                 // restore of remote windows, which runs after the local ones, does not hold
                 // opens back.
+                log::info!("open request ({} url(s)): waiting for the restore", urls.urls.len());
                 let ready = future::select(
                     Box::pin(restore_finished.clone()),
                     Box::pin(local_restore_done.clone()),
                 );
                 let _ = ready.await;
+                log::info!("open request: the restore let it through");
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
                         handle_open_request(request, app_state.clone(), cx);
@@ -1339,9 +1353,17 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
         let open_behavior = request.open_behavior;
         let location = workspace::SerializedWorkspaceLocation::Remote(connection_options.clone());
         let base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
+        log::info!("remote open request: {} path(s)", request.open_paths.len());
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_remote_project(connection_options, paths, app_state, base_open_options, cx).await
+            let result =
+                open_remote_project(connection_options, paths, app_state, base_open_options, cx)
+                    .await;
+            match &result {
+                Ok(_) => log::info!("remote open request: the remote project is open"),
+                Err(error) => log::error!("remote open request failed: {error:#}"),
+            }
+            result
         })
         .detach_and_log_err(cx);
         return;

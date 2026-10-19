@@ -419,15 +419,81 @@ pub fn listen_for_cli_connections(opener: OpenListener) -> Result<()> {
     }
     let listener = UnixDatagram::bind(&sock_path)?;
     thread::spawn(move || {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; COD_OPEN_DATAGRAM_MAX];
         while let Ok(len) = listener.recv(&mut buf) {
+            let url = String::from_utf8_lossy(&buf[..len]).to_string();
+            log::info!("open request from another process: {}", cod_url_for_log(&url));
             opener.open(RawOpenRequest {
-                urls: vec![String::from_utf8_lossy(&buf[..len]).to_string()],
+                urls: vec![url],
                 ..Default::default()
             });
         }
     });
     Ok(())
+}
+
+/// The largest open request the socket of `listen_for_cli_connections` reads in one datagram.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+const COD_OPEN_DATAGRAM_MAX: usize = 1024;
+
+/// Cod (#24): sends each path or url of this start to the running Cod, one datagram each, on
+/// the socket that `listen_for_cli_connections` reads. Returns how many were sent.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub fn cod_forward_to_running_instance(paths_or_urls: &[String]) -> Result<usize> {
+    use release_channel::RELEASE_CHANNEL_NAME;
+    use std::os::unix::net::UnixDatagram;
+
+    if paths_or_urls.is_empty() {
+        return Ok(0);
+    }
+    let sock_path = paths::data_dir().join(format!("zed-{}.sock", *RELEASE_CHANNEL_NAME));
+    let sock = UnixDatagram::unbound()?;
+    sock.connect(&sock_path)
+        .with_context(|| format!("connecting to {}", sock_path.display()))?;
+    let mut sent = 0;
+    for arg in paths_or_urls {
+        let canonical = std::fs::canonicalize(Path::new(arg)).ok();
+        let url = cod_forwarded_url(arg, canonical.as_deref());
+        if url.len() > COD_OPEN_DATAGRAM_MAX {
+            log::error!(
+                "not forwarding an open of {} bytes (the limit is {COD_OPEN_DATAGRAM_MAX})",
+                url.len()
+            );
+            continue;
+        }
+        log::info!("forwarding the open of {}", cod_url_for_log(&url));
+        sock.send(url.as_bytes())
+            .with_context(|| format!("sending to {}", sock_path.display()))?;
+        sent += 1;
+    }
+    Ok(sent)
+}
+
+/// Cod (#24): the url a forwarded path or url is sent as, as `parse_url_arg` in main.rs builds
+/// it: an existing path as its canonical `file://` url, a url with a scheme as it is, and any
+/// other text as a `file://` url.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cod_forwarded_url(arg: &str, canonical: Option<&Path>) -> String {
+    if let Some(path) = canonical {
+        return format!("file://{}", path.display());
+    }
+    if arg.contains("://") {
+        arg.to_string()
+    } else {
+        format!("file://{arg}")
+    }
+}
+
+/// Cod (#24): an open request for the log, without the password an ssh:// url may carry.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cod_url_for_log(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) if parsed.password().is_some() => {
+            parsed.set_password(Some("***")).ok();
+            parsed.to_string()
+        }
+        _ => url.to_string(),
+    }
 }
 
 fn connect_to_cli(
@@ -1384,6 +1450,23 @@ mod tests {
         });
 
         assert_eq!(request.open_behavior, Some(cli::OpenBehavior::AlwaysNew));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn test_cod_forwarded_url() {
+        assert_eq!(
+            cod_forwarded_url("ssh://me@127.0.0.1:2222/tmp/repo", None),
+            "ssh://me@127.0.0.1:2222/tmp/repo"
+        );
+        assert_eq!(
+            cod_forwarded_url("repo", Some(Path::new("/home/me/repo"))),
+            "file:///home/me/repo"
+        );
+        assert_eq!(cod_forwarded_url("/missing/file.rs", None), "file:///missing/file.rs");
+        assert_eq!(cod_forwarded_url("zed://settings", None), "zed://settings");
+        assert_eq!(cod_url_for_log("ssh://me:secret@host:22/tmp"), "ssh://me:***@host:22/tmp");
+        assert_eq!(cod_url_for_log("ssh://me@host:22/tmp"), "ssh://me@host:22/tmp");
     }
 
     #[gpui::test]
