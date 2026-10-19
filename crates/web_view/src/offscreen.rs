@@ -268,7 +268,21 @@ impl OffscreenView {
         });
 
         let focus_handle = cx.focus_handle();
+        let this = cx.weak_entity();
+        let page_focus = focus_handle.clone();
         let subscriptions = vec![
+            // Back, forward and reload work while the page has the keyboard. Interceptors run before key bindings, so ctrl-r reloads the page instead of opening recent projects.
+            cx.intercept_keystrokes(move |event, window, cx| {
+                let Some(action) = navigation_for(&event.keystroke) else {
+                    return;
+                };
+                if !page_focus.is_focused(window) {
+                    return;
+                }
+                if this.update(cx, |this, cx| this.navigate(action, cx)).is_ok() {
+                    cx.stop_propagation();
+                }
+            }),
             cx.on_focus(&focus_handle, window, |this, _, _| {
                 log::info!("web_view: GPUI focus in, the page gets keyboard focus");
                 if let Some(page) = &this.page {
@@ -550,6 +564,11 @@ impl OffscreenView {
             return;
         };
         let keystroke = &event.keystroke;
+        // Handled by the keystroke interceptor; the page never sees them.
+        if navigation_for(keystroke).is_some() {
+            cx.stop_propagation();
+            return;
+        }
         let flags = modifier_flags(&keystroke.modifiers, None);
         let Some(code) = windows_key_code(keystroke) else {
             return;
@@ -589,6 +608,20 @@ impl OffscreenView {
             modifier_flags(&event.keystroke.modifiers, None),
         );
         cx.stop_propagation();
+    }
+}
+
+/// The browser keys of a focused page: alt-left goes back, alt-right goes forward, ctrl-r reloads.
+fn navigation_for(keystroke: &Keystroke) -> Option<u8> {
+    let modifiers = &keystroke.modifiers;
+    if modifiers.shift || modifiers.platform || modifiers.function {
+        return None;
+    }
+    match (modifiers.alt, modifiers.control, keystroke.key.as_str()) {
+        (true, false, "left") => Some(protocol::NAVIGATE_BACK),
+        (true, false, "right") => Some(protocol::NAVIGATE_FORWARD),
+        (false, true, "r") => Some(protocol::NAVIGATE_RELOAD),
+        _ => None,
     }
 }
 
@@ -1094,5 +1127,17 @@ mod tests {
             size: gpui::size(px(300.0), px(200.0)),
         };
         assert_eq!(page_point(gpui::point(px(150.0), px(90.0)), bounds), (50, 50));
+    }
+
+    #[test]
+    fn browser_keys_go_back_forward_and_reload() {
+        let action = |text: &str| navigation_for(&Keystroke::parse(text).unwrap());
+        assert_eq!(action("alt-left"), Some(protocol::NAVIGATE_BACK));
+        assert_eq!(action("alt-right"), Some(protocol::NAVIGATE_FORWARD));
+        assert_eq!(action("ctrl-r"), Some(protocol::NAVIGATE_RELOAD));
+        assert_eq!(action("left"), None);
+        assert_eq!(action("ctrl-left"), None);
+        assert_eq!(action("ctrl-shift-r"), None);
+        assert_eq!(action("r"), None);
     }
 }
