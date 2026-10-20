@@ -17,8 +17,10 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +44,7 @@ BILLING_API = {
 }
 
 
-def ask_html(session_id: str = SESSION_ID) -> str:
+def ask_html(session_id: str = SESSION_ID, open_file_path: str = "src/invoice.rs:18") -> str:
     """The story's own fixture: a text field and `Send` button, an `open-file` link, a
     `focus-session` button, a button with an action outside the allowlist, and an inline script
     that would change the heading if it ran. Every interactive element is an absolutely
@@ -59,7 +61,7 @@ def ask_html(session_id: str = SESSION_ID) -> str:
         f'<input id="answer" type="text" autofocus style="{box.format(left=0, top=0)}">'
         f'<button data-cod="submit" data-cod-value-from="#answer" '
         f'style="{box.format(left=230, top=0)}">Send</button>'
-        f'<a data-cod="open-file" data-cod-path="src/invoice.rs:18" '
+        f'<a data-cod="open-file" data-cod-path="{open_file_path}" '
         f'style="{box.format(left=0, top=40)}display:block;">Open invoice.rs</a>'
         f'<button data-cod="focus-session" data-cod-session="{session_id}" '
         f'style="{box.format(left=0, top=80)}">Focus session</button>'
@@ -71,6 +73,72 @@ def ask_html(session_id: str = SESSION_ID) -> str:
         "</script>"
         "</body></html>"
     )
+
+
+def forged_onerror_html() -> str:
+    """RC review B1: an inline event handler, not a `<script>` element, that tries to forge a
+    submit through the bridge. Stripping `<script>` blocks alone does not stop it; only blocking
+    page-authored JavaScript itself (CSP or an engine-level switch) does.
+    """
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>"
+        "<img src=\"data:,\" onerror=\"window.cod.call('submit',{value:'forged'})\">"
+        "</body></html>"
+    )
+
+
+def navigate_away_html(target_url: str) -> str:
+    """RC review B2: a page whose whole body is a plain link (no `data-cod`) to another
+    document. Clicking it is an ordinary same-tab navigation, the kind any agent-made page might
+    legitimately contain.
+    """
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+        '<body style="margin:0">'
+        f'<a id="away" href="{target_url}" '
+        'style="display:block;position:absolute;top:0;left:0;width:100%;height:100%;">'
+        "leave"
+        "</a>"
+        "</body></html>"
+    )
+
+
+class ForgedBridgeServer:
+    """An external page (RC review B2) that answers its own load by emitting a bridge-shaped
+    console message, to check that a document Cod never built cannot forge a submit just by
+    being shown in a tab that used to be an agent page.
+    """
+
+    def __init__(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - the http.server name
+                body = (
+                    "<!doctype html><html><body>"
+                    "<script>console.log('cod:bridge:'+JSON.stringify("
+                    "{name:'submit',args:{value:'forged'}}));</script>"
+                    "</body></html>"
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/forged"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
 
 def pages(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -156,16 +224,23 @@ class AgentPagesTest(CodTestCase):
             time.sleep(0.2)
         return repo
 
-    def write_ask_html(self, session_id: str = SESSION_ID) -> Path:
+    def write_ask_html(self, session_id: str = SESSION_ID, open_file_path: str = "src/invoice.rs:18") -> Path:
         folder = self.workdir / "agent-pages"
         folder.mkdir(exist_ok=True)
         path = folder / "ask.html"
-        path.write_text(ask_html(session_id))
+        path.write_text(ask_html(session_id, open_file_path))
         return path
 
-    def open_agent_page(self, repo: Path, *extra: str) -> str:
+    def write_html(self, name: str, content: str) -> Path:
+        folder = self.workdir / "agent-pages"
+        folder.mkdir(exist_ok=True)
+        path = folder / name
+        path.write_text(content)
+        return path
+
+    def open_agent_page(self, repo: Path, *extra: str, open_file_path: str = "src/invoice.rs:18") -> str:
         """`codctl open --html ask.html [extra...]`, which must print the page id and exit 0 at once (#43 AC1)."""
-        html_path = self.write_ask_html()
+        html_path = self.write_ask_html(open_file_path=open_file_path)
         result = self.codctl("open", "--html", str(html_path), *extra, cwd=repo)
         self.expect_result(result, 0, stderr="")
         if not re.fullmatch(r"page-\d+\n", result.stdout):
@@ -468,6 +543,133 @@ class AgentPagesTest(CodTestCase):
             after = self.state()
             self.expect_equal("active tab unchanged", before["active_tab"], after["active_tab"])
             self.expect_equal("tabs unchanged", before["tabs"], after["tabs"])
+
+    # RC review B1 (security): an inline event handler must not run without --js.
+
+    def test_b1_inline_event_handlers_do_not_run_without_js(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open a page whose onerror handler tries to forge a submit, without --js"):
+            html_path = self.write_html("forged.html", forged_onerror_html())
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                time.sleep(SETTLE_TIME)
+                self.expect_equal(
+                    "codctl open --html --wait exited on its own (forged onerror submit, no --js)",
+                    None,
+                    process.poll(),
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    # RC review B2 (security): a same-tab navigation away from the agent document must not keep
+    # bridge privileges.
+
+    def test_b2_bridge_messages_after_navigating_away_are_refused(self) -> None:
+        with self.step("start Cod on billing-api and open a page that links to an outside page"):
+            repo = self.start_on_billing_api()
+            forged = ForgedBridgeServer()
+            self.addCleanup(forged.close)
+            html_path = self.write_html("navigate-away.html", navigate_away_html(forged.url()))
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                page_id = None
+                deadline = time.monotonic() + LOAD_TIMEOUT
+                while page_id is None:
+                    state = self.state()
+                    candidates = [page["id"] for page in pages(state) if page.get("state") == "loaded"]
+                    if candidates:
+                        page_id = candidates[-1]
+                    elif time.monotonic() > deadline:
+                        raise AssertionError("codctl open --html --wait never showed a loaded page")
+                    else:
+                        time.sleep(0.1)
+
+                with self.step("follow the same-tab link to the outside page, which tries to forge a submit"):
+                    # The link fills the whole page.
+                    self.click_in_page(page_id, 20, 20)
+                    time.sleep(SETTLE_TIME)
+
+                with self.step("the forged submit from the outside page never answers --wait"):
+                    self.expect_equal(
+                        "codctl open --html --wait exited on its own (forged submit after navigating away)",
+                        None,
+                        process.poll(),
+                    )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    # RC review B4 (stability): an oversized --html document is refused, not sent to the helper.
+
+    def test_b4_oversized_html_is_refused_without_breaking_other_pages(self) -> None:
+        with self.step("start Cod on billing-api and open a normal agent page first"):
+            repo = self.start_on_billing_api()
+            healthy_id = self.open_agent_page(repo)
+
+        with self.step("a too-large --html document is refused with a clear error, not a crash"):
+            filler = "x" * (900 * 1024)
+            big_path = self.write_html("too-big.html", f"<!doctype html><body><!-- {filler} --></body>")
+            result = self.codctl("open", "--html", str(big_path), cwd=repo)
+            self.expect_equal("exit code of an oversized --html document", 1, result.returncode)
+            self.expect_equal("stdout of an oversized --html document", "", result.stdout)
+            if "large" not in result.stderr:
+                raise AssertionError(f"expected a clear size error, got stderr {result.stderr!r}")
+
+        with self.step("the earlier page tab is unaffected"):
+            self.wait_for(
+                lambda state: (page_by_id(state, healthy_id) or {}).get("state") == "loaded",
+                SHOW_TIMEOUT,
+                "the earlier agent page to still be loaded",
+            )
+
+    # RC review B6 (security): a symlink inside the workspace that points outside it must not let
+    # an agent page open the file it points to.
+
+    def test_b6_symlink_escape_is_refused(self) -> None:
+        with self.step("create a repo with a symlink pointing at a secret file outside it"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            secret = self.workdir / "outside-secret.txt"
+            secret.write_text("outside secret content, never meant to be opened from a page\n")
+            (repo / "outside-link.txt").symlink_to(secret)
+            self.start_cod(repo)
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+            deadline = time.monotonic() + COMMAND_TIMEOUT
+            while True:
+                last = self.codctl("pane", "list", "--json")
+                if last.returncode == 0:
+                    break
+                if time.monotonic() > deadline:
+                    raise AssertionError(f"codctl did not reach Cod: exit {last.returncode}, stderr {last.stderr!r}")
+                time.sleep(0.2)
+
+        with self.step("open ask.html whose open-file action points at the symlink, and focus it"):
+            page_id = self.open_agent_page(repo, open_file_path="outside-link.txt")
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("focused") is True,
+                SHOW_TIMEOUT,
+                "the agent page to have the focus",
+            )
+
+        with self.step("activate the open-file link: the outside file is refused, not opened"):
+            before = self.state()
+            # The open-file link is the absolutely positioned box at left 0, top 40.
+            self.click_in_page(page_id, 50, 55)
+            time.sleep(SETTLE_TIME)
+            after = self.state()
+            self.expect_equal("active tab unchanged", before["active_tab"], after["active_tab"])
+            self.expect_equal("tabs unchanged", before["tabs"], after["tabs"])
+            log_text = self.output_log()
+            if "refused" not in log_text or "outside-link.txt" not in log_text:
+                raise AssertionError(f"expected the symlink escape refused and logged; last 4000 chars: {log_text[-4000:]!r}")
 
 
 if __name__ == "__main__":
