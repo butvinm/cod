@@ -207,6 +207,14 @@ pub struct OffscreenView {
     kind: PageKind,
     workspace: Option<WeakEntity<Workspace>>,
     url: SharedString,
+    /// The agent document's own URL at the moment this page was built (RC review B2): bridge
+    /// calls are only ever acted on while `url` still equals this. Always `None` for a page that
+    /// is not `PageKind::Agent`.
+    agent_document_url: Option<SharedString>,
+    /// Set once the main frame's address changes away from `agent_document_url`: a same-tab
+    /// navigation to another document (an external site, another `data:` URL) must not keep the
+    /// bridge privileges of the agent document it replaced (RC review B2).
+    agent_navigated_away: bool,
     title: Option<SharedString>,
     loading: bool,
     /// The last main-frame load error, cleared by the next load.
@@ -344,11 +352,14 @@ impl OffscreenView {
             }));
         }
 
+        let agent_document_url = (kind == PageKind::Agent).then(|| SharedString::from(url.clone()));
         Self {
             page_id,
             kind,
             workspace: None,
             url: url.into(),
+            agent_document_url,
+            agent_navigated_away: false,
             title: None,
             loading: true,
             load_error: None,
@@ -555,6 +566,18 @@ impl OffscreenView {
                 }
                 if let Some(url) = diagnostics.address {
                     log::info!("web_view: address {url}");
+                    // RC review B2: once the main frame's address no longer names the agent
+                    // document this page was built from, its bridge is refused for good, even if
+                    // a later navigation happens to return to the same address.
+                    if self.agent_document_url.as_deref().is_some_and(|agent_url| agent_url != url.as_str())
+                        && !self.agent_navigated_away
+                    {
+                        self.agent_navigated_away = true;
+                        log::warn!(
+                            "web_view: {} navigated away from its agent document to {url:?}: its bridge is refused from now on",
+                            self.page_id
+                        );
+                    }
                     if self.url.as_ref() != url.as_str() {
                         self.url = url.into();
                         cx.emit(PageItemEvent::UrlChanged);
@@ -577,9 +600,11 @@ impl OffscreenView {
                     );
                 }
                 for message in diagnostics.console {
-                    // Agent pages only: a bridge call from Cod's own bootstrap script is acted on
+                    // Agent pages only, and only while still showing their own agent document
+                    // (RC review B2): a bridge call from Cod's own bootstrap script is acted on
                     // and never shown as page console output (#43).
                     if self.kind == PageKind::Agent
+                        && !self.agent_navigated_away
                         && let Some(call) = crate::agent_bridge::parse_bridge_message(&message)
                     {
                         self.dispatch_bridge_call(call, window, cx);
@@ -796,6 +821,26 @@ fn open_file_from_page(
         log::warn!("web_view: {page_id} refused to open {raw:?}: not inside the workspace's folders");
         return;
     };
+    // `find_project_path` only checks lexical containment: a symlink entry inside the workspace
+    // whose target resolves outside it would otherwise still pass (RC review B6). Canonicalize
+    // the actual target and re-check it against the worktree's own canonical root before opening
+    // anything; refuse and log like every other containment failure here.
+    let Some(worktree) = project.read(cx).worktree_for_id(project_path.worktree_id, cx) else {
+        log::warn!("web_view: {page_id} refused to open {raw:?}: unknown worktree");
+        return;
+    };
+    let root = worktree.read(cx).abs_path();
+    let candidate = root.join(project_path.path.as_std_path());
+    let contained = std::fs::canonicalize(&candidate)
+        .ok()
+        .zip(std::fs::canonicalize(&*root).ok())
+        .is_some_and(|(candidate, root)| candidate.starts_with(&root));
+    if !contained {
+        log::warn!(
+            "web_view: {page_id} refused to open {raw:?}: resolves outside the workspace's folders"
+        );
+        return;
+    }
     // The file opens the way Zed opens a file: in the active pane.
     let page_id = page_id.clone();
     let path_text = path_text.to_owned();
