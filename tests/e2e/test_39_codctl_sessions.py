@@ -193,6 +193,54 @@ class CodctlSessionsTest(CodTestCase):
                 "the scripted reply in the transcript",
             )
 
+    def test_c2_send_keeps_the_users_unsent_draft(self) -> None:
+        """RC review C2: `session send` used to insert its text at the message box's cursor and
+        submit everything there, so a draft the user had not sent yet went out (and was cleared)
+        along with the command's own text."""
+        with self.step("create the fixture repo and a claude script with two plain turns"):
+            script = self.write_script(
+                "claude.json",
+                {
+                    "session_ids": ["claude-session-1"],
+                    "turns": [
+                        {"steps": [{"chunk": "Done."}, {"end": "end_turn"}]},
+                        {"steps": [{"chunk": "Noted."}, {"end": "end_turn"}]},
+                    ],
+                },
+            )
+            self.start_with_agents(script, None)
+
+        with self.step("start a session, type an unsent draft, then send a different message"):
+            session_id = self.new_session("claude")
+            self.type("unsent draft about the ledger export")
+            result = self.codctl.run("session", "send", session_id, "Fix the rounding in src/invoice.rs")
+            self.expect_result(result, 0, stdout="", stderr="")
+
+        with self.step("the sent message and its reply show, without the draft swept into them"):
+            state = self.wait_for(
+                lambda state: "Done." in chat(state).get("transcript", ""),
+                SHOW_TIMEOUT,
+                "the scripted reply to the sent message",
+            )
+            self.expect_equal(
+                "the sent message is exactly the requested text",
+                True,
+                "Fix the rounding in src/invoice.rs" in chat(state).get("transcript", ""),
+            )
+            self.expect_equal(
+                "the unsent draft was not swept into the sent message",
+                False,
+                "unsent draft about the ledger export" in chat(state).get("transcript", ""),
+            )
+
+        with self.step("the draft is still in the message box: Enter sends it on its own"):
+            self.keys("enter")
+            self.wait_for(
+                lambda state: "unsent draft about the ledger export" in chat(state).get("transcript", ""),
+                SHOW_TIMEOUT,
+                "the preserved draft sent on its own",
+            )
+
     # AC4
 
     def test_ac4_wait_until_idle_and_needs_input(self) -> None:

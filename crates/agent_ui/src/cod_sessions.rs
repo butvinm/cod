@@ -148,8 +148,13 @@ fn find_chat(
     })
 }
 
-/// Sends the text as the user's message in this session and starts the agent (#39 AC3): sets the
-/// message box's text and submits it, the same as typing the text and pressing Enter.
+/// Sends the text as the user's message in this session and starts the agent (#39 AC3): the same
+/// as typing the text and pressing Enter, but without disturbing a draft the user already typed.
+///
+/// `insert_text` inserts at the user's current cursor, so setting the box's text this way and
+/// sending used to submit the draft and the requested text together, then clear the box: an
+/// unsent draft was silently sent along with the command and lost (#C2). Instead, the box's
+/// contents are swapped out for the submission and the draft is put back afterwards.
 pub fn send_message(
     workspace: &Entity<Workspace>,
     session_id: &str,
@@ -163,11 +168,20 @@ pub fn send_message(
         .read(cx)
         .root_thread_view()
         .context("the chat has no message box yet")?;
+    let draft = thread_view.read(cx).message_editor.read(cx).text(cx);
     thread_view.update(cx, |view, cx| {
-        view.message_editor
-            .update(cx, |editor, cx| editor.insert_text(text, window, cx));
+        view.message_editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+            editor.insert_text(text, window, cx);
+        });
     });
     thread_view.update(cx, |view, cx| view.send(window, cx));
+    if !draft.is_empty() {
+        thread_view.update(cx, |view, cx| {
+            view.message_editor
+                .update(cx, |editor, cx| editor.insert_text(&draft, window, cx));
+        });
+    }
     Ok(())
 }
 
