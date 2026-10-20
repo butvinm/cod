@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    io::{BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Write},
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd as _, FromRawFd as _},
@@ -474,6 +474,13 @@ pub fn main() {
     loop {
         let message = match ToBrowser::read_from(&mut input) {
             Ok(message) => message,
+            // Cod itself refuses to send an oversized `Create` (RC review B4); this only catches
+            // a message that still slipped through. The stream already resynced (the bytes were
+            // drained), so every other page tab keeps running instead of the whole helper exiting.
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                eprintln!("cod-browser: refused an oversized message ({error}), staying up");
+                continue;
+            }
             Err(error) => {
                 // Cod closed the socket or exited: nothing is left to draw for.
                 eprintln!("cod-browser: connection ended ({error}), exiting");

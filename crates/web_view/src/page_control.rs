@@ -161,6 +161,16 @@ pub fn open_html(
     let vars = crate::agent_bridge::current_theme_vars(cx);
     let document = crate::agent_bridge::build_agent_document(&source, allow_js, &vars);
     let url = crate::agent_bridge::data_url(&document);
+    // RC review B4: an oversized `Create` message exceeds the helper protocol's one message size
+    // limit and kills every open page tab, though `codctl open --html` had already reported
+    // success. Refused here, before anything is sent, with a clear error instead.
+    if !crate::browser_client::protocol::create_message_fits(url.len()) {
+        bail!(
+            "the page is too large to open ({} bytes encoded; the limit is {} bytes)",
+            url.len(),
+            crate::browser_client::protocol::max_create_url_len(),
+        );
+    }
     Ok(crate::pages::open(workspace, url, crate::pages::PageKind::Agent, window, cx).to_string())
 }
 

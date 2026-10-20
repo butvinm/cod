@@ -29,6 +29,26 @@ pub const NAVIGATE_RELOAD: u8 = 2;
 const MAX_MESSAGE: u32 = 1 << 20;
 const MAX_FRAME_BYTES: usize = 1 << 28;
 
+/// Bytes a `Create` message spends on everything but its `url` field: the tag, `page`, `width`,
+/// `height`, `scale` and the URL's own length prefix (RC review B4).
+const CREATE_FIXED_BYTES: usize = 1 + 4 + 4 + 4 + 4 + 4;
+
+/// Whether a `Create` message carrying a URL this long would fit under the protocol's one
+/// message size limit (RC review B4): a page large enough to fail this must be refused before it
+/// is ever sent, instead of exceeding `MAX_MESSAGE` and taking down the helper's connection, and
+/// every page tab with it.
+pub fn create_message_fits(url_len: usize) -> bool {
+    CREATE_FIXED_BYTES
+        .checked_add(url_len)
+        .is_some_and(|total| total <= MAX_MESSAGE as usize)
+}
+
+/// The largest `url` a `Create` message can carry under the protocol's message size limit (RC
+/// review B4), for a clear error message that names the limit.
+pub fn max_create_url_len() -> usize {
+    MAX_MESSAGE as usize - CREATE_FIXED_BYTES
+}
+
 /// Messages from Cod to the helper.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToBrowser {
@@ -239,6 +259,15 @@ fn bad(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Drains an oversized message's bytes so the stream stays framed, then reports it as
+/// `InvalidInput`, distinct from `bad`'s `InvalidData`: a caller can tell "one bad message,
+/// still a live connection" apart from "the stream itself is corrupt" (RC review B4).
+fn skip_oversized(input: &mut impl Read, length: usize) -> io::Result<io::Error> {
+    let mut discard = vec![0u8; length];
+    input.read_exact(&mut discard)?;
+    Ok(io::Error::new(io::ErrorKind::InvalidInput, "oversized message refused"))
+}
+
 impl ToBrowser {
     pub fn write_to(&self, out: &mut impl Write) -> io::Result<()> {
         match self {
@@ -326,8 +355,14 @@ impl ToBrowser {
 
     pub fn read_from(input: &mut impl Read) -> io::Result<Self> {
         let length = read_length(input)?;
-        if length == 0 || length > MAX_MESSAGE as usize {
+        if length == 0 {
             return Err(bad("bad message length"));
+        }
+        if length > MAX_MESSAGE as usize {
+            // Cod itself refuses to send a `Create` this large (RC review B4), so this is
+            // defensive: still consume the bytes so the stream stays framed, and let the caller
+            // keep every other page tab alive instead of treating the connection as corrupt.
+            return Err(skip_oversized(input, length)?);
         }
         let mut message = vec![0; length];
         input.read_exact(&mut message)?;
