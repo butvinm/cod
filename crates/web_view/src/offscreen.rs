@@ -501,15 +501,15 @@ impl OffscreenView {
     /// Acts on one bridge call from an agent page's bootstrap script (#43 AC2, AC3, AC4): checks
     /// the allowlist here, in Cod, then runs the matching action. Anything not in the allowlist is
     /// refused and logged, never acted on.
+    ///
+    /// The action itself runs deferred, after this view's update ends: closing the page tab (`submit`) and moving the focus to an editor or a chat (`open-file`, `focus-session`) read or release this view, which GPUI forbids while it is being updated (a double lease panic).
     fn dispatch_bridge_call(
         &mut self,
         call: crate::agent_bridge::BridgeCall,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::agent_bridge::{arg_str, is_allowed};
-
-        if !is_allowed(&call.name) {
+        if !crate::agent_bridge::is_allowed(&call.name) {
             log::warn!(
                 "web_view: {} refused the action {:?}: not in the bridge allowlist",
                 self.page_id,
@@ -517,103 +517,11 @@ impl OffscreenView {
             );
             return;
         }
-        match call.name.as_str() {
-            "submit" => {
-                let value = arg_str(&call, "value");
-                log::info!("web_view: {} submitted {value:?}", self.page_id);
-                crate::agent_bridge::submit(&self.page_id, value, cx);
-                pages::close(&self.page_id, window, cx);
-            }
-            "open-file" => self.open_file_from_page(arg_str(&call, "path"), window, cx),
-            "focus-session" => self.focus_session_from_page(arg_str(&call, "session"), window, cx),
-            _ => unreachable!("checked by is_allowed above"),
-        }
-    }
-
-    /// `data-cod="open-file"` (#43 AC3): opens the path at its 1-based line and column in the
-    /// editor, only when it resolves inside one of the workspace's own folders (security
-    /// requirement #7). A path outside them, or a missing workspace, is refused and logged.
-    fn open_file_from_page(&mut self, raw: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.as_ref().and_then(|workspace| workspace.upgrade())
-        else {
-            log::warn!("web_view: {} refused to open {raw:?}: no workspace", self.page_id);
-            return;
-        };
-        let (path_text, line, column) = crate::agent_bridge::split_path_position(&raw);
-        let project = workspace.read(cx).project().clone();
-        let Some(project_path) = project.read(cx).find_project_path(path_text, cx) else {
-            log::warn!(
-                "web_view: {} refused to open {raw:?}: not inside the workspace's folders",
-                self.page_id
-            );
-            return;
-        };
         let page_id = self.page_id.clone();
-        let path_text = path_text.to_owned();
-        cx.spawn_in(window, async move |_, cx| {
-            let item = workspace
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.open_path(project_path, None, true, window, cx)
-                })?
-                .await?;
-            if let Some(line) = line {
-                workspace.update_in(cx, |_, window, cx| {
-                    let Some(editor) = item.downcast::<editor::Editor>() else {
-                        return;
-                    };
-                    editor.update(cx, |editor, cx| {
-                        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
-                            return;
-                        };
-                        let snapshot = buffer.read(cx).snapshot();
-                        let point = snapshot.point_from_external_input(
-                            line.saturating_sub(1),
-                            column.unwrap_or(1).saturating_sub(1),
-                        );
-                        editor.go_to_singleton_buffer_point(point, window, cx);
-                    });
-                })?;
-            }
-            log::info!("web_view: {page_id} opened {path_text:?} from its page");
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    /// `data-cod="focus-session"` (#43 AC3): focuses the chat with this session id, among the
-    /// `Session` entries Cod's status store already has for this page's own workspace. An unknown
-    /// session, or a missing workspace, is refused and logged.
-    fn focus_session_from_page(&self, session: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.as_ref().and_then(|workspace| workspace.upgrade())
-        else {
-            log::warn!("web_view: {} refused to focus session {session:?}: no workspace", self.page_id);
-            return;
-        };
-        let Some(workspace_id) = workspace.read(cx).database_id() else {
-            log::warn!(
-                "web_view: {} refused to focus session {session:?}: the workspace has no id yet",
-                self.page_id
-            );
-            return;
-        };
-        let entry = CodStatusStore::try_global(cx).and_then(|store| {
-            store
-                .read(cx)
-                .entries(workspace_id)
-                .iter()
-                .find(|entry| entry.kind == CodEntryKind::Session && entry.key.as_ref() == session.as_str())
-                .cloned()
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            run_bridge_action(page_id, workspace, call, window, cx)
         });
-        match entry.and_then(|entry| entry.open) {
-            Some(open) => {
-                log::info!("web_view: {} focused session {session:?}", self.page_id);
-                open(window, cx);
-            }
-            None => log::warn!(
-                "web_view: {} refused to focus session {session:?}: unknown session",
-                self.page_id
-            ),
-        }
     }
 
     fn hide(&mut self, reason: &str) {
@@ -842,6 +750,116 @@ impl OffscreenView {
 }
 
 /// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
+/// Runs one allowed bridge call of the agent page `page_id` (#43 AC2, AC3). It runs deferred, with no page view being updated (see `OffscreenView::dispatch_bridge_call`).
+fn run_bridge_action(
+    page_id: PageId,
+    workspace: Option<WeakEntity<Workspace>>,
+    call: crate::agent_bridge::BridgeCall,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use crate::agent_bridge::arg_str;
+
+    let workspace = workspace.and_then(|workspace| workspace.upgrade());
+    match call.name.as_str() {
+        "submit" => {
+            let value = arg_str(&call, "value");
+            log::info!("web_view: {page_id} submitted {value:?}");
+            crate::agent_bridge::submit(&page_id, value, cx);
+            pages::close(&page_id, window, cx);
+        }
+        "open-file" => open_file_from_page(&page_id, workspace, arg_str(&call, "path"), window, cx),
+        "focus-session" => {
+            focus_session_from_page(&page_id, workspace, arg_str(&call, "session"), window, cx)
+        }
+        other => log::warn!("web_view: {page_id} refused the action {other:?}: not in the bridge allowlist"),
+    }
+}
+
+/// `data-cod="open-file"` (#43 AC3): opens the path at its 1-based line and column in the editor, only when it resolves inside one of the workspace's own folders (security requirement #7). A path outside them, or a missing workspace, is refused and logged.
+fn open_file_from_page(
+    page_id: &PageId,
+    workspace: Option<Entity<Workspace>>,
+    raw: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace else {
+        log::warn!("web_view: {page_id} refused to open {raw:?}: no workspace");
+        return;
+    };
+    let (path_text, line, column) = crate::agent_bridge::split_path_position(&raw);
+    let project = workspace.read(cx).project().clone();
+    let Some(project_path) = project.read(cx).find_project_path(path_text, cx) else {
+        log::warn!("web_view: {page_id} refused to open {raw:?}: not inside the workspace's folders");
+        return;
+    };
+    let page_id = page_id.clone();
+    let path_text = path_text.to_owned();
+    window
+        .spawn(cx, async move |cx| {
+            let item = workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.open_path(project_path, None, true, window, cx)
+                })?
+                .await?;
+            if let Some(line) = line {
+                workspace.update_in(cx, |_, window, cx| {
+                    let Some(editor) = item.downcast::<editor::Editor>() else {
+                        return;
+                    };
+                    editor.update(cx, |editor, cx| {
+                        let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+                            return;
+                        };
+                        let snapshot = buffer.read(cx).snapshot();
+                        let point = snapshot.point_from_external_input(
+                            line.saturating_sub(1),
+                            column.unwrap_or(1).saturating_sub(1),
+                        );
+                        editor.go_to_singleton_buffer_point(point, window, cx);
+                    });
+                })?;
+            }
+            log::info!("web_view: {page_id} opened {path_text:?} from its page");
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// `data-cod="focus-session"` (#43 AC3): focuses the chat with this session id, among the `Session` entries Cod's status store already has for this page's own workspace. An unknown session, or a missing workspace, is refused and logged.
+fn focus_session_from_page(
+    page_id: &PageId,
+    workspace: Option<Entity<Workspace>>,
+    session: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = workspace else {
+        log::warn!("web_view: {page_id} refused to focus session {session:?}: no workspace");
+        return;
+    };
+    let Some(workspace_id) = workspace.read(cx).database_id() else {
+        log::warn!("web_view: {page_id} refused to focus session {session:?}: the workspace has no id yet");
+        return;
+    };
+    let entry = CodStatusStore::try_global(cx).and_then(|store| {
+        store
+            .read(cx)
+            .entries(workspace_id)
+            .iter()
+            .find(|entry| entry.kind == CodEntryKind::Session && entry.key.as_ref() == session.as_str())
+            .cloned()
+    });
+    match entry.and_then(|entry| entry.open) {
+        Some(open) => {
+            log::info!("web_view: {page_id} focused session {session:?}");
+            open(window, cx);
+        }
+        None => log::warn!("web_view: {page_id} refused to focus session {session:?}: unknown session"),
+    }
+}
+
 fn page_context(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => format!("{}{}", parsed.host_str().unwrap_or_default(), parsed.path()),
