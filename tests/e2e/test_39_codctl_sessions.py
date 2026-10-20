@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from fake_acp_agent import fake_agent_settings
 
 COMMAND_TIMEOUT = 30.0
 SHOW_TIMEOUT = 15.0
+SETTLE_TIME = 1.0
 
 BILLING_API = {
     "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -31,6 +33,30 @@ BILLING_API = {
 
 def chat(state: dict[str, Any]) -> dict[str, Any]:
     return state.get("chat") or {}
+
+
+def prompt_texts_and_cancels(log_path: Path) -> tuple[list[str], int]:
+    """Reads the fake agent's own `COD_FAKE_ACP_LOG` (RC review C2 new defect #2): the text of
+    every `session/prompt` call the agent received, in arrival order, and how many
+    `session/cancel` notifications arrived. A cancel while a turn runs is exactly what the
+    legacy transport's `send_content` path used to trigger."""
+    prompts: list[str] = []
+    cancels = 0
+    if not log_path.exists():
+        return prompts, cancels
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        direction, _, payload = line.partition(" ")
+        if direction != "in" or not payload:
+            continue
+        message = json.loads(payload)
+        method = message.get("method")
+        if method == "session/prompt":
+            blocks = (message.get("params") or {}).get("prompt") or []
+            text = "".join(block.get("text", "") for block in blocks if block.get("type") == "text")
+            prompts.append(text)
+        elif method == "session/cancel":
+            cancels += 1
+    return prompts, cancels
 
 
 class Codctl:
@@ -249,6 +275,90 @@ class CodctlSessionsTest(CodTestCase):
                 SHOW_TIMEOUT,
                 "the preserved draft sent on its own",
             )
+
+    def test_rc_c2_send_queues_behind_a_running_turn_instead_of_interrupting_it(self) -> None:
+        """RC review C2 new defect #2: `session send` called `ThreadView::send_content`
+        directly, which always starts a turn right away; while a turn was already running, this
+        cancelled it on the legacy transport and overtook whatever the user had already queued
+        behind it. A turn that blocks on a `wait` step lets the test hold it open and queue a
+        plain user message ahead of the codctl message, then check from the fake agent's own
+        log that no cancel ever happened and that both messages reached the agent in the order
+        they were queued, not the order codctl called in."""
+        claude_log = self.workdir / "claude.log"
+        with self.step("create the fixture repo and a claude script whose first turn blocks on a control file"):
+            script = self.write_script(
+                "claude.json",
+                {
+                    "session_ids": ["claude-session-1"],
+                    "turns": [
+                        {"steps": [{"chunk": "T1 chunk"}, {"wait": "release-1"}, {"end": "end_turn"}]},
+                        {"steps": [{"chunk": "T2 chunk"}, {"end": "end_turn"}]},
+                        {"steps": [{"chunk": "T3 chunk"}, {"end": "end_turn"}]},
+                    ],
+                },
+            )
+            repo = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(
+                repo,
+                extra_settings={"agent_servers": {"claude": fake_agent_settings(script, log=claude_log)}},
+            )
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, SHOW_TIMEOUT, "the agent panel to load")
+
+        with self.step("start a session, focus its message box, and send the first message"):
+            session_id = self.new_session("claude")
+            self.run_command("agent: toggle focus")
+            self.wait_for(
+                lambda state: state.get("agent_panel_focused") is True,
+                SHOW_TIMEOUT,
+                "the new chat's message box to take the focus",
+            )
+            self.type("Begin turn one please")
+            self.keys("enter")
+            self.wait_for(
+                lambda state: "T1 chunk" in chat(state).get("transcript", ""),
+                SHOW_TIMEOUT,
+                "turn one to start generating",
+            )
+
+        with self.step("while turn one is still generating, queue a plain user message through the UI"):
+            self.type("Queued user message about tax rates")
+            self.keys("enter")
+            time.sleep(SETTLE_TIME)
+
+        with self.step("while still generating, send a codctl message: it must queue, not interrupt"):
+            result = self.codctl.run("session", "send", session_id, "Codctl message about ledger export")
+            self.expect_result(result, 0, stdout="", stderr="")
+            time.sleep(SETTLE_TIME)
+
+        with self.step("release turn one and let the queue drain"):
+            (self.workdir / "release-1").write_text("go\n")
+            self.wait_for(
+                lambda state: "T3 chunk" in chat(state).get("transcript", ""),
+                SHOW_TIMEOUT,
+                "every queued turn to finish",
+            )
+
+        with self.step("the fake agent's own log shows no cancel, and the FIFO order of the two queued messages"):
+            prompts, cancels = prompt_texts_and_cancels(claude_log)
+            self.expect_equal("no session/cancel while turn one was generating", 0, cancels)
+            self.expect_equal("number of prompts the fake agent received", 3, len(prompts))
+            if len(prompts) == 3:
+                self.expect_equal("prompt 1 is the first, idle send", "Begin turn one please", prompts[0])
+                self.expect_equal(
+                    "prompt 2 is the queued user message, not the codctl message that queued behind it",
+                    "Queued user message about tax rates",
+                    prompts[1],
+                )
+                self.expect_equal(
+                    "prompt 3 is the codctl message, sent only once the queue ahead of it drained",
+                    "Codctl message about ledger export",
+                    prompts[2],
+                )
 
     # AC4
 
