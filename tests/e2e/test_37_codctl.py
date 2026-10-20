@@ -251,6 +251,28 @@ class CodctlTest(CodTestCase):
             self.wait_for_window({"names": [None, PAY_NAME, None], "folders": [[real(web)], [real(api)], []], "active": 2})
             self.expect_equal("active listed ID", [focused_id], [workspace["id"] for workspace in self.list_json() if workspace["active"]])
 
+    def test_a2_new_on_an_already_open_folder_does_not_duplicate_its_id(self) -> None:
+        """RC review A2: `workspace new --folder X` while X is already open used to restore X's
+        saved database row into a second, independent workspace entity, so both ended up sharing
+        one id and persistence. It must instead find the one already open on that folder."""
+        with self.step("create the fixture repos billing-web and billing-api, and start on billing-web"):
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            api = self.make_work_repo("billing-api", BILLING_API)
+            first = self.start_on(web)
+
+        with self.step("open billing-api as a new workspace"):
+            api_id = self.new_workspace("--folder", str(api))
+            self.wait_for_window({"names": [None, None], "folders": [[real(web)], [real(api)]], "active": 0})
+
+        with self.step("workspace new --folder billing-api again returns the same id, not a third one"):
+            again_id = self.new_workspace("--folder", str(api))
+            self.expect_equal("the second call returns billing-api's existing id", api_id, again_id)
+
+        with self.step("the window still shows exactly two workspaces, and list has no duplicate id"):
+            self.expect_window_stays({"names": [None, None], "folders": [[real(web)], [real(api)]], "active": 0})
+            listed_ids = [workspace["id"] for workspace in self.list_json()]
+            self.expect_equal("still exactly two workspaces, no duplicate id", sorted([first, api_id]), sorted(listed_ids))
+
     # AC3
 
     def test_ac3_list_text_and_json(self) -> None:

@@ -267,12 +267,52 @@ fn id_of(member: &Member) -> Result<WorkspaceId> {
     member.id.context("the workspace has no ID yet")
 }
 
+/// Whether `wanted` and `open` name the same set of folders, order independent and never
+/// matching an empty `wanted` (#A2): the pure half of finding a workspace already open on the
+/// folders `workspace new` was asked for.
+fn same_folder_set(wanted: &[PathBuf], open: &[String]) -> bool {
+    if wanted.is_empty() {
+        return false;
+    }
+    let wanted: std::collections::BTreeSet<String> =
+        wanted.iter().map(|path| path.to_string_lossy().into_owned()).collect();
+    let open: std::collections::BTreeSet<&str> = open.iter().map(String::as_str).collect();
+    wanted.len() == open.len() && wanted.iter().all(|folder| open.contains(folder.as_str()))
+}
+
+/// The live member already open on exactly these folders, if any (#A2).
+fn find_live_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> {
+    members(cx)
+        .into_iter()
+        .find(|member| member.live.is_some() && same_folder_set(folders, &member.folders))
+}
+
 async fn new_workspace(
     name: Option<String>,
     folders: Vec<PathBuf>,
     focus: bool,
     cx: &mut AsyncApp,
 ) -> Result<Value> {
+    // #A2: `Workspace::new_local` restores the saved database row for these roots when one
+    // exists, even while a live workspace already has them open; the new call's workspace
+    // entity would then share that row's id and persistence with the one already showing it.
+    // Canonicalize first, the same as `Workspace::new_local` does before it looks the roots up.
+    let canonical: Vec<PathBuf> = folders
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .collect();
+    if let Some(existing) = cx.update(|cx| find_live_with_same_folders(&canonical, cx)) {
+        // Zed's own answer to opening a folder that is already open is to focus that window
+        // instead of making a second one for it; do the same instead of duplicating the id.
+        let id = id_of(&existing)?;
+        let workspace = existing.live.context("the matching workspace is not live")?;
+        if focus {
+            existing.window.update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace, None, window, cx)
+            })?;
+        }
+        return Ok(json!({ "id": i64::from(id), "already_open": true }));
+    }
     let window = cx
         .update(|cx| target_window(cx))
         .context("Cod has no workspace window")?;
@@ -1150,5 +1190,17 @@ mod tests {
         };
         assert_eq!(check_folders(&present), Ok(()));
         assert_eq!(check_folders(&Request::WorkspaceList), Ok(()));
+    }
+
+    #[test]
+    fn same_folder_set_ignores_order_and_never_matches_nothing_wanted() {
+        // #A2: used to decide whether `workspace new --folder /repo` targets a folder some live
+        // workspace already has open, instead of restoring its saved row into a second entity
+        // that would then share its database id.
+        let wanted = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        assert!(same_folder_set(&wanted, &["/b".to_owned(), "/a".to_owned()]));
+        assert!(!same_folder_set(&wanted, &["/a".to_owned()]));
+        assert!(!same_folder_set(&wanted, &["/a".to_owned(), "/b".to_owned(), "/c".to_owned()]));
+        assert!(!same_folder_set(&[], &["/a".to_owned()]));
     }
 }
