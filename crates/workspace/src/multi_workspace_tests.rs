@@ -1732,8 +1732,9 @@ async fn test_nearest_retained_workspace_skips_disconnected_workspace(cx: &mut T
     });
 }
 
-/// Cod (#25 AC5): a window showing OPS-77 and the workspace PAY-1234 that a pending member's
-/// load creates. Returns the window, OPS-77, PAY-1234 and PAY-1234's id.
+/// Cod (#25 AC5): a window saved as PAY-1234, OPS-77, started again with OPS-77 shown and
+/// PAY-1234 pending, and the workspace PAY-1234 that the pending member's load creates.
+/// Returns the window, OPS-77, PAY-1234 and PAY-1234's id.
 async fn cod_pending_load_fixture(
     cx: &mut TestAppContext,
 ) -> (
@@ -1754,6 +1755,12 @@ async fn cod_pending_load_fixture(
     let ops =
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
     let pay_id = WorkspaceId::from_i64(1234);
+    let ops_id = WorkspaceId::from_i64(77);
+    ops.update(cx, |workspace, _| workspace.set_database_id(ops_id));
+    multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.cod_begin_restore(&[pay_id, ops_id]);
+        multi_workspace.cod_add_pending_workspace(pay_id, vec![PathBuf::from("/billing-api")]);
+    });
     let pay = multi_workspace.update_in(cx, |_, window, cx| {
         cx.new(|cx| {
             let mut workspace = Workspace::test_new(project_pay, window, cx);
@@ -1784,11 +1791,10 @@ async fn test_cod_newest_click_wins_over_a_pending_load_that_shows_its_workspace
             &ops,
             "the newest click (OPS-77) must stay shown"
         );
-        assert!(
-            multi_workspace
-                .workspaces()
-                .any(|workspace| workspace == &pay),
-            "the loaded workspace must still join the window"
+        assert_eq!(
+            multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+            vec![pay.clone(), ops.clone()],
+            "the loaded workspace must join the window at its saved place"
         );
     });
 
@@ -1818,10 +1824,10 @@ async fn test_cod_a_pending_load_shows_its_workspace_without_a_newer_request(
             &pay,
             "the only request must show PAY-1234"
         );
-        assert!(
-            multi_workspace
-                .workspaces()
-                .any(|workspace| workspace == &ops)
+        assert_eq!(
+            multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+            vec![pay.clone(), ops.clone()],
+            "the loaded workspace must join the window at its saved place"
         );
     });
 }

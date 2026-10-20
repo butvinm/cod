@@ -368,7 +368,7 @@ pub struct MultiWorkspace {
     cod_materializing: bool,
     /// Cod (#25 AC5): the pending member loading now and the stamp of the request that asked
     /// for it, until the load shows (or only adds) the workspace it creates. See
-    /// `cod_is_stale_load_activation`.
+    /// `cod_join_loading_member`.
     cod_loading: Option<(WorkspaceId, u64)>,
     /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
     /// key it was saved under.
@@ -1635,8 +1635,7 @@ impl MultiWorkspace {
     ) {
         // Cod (#25 AC5): a pending member's load shows the workspace it creates, unless a newer
         // request came in while it loaded; then the workspace only joins the window.
-        if self.cod_is_stale_load_activation(&workspace, cx) {
-            self.add(workspace, window, cx);
+        if !self.cod_join_loading_member(&workspace, window, cx) {
             return;
         }
 

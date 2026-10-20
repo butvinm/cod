@@ -639,27 +639,35 @@ impl MultiWorkspace {
         self.cod_pending.insert(id, paths);
     }
 
-    /// Cod (#25 AC5): whether this `activate` call is a pending member's load showing the
-    /// workspace it just created, for a request that a newer one (a click on another tab, for
-    /// example) replaced while it loaded. Every load path shows the workspace itself as soon as
-    /// it creates it (`OpenMode::Activate`, `open_workspace_by_id`, the remote opener), before
-    /// the load's completion checks the request stamp, so without this check a slow load would
-    /// switch the window back to it. Only the load's first activation of that workspace is
-    /// checked (nothing else holds the new workspace before it); later requests to show it are
-    /// never held back.
-    pub(super) fn cod_is_stale_load_activation(
+    /// Cod (#25 AC5): called by `activate`; false when `activate` must not show `workspace`.
+    ///
+    /// Every load path of a pending member shows the workspace it creates as soon as it creates
+    /// it (`OpenMode::Activate`, `open_workspace_by_id`, the remote opener), long before the
+    /// load's completion checks the request stamp. When that activation is the loading member's
+    /// (only its first one is checked: nothing else holds the new workspace before it), the
+    /// workspace joins the window at its saved place, not at the end, and is shown only when no
+    /// newer request (a click on another tab, for example) came in while it loaded. Any other
+    /// activation is left alone.
+    pub(super) fn cod_join_loading_member(
         &mut self,
         workspace: &Entity<Workspace>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some((id, stamp)) = self.cod_loading else {
-            return false;
+            return true;
         };
         if workspace.read(cx).database_id() != Some(id) {
-            return false;
+            return true;
         }
         self.cod_loading = None;
-        CodActivationIntents::current(cx, cx.entity_id()) != stamp
+        // Read while the member is still listed as pending, at its saved place.
+        let order = self.cod_saved_workspace_ids(cx);
+        let key = workspace.read(cx).project_group_key(cx);
+        let index = self.hold(workspace.clone(), window, cx);
+        self.pin(index, key, cx);
+        self.cod_order_workspaces(&order, cx);
+        CodActivationIntents::current(cx, cx.entity_id()) == stamp
     }
 
     /// Cod (#25 AC5): marks the member `id` as loading for a fresh request, as
