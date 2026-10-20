@@ -1831,3 +1831,91 @@ async fn test_cod_a_pending_load_shows_its_workspace_without_a_newer_request(
         );
     });
 }
+
+#[gpui::test]
+async fn test_cod_tab_click_survives_a_load_shown_between_press_and_release(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        // A click on the pending PAY-1234 started its load...
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        // ...the button goes down on the OPS-77 tab...
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        // ...and before it comes up the load shows PAY-1234, whose title bar now draws the tabs.
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &pay,
+            "a press alone must not show a workspace"
+        );
+        assert!(multi_workspace.cod_tab_pressed());
+    });
+
+    // The release over the OPS-77 tab of the new title bar completes the click.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_release_tab(&CodMember::Live(ops.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(shown, "the release over the pressed workspace's tab is a click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &ops);
+        assert!(!multi_workspace.cod_tab_pressed());
+    });
+}
+
+#[gpui::test]
+async fn test_cod_tab_release_elsewhere_is_no_click(cx: &mut TestAppContext) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Down on OPS-77, up on PAY-1234: no click, as in Zed.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        multi_workspace.cod_release_tab(&CodMember::Live(pay.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!shown, "a release over another tab is no click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+        assert!(!multi_workspace.cod_tab_pressed(), "the release ends the press");
+    });
+
+    // Down on OPS-77, up outside the tabs, then up over OPS-77 without a new press: no click.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        multi_workspace.cod_cancel_tab_press();
+        multi_workspace.cod_release_tab(&CodMember::Live(ops.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!shown, "a release without a press on the tab is no click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}
+
+#[gpui::test]
+async fn test_cod_pending_tab_press_matches_its_loaded_tab(cx: &mut TestAppContext) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    // The button goes down on the tab of PAY-1234 while it is still pending; the release lands
+    // on the tab drawn for the loaded PAY-1234.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Pending(pay_id), cx);
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+        multi_workspace.cod_show_member(CodMember::Live(ops.clone()), window, cx);
+        multi_workspace.cod_release_tab(&CodMember::Live(pay.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(shown, "a pending tab and its loaded tab are the same tab");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}

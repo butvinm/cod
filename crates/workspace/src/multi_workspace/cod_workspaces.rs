@@ -105,6 +105,35 @@ pub enum CodMember {
     Pending(WorkspaceId),
 }
 
+/// Cod (#25 AC5): the workspace tab the left button went down on, kept by the window's
+/// `MultiWorkspace` rather than by the tab element. Each workspace draws its own title bar, so
+/// when a pending workspace finishes loading between the press and the release, the release
+/// lands on a tab of another title bar. The tab is known by its workspace id and by its
+/// workspace entity, so a pending member's press matches the same member once it is loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CodTabPress {
+    id: Option<WorkspaceId>,
+    entity: Option<gpui::EntityId>,
+}
+
+impl CodTabPress {
+    fn of(member: &CodMember, cx: &App) -> Self {
+        Self {
+            id: MultiWorkspace::cod_member_id(member, cx),
+            entity: match member {
+                CodMember::Live(workspace) => Some(workspace.entity_id()),
+                CodMember::Pending(_) => None,
+            },
+        }
+    }
+
+    /// Whether `other` stands for the same workspace tab.
+    fn same_tab(&self, other: &Self) -> bool {
+        (self.id.is_some() && self.id == other.id)
+            || (self.entity.is_some() && self.entity == other.entity)
+    }
+}
+
 /// The key-value scope that holds the workspace names, keyed by workspace id.
 const NAMES_SCOPE: &str = "cod_workspace_names";
 
@@ -1068,6 +1097,43 @@ impl MultiWorkspace {
             .iter()
             .find(|held| held.workspace.read(cx).database_id() == Some(id))
             .and_then(|held| held.activated_at)
+    }
+
+    /// Cod (#25 AC5): the left button went down on the tab of `member`. The tab acts on the
+    /// release, as a Zed tab acts on a click (`cod_release_tab`).
+    pub fn cod_press_tab(&mut self, member: &CodMember, cx: &App) {
+        self.cod_pressed_tab = Some(CodTabPress::of(member, cx));
+    }
+
+    /// Cod (#25 AC5): the left button came up over the tab of `member`. When it went down on the
+    /// same workspace's tab, in this title bar or in the one shown before a pending workspace
+    /// finished loading, the member is shown, as on a click. Returns whether it was. Either way
+    /// the press is over.
+    pub fn cod_release_tab(
+        &mut self,
+        member: &CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pressed) = self.cod_pressed_tab.take() else {
+            return false;
+        };
+        if !pressed.same_tab(&CodTabPress::of(member, cx)) {
+            return false;
+        }
+        self.cod_show_member(member.clone(), window, cx);
+        true
+    }
+
+    /// Cod (#25 AC5): the left button came up anywhere but over a tab, so a pending press is no
+    /// click, as in Zed.
+    pub fn cod_cancel_tab_press(&mut self) {
+        self.cod_pressed_tab = None;
+    }
+
+    /// Cod (#25 AC5): whether a press on a workspace tab waits for its release.
+    pub fn cod_tab_pressed(&self) -> bool {
+        self.cod_pressed_tab.is_some()
     }
 
     /// Cod (#25): shows the member, loading it first when it is pending.

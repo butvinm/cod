@@ -370,6 +370,10 @@ pub struct MultiWorkspace {
     /// for it, until the load shows (or only adds) the workspace it creates. See
     /// `cod_join_loading_member`.
     cod_loading: Option<(WorkspaceId, u64)>,
+    /// Cod (#25 AC5): the workspace tab the left button is down on, shared by the title bars of
+    /// all members so its release still counts after the shown workspace changed. See
+    /// `cod_press_tab`.
+    cod_pressed_tab: Option<cod_workspaces::CodTabPress>,
     /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
     /// key it was saved under.
     cod_window_key: String,
@@ -470,6 +474,7 @@ impl MultiWorkspace {
             cod_pending_remote: std::collections::HashMap::new(),
             cod_materializing: false,
             cod_loading: None,
+            cod_pressed_tab: None,
             // Cod (#24): a restored window has its saved key from its restore owner; a window
             // opened for a moving project takes its reserved key after it is built
             // (`cod_set_window_key`).

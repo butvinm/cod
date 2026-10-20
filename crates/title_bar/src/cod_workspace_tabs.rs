@@ -1,6 +1,6 @@
 //! Cod (#25): the workspaces of the window as quiet tabs in the title bar, in window order, each
 //! with a status dot only when something is happening, followed by a "+" that opens a new
-//! workspace. Pressing a tab shows its workspace (a pending one loads first).
+//! workspace. Clicking a tab shows its workspace (a pending one loads first).
 //!
 //! Names follow "[ISSUE-ID] title" (D27): the leading "[ID]" is always shown whole and only the
 //! rest is cut with "...". The full name is the tab's tooltip.
@@ -258,13 +258,24 @@ pub fn render_cod_workspace_tabs(
             .cursor_pointer()
             .child(content)
             .tooltip(Tooltip::text(name.clone()))
-            // The press shows the workspace, not the release (#25 AC5): each workspace draws its
-            // own title bar, so when a pending workspace finishes loading and is shown between
-            // the press and the release, the release lands on another title bar's tab and a
-            // click would be lost; the newest press must win.
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            // A click shows the workspace, as a click on a Zed tab does: the press and then the
+            // release over the same workspace's tab (#25 AC5). The press is kept by the window's
+            // `MultiWorkspace`, not by this element: each workspace draws its own title bar, so
+            // when a pending workspace finishes loading and is shown between the press and the
+            // release, the release lands on the new title bar's tab for the same workspace.
+            .on_mouse_down(MouseButton::Left, {
+                let weak = weak.clone();
+                let member = member.clone();
+                move |_, _window, cx| {
+                    weak.update(cx, |multi_workspace, cx| {
+                        multi_workspace.cod_press_tab(&member, cx)
+                    })
+                    .ok();
+                }
+            })
+            .on_mouse_up(MouseButton::Left, move |_, window, cx| {
                 weak.update(cx, |multi_workspace, cx| {
-                    multi_workspace.cod_show_member(member.clone(), window, cx)
+                    multi_workspace.cod_release_tab(&member, window, cx)
                 })
                 .ok();
             });
@@ -282,10 +293,19 @@ pub fn render_cod_workspace_tabs(
         add_button: None,
     };
 
+    // A release anywhere but over the pressed tab ends the press without a click. The row's
+    // own release listener runs after the tab's (children first), so a release over a tab
+    // gets its chance first; a release outside the row is seen here too.
+    let cancel = move |_: &gpui::MouseUpEvent, _: &mut Window, cx: &mut App| {
+        weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
+            .ok();
+    };
     h_flex()
         .h_full()
         .min_w_0()
         .overflow_x_hidden()
+        .on_mouse_up(MouseButton::Left, cancel.clone())
+        .on_mouse_up_out(MouseButton::Left, cancel)
         .on_children_prepainted(move |bounds, _window, _cx| {
             let mut layout = layout.borrow_mut();
             let tab_count = layout.tabs.len();
