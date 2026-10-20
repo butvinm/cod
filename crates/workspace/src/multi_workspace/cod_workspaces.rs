@@ -639,6 +639,38 @@ impl MultiWorkspace {
         self.cod_pending.insert(id, paths);
     }
 
+    /// Cod (#25 AC5): whether this `activate` call is a pending member's load showing the
+    /// workspace it just created, for a request that a newer one (a click on another tab, for
+    /// example) replaced while it loaded. Every load path shows the workspace itself as soon as
+    /// it creates it (`OpenMode::Activate`, `open_workspace_by_id`, the remote opener), before
+    /// the load's completion checks the request stamp, so without this check a slow load would
+    /// switch the window back to it. Only the load's first activation of that workspace is
+    /// checked (nothing else holds the new workspace before it); later requests to show it are
+    /// never held back.
+    pub(super) fn cod_is_stale_load_activation(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((id, stamp)) = self.cod_loading else {
+            return false;
+        };
+        if workspace.read(cx).database_id() != Some(id) {
+            return false;
+        }
+        self.cod_loading = None;
+        CodActivationIntents::current(cx, cx.entity_id()) != stamp
+    }
+
+    /// Cod (#25 AC5): marks the member `id` as loading for a fresh request, as
+    /// `cod_activate_pending` does, without loading anything; returns the request's stamp.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cod_test_begin_load(&mut self, id: WorkspaceId, cx: &mut Context<Self>) -> u64 {
+        let stamp = CodActivationIntents::bump(cx, cx.entity_id());
+        self.cod_loading = Some((id, stamp));
+        stamp
+    }
+
     /// Loads a pending member in the foreground and shows it, at its place in the window
     /// order and with its id. On failure it stays pending, so a later switch tries again.
     pub(super) fn cod_activate_pending(
@@ -696,6 +728,7 @@ impl MultiWorkspace {
         let order: Vec<WorkspaceId> = self.cod_saved_workspace_ids(cx);
         let app_state = self.workspace().read(cx).app_state().clone();
         self.cod_materializing = true;
+        self.cod_loading = Some((id, activation_intent));
         cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = if let Some(connection) = remote {
                 // A remote member loads its exact saved row over its saved connection.
@@ -736,6 +769,7 @@ impl MultiWorkspace {
             };
             this.update_in(cx, |this, window, cx| {
                 this.cod_materializing = false;
+                this.cod_loading = None;
                 let loaded = this
                     .held
                     .iter()

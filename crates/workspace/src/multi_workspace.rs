@@ -366,6 +366,10 @@ pub struct MultiWorkspace {
     cod_pending_remote: std::collections::HashMap<WorkspaceId, RemoteConnectionOptions>,
     /// Cod (#24): true while a pending member loads; other activation requests wait for it.
     cod_materializing: bool,
+    /// Cod (#25 AC5): the pending member loading now and the stamp of the request that asked
+    /// for it, until the load shows (or only adds) the workspace it creates. See
+    /// `cod_is_stale_load_activation`.
+    cod_loading: Option<(WorkspaceId, u64)>,
     /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
     /// key it was saved under.
     cod_window_key: String,
@@ -465,6 +469,7 @@ impl MultiWorkspace {
             cod_pending: std::collections::HashMap::new(),
             cod_pending_remote: std::collections::HashMap::new(),
             cod_materializing: false,
+            cod_loading: None,
             // Cod (#24): a restored window has its saved key from its restore owner; a window
             // opened for a moving project takes its reserved key after it is built
             // (`cod_set_window_key`).
@@ -1628,6 +1633,13 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Cod (#25 AC5): a pending member's load shows the workspace it creates, unless a newer
+        // request came in while it loaded; then the workspace only joins the window.
+        if self.cod_is_stale_load_activation(&workspace, cx) {
+            self.add(workspace, window, cx);
+            return;
+        }
+
         if self.workspace() == &workspace {
             self.focus_active_workspace(window, cx);
             return;

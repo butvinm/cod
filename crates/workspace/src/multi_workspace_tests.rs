@@ -1731,3 +1731,81 @@ async fn test_nearest_retained_workspace_skips_disconnected_workspace(cx: &mut T
         );
     });
 }
+
+/// Cod (#25 AC5): a window showing OPS-77 and the workspace PAY-1234 that a pending member's
+/// load creates. Returns the window, OPS-77, PAY-1234 and PAY-1234's id.
+async fn cod_pending_load_fixture(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<MultiWorkspace>,
+    &mut VisualTestContext,
+    Entity<Workspace>,
+    Entity<Workspace>,
+    WorkspaceId,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/billing-api", json!({ "README.md": "" })).await;
+    fs.insert_tree("/infra", json!({ "README.md": "" })).await;
+    let project_ops = Project::test(fs.clone(), ["/infra".as_ref()], cx).await;
+    let project_pay = Project::test(fs, ["/billing-api".as_ref()], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_ops], cx);
+    let ops = multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let pay_id = WorkspaceId::from_i64(1234);
+    let pay = multi_workspace.update_in(cx, |_, window, cx| {
+        cx.new(|cx| {
+            let mut workspace = Workspace::test_new(project_pay, window, cx);
+            workspace.set_database_id(pay_id);
+            workspace
+        })
+    });
+    (multi_workspace, cx, ops, pay, pay_id)
+}
+
+#[gpui::test]
+async fn test_cod_newest_click_wins_over_a_pending_load_that_shows_its_workspace(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        // A click on the pending PAY-1234 starts its load...
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        // ...then a click on OPS-77, shown already, comes before the load creates PAY-1234.
+        multi_workspace.cod_show_member(CodMember::Live(ops.clone()), window, cx);
+        // The load creates PAY-1234 and shows it, as `OpenMode::Activate` does.
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &ops, "the newest click (OPS-77) must stay shown");
+        assert!(
+            multi_workspace.workspaces().any(|workspace| workspace == &pay),
+            "the loaded workspace must still join the window"
+        );
+    });
+
+    // A later click on the loaded PAY-1234 shows it.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_show_member(CodMember::Live(pay.clone()), window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}
+
+#[gpui::test]
+async fn test_cod_a_pending_load_shows_its_workspace_without_a_newer_request(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay, "the only request must show PAY-1234");
+        assert!(multi_workspace.workspaces().any(|workspace| workspace == &ops));
+    });
+}
