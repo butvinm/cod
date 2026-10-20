@@ -210,8 +210,12 @@ class CodctlSessionsTest(CodTestCase):
             )
             self.start_with_agents(script, None)
 
-        with self.step("start a session, type an unsent draft, then send a different message"):
+        with self.step("start a session, focus its message box, type an unsent draft, then send a different message"):
             session_id = self.new_session("claude")
+            # codctl session new starts the chat without giving the window real keyboard focus
+            # (no UI click or keystroke caused it), unlike opening a chat by hand; focus it for
+            # real before typing, the same as every other test that types into a chat.
+            self.run_command("agent: toggle focus")
             self.wait_for(
                 lambda state: state.get("agent_panel_focused") is True,
                 SHOW_TIMEOUT,
