@@ -12,6 +12,7 @@
 //! - A request with another `v` gets an error reply, so a newer `codctl` fails clearly against an older Cod. The `id` lets one connection carry several requests later (`codctl events`, #41).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
@@ -1268,12 +1269,19 @@ fn parse_session_cli(args: &[String], env: &dyn Fn(&str) -> Option<String>) -> R
             };
             let timeout = match options.timeout.as_deref() {
                 None => None,
-                Some(text) => Some(
-                    text.parse::<f64>()
+                Some(text) => {
+                    let seconds = text
+                        .parse::<f64>()
                         .ok()
-                        .filter(|seconds| *seconds > 0.)
-                        .ok_or_else(|| format!("--timeout must be a number of seconds greater than 0, not {text:?}"))?,
-                ),
+                        .filter(|seconds| seconds.is_finite() && *seconds > 0.)
+                        .ok_or_else(|| format!("--timeout must be a number of seconds greater than 0, not {text:?}"))?;
+                    // A finite, positive `f64` can still be too large for `Duration` to hold
+                    // (#A1: `--timeout 1e30` used to pass this check and panic in codctl_server).
+                    if Duration::try_from_secs_f64(seconds).is_err() {
+                        return Err(format!("--timeout is too large to use, not {text:?}"));
+                    }
+                    Some(seconds)
+                }
             };
             Request::SessionWait {
                 session: session.clone(),
@@ -1457,15 +1465,17 @@ pub fn render(request: &Request, json: bool, result: &Value) -> (String, i32) {
             (format!("{state}\t{line}\n"), EXIT_OK)
         }
         Request::OpenAgentPage { .. } => {
-            if json {
-                return (format!("{result}\n"), EXIT_OK);
-            }
             // `--wait`: the page was submitted (prints the value) or its tab was closed instead
             // (prints nothing; EXIT_KEPT is reused for the "closed instead" exit code, 2, #43 AC2).
+            // #A7: the closed case must exit 2 in `--json` too, not just in the plain output.
+            let closed = result.get("closed").and_then(Value::as_bool) == Some(true);
+            if json {
+                return (format!("{result}\n"), if closed { EXIT_KEPT } else { EXIT_OK });
+            }
             if let Some(value) = result.get("value").and_then(Value::as_str) {
                 return (format!("{value}\n"), EXIT_OK);
             }
-            if result.get("closed").and_then(Value::as_bool) == Some(true) {
+            if closed {
                 return (String::new(), EXIT_KEPT);
             }
             let id = result.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -1516,6 +1526,28 @@ mod tests {
         assert_eq!(
             socket_path(&env_of(&[("USER", "ana")])),
             std::env::temp_dir().join("cod-ana").join("codctl.sock")
+        );
+    }
+
+    #[test]
+    fn session_wait_rejects_a_timeout_duration_cannot_hold() {
+        // #A1: `1e30` is finite and positive, so it used to reach codctl_server and panic in
+        // `Duration::from_secs_f64`. codctl's own parsing now rejects it before sending anything.
+        assert!(parse(&["session", "wait", "s1", "--until", "idle", "--timeout", "1e30"], &[]).is_err());
+        assert!(parse(&["session", "wait", "s1", "--until", "idle", "--timeout", "inf"], &[]).is_err());
+        assert!(parse(&["session", "wait", "s1", "--until", "idle", "--timeout", "nan"], &[]).is_err());
+        assert!(parse(&["session", "wait", "s1", "--until", "idle", "--timeout", "-1"], &[]).is_err());
+        let ok = parse(&["session", "wait", "s1", "--until", "idle", "--timeout", "20"], &[]);
+        assert_eq!(
+            ok,
+            run(
+                Request::SessionWait {
+                    session: "s1".to_owned(),
+                    until: "idle".to_owned(),
+                    timeout: Some(20.0),
+                },
+                false
+            )
         );
     }
 
@@ -1673,6 +1705,24 @@ mod tests {
         let close = Request::WorkspaceClose { workspace: "1".to_owned(), force: false };
         assert_eq!(render(&close, false, &json!({"closed": true})), (String::new(), EXIT_OK));
         assert_eq!(render(&close, false, &json!({"closed": false})), (String::new(), EXIT_KEPT));
+    }
+
+    #[test]
+    fn open_html_wait_exits_kept_when_closed_in_json_too() {
+        // #A7: `open --html FILE --wait --json` used to exit 0 when the page was closed without
+        // submitting, unlike the plain output, which already exited `EXIT_KEPT` (2).
+        let open = Request::OpenAgentPage {
+            workspace: None,
+            html: PathBuf::from("/a.html"),
+            wait: true,
+            js: false,
+        };
+        let closed = json!({"closed": true});
+        assert_eq!(render(&open, false, &closed), (String::new(), EXIT_KEPT));
+        assert_eq!(render(&open, true, &closed).1, EXIT_KEPT);
+        let submitted = json!({"value": "yes"});
+        assert_eq!(render(&open, false, &submitted), ("yes\n".to_owned(), EXIT_OK));
+        assert_eq!(render(&open, true, &submitted).1, EXIT_OK);
     }
 
     #[test]

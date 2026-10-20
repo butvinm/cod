@@ -81,6 +81,17 @@ pub async fn send_message(session_id: String, text: String, cx: &mut AsyncApp) -
     Ok(json!({}))
 }
 
+/// Turns `--timeout` seconds into a `Duration`, never panicking (#A1): rejects negative,
+/// non-finite (NaN, infinite) values and values too large for `Duration` to hold, instead of
+/// letting `Duration::from_secs_f64` panic on them (`codctl session wait <id> --until idle
+/// --timeout 1e30` used to crash Cod this way).
+fn timeout_duration(secs: f64) -> Result<Duration> {
+    if !secs.is_finite() || secs < 0.0 {
+        bail!("--timeout must be a finite, non-negative number of seconds, not {secs}");
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| anyhow::anyhow!("--timeout is too large to represent"))
+}
+
 /// `codctl session wait` (#39 AC4): polls the session's state until it reaches `until`, the
 /// timeout runs out, or the session fails.
 pub async fn wait_session(
@@ -92,7 +103,14 @@ pub async fn wait_session(
     if !matches!(until.as_str(), "idle" | "needs-input") {
         bail!("--until must be idle or needs-input, not {until}");
     }
-    let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs_f64(secs.max(0.)));
+    let deadline = match timeout {
+        Some(secs) => Some(
+            Instant::now()
+                .checked_add(timeout_duration(secs)?)
+                .context("--timeout is too large to represent")?,
+        ),
+        None => None,
+    };
     loop {
         let Some((_, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
             bail!("unknown session {session_id}");
@@ -138,4 +156,27 @@ pub async fn session_status(session_id: String, line: Option<String>, cx: &mut A
         .find(|info| info.id == session_id)
         .with_context(|| format!("unknown session {session_id}"))?;
     Ok(json!({ "state": info.state, "line": info.line }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::timeout_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn timeout_duration_rejects_what_duration_cannot_hold() {
+        // #A1: `codctl session wait <id> --until idle --timeout 1e30` used to panic in
+        // `Duration::from_secs_f64` here, on the app's foreground thread.
+        assert!(timeout_duration(1e30).is_err());
+        assert!(timeout_duration(f64::MAX).is_err());
+        assert!(timeout_duration(f64::INFINITY).is_err());
+        assert!(timeout_duration(f64::NAN).is_err());
+        assert!(timeout_duration(-1.0).is_err());
+    }
+
+    #[test]
+    fn timeout_duration_accepts_an_ordinary_timeout() {
+        assert_eq!(timeout_duration(20.0).unwrap(), Duration::from_secs_f64(20.0));
+        assert_eq!(timeout_duration(0.0).unwrap(), Duration::ZERO);
+    }
 }
