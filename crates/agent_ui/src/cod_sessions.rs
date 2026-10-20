@@ -16,8 +16,9 @@
 use std::collections::{HashMap, HashSet};
 
 use acp_thread::{AcpThread, AgentThreadEntry, ToolCallStatus};
+use agent_client_protocol::schema::v1 as acp_v1;
 use anyhow::{Context as _, Result};
-use gpui::{App, AppContext as _, Entity, Global, SharedString, Window};
+use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, Window};
 use project::AgentId;
 use workspace::Workspace;
 
@@ -148,13 +149,17 @@ fn find_chat(
     })
 }
 
-/// Sends the text as the user's message in this session and starts the agent (#39 AC3): the same
-/// as typing the text and pressing Enter, but without disturbing a draft the user already typed.
+/// Sends the text as the user's message in this session and starts the agent (#39 AC3), the same
+/// way the message box's own submit does, but without ever touching the box's live contents.
 ///
-/// `insert_text` inserts at the user's current cursor, so setting the box's text this way and
-/// sending used to submit the draft and the requested text together, then clear the box: an
-/// unsent draft was silently sent along with the command and lost (#C2). Instead, the box's
-/// contents are swapped out for the submission and the draft is put back afterwards.
+/// Setting the box's text through `insert_text` (at the user's cursor) and sending used to
+/// submit the draft the user had not sent yet together with the requested text, then clear the
+/// box: an unsent draft was silently sent along with the command and lost (#C2). Clearing the
+/// box, inserting the requested text and restoring the draft afterwards does not fix this: the
+/// box's contents are read by a task spawned when sending starts, not read synchronously by it,
+/// so a draft restored right after that call returns can still be swept up by that task once it
+/// runs. `ThreadView::send_content` takes finished content blocks directly and never reads the
+/// box at all, so the draft is never at risk.
 pub fn send_message(
     workspace: &Entity<Workspace>,
     session_id: &str,
@@ -168,33 +173,11 @@ pub fn send_message(
         .read(cx)
         .root_thread_view()
         .context("the chat has no message box yet")?;
-    let draft = thread_view.read(cx).message_editor.read(cx).text(cx);
-    log::warn!("C2-DEBUG draft before={draft:?}");
+    let contents: Vec<acp_v1::ContentBlock> =
+        vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(text.to_owned()))];
     thread_view.update(cx, |view, cx| {
-        view.message_editor.update(cx, |editor, cx| {
-            editor.clear(window, cx);
-            editor.insert_text(text, window, cx);
-        });
+        view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
     });
-    log::warn!(
-        "C2-DEBUG editor text after clear+insert={:?}",
-        thread_view.read(cx).message_editor.read(cx).text(cx)
-    );
-    thread_view.update(cx, |view, cx| view.send(window, cx));
-    log::warn!(
-        "C2-DEBUG editor text after send={:?}",
-        thread_view.read(cx).message_editor.read(cx).text(cx)
-    );
-    if !draft.is_empty() {
-        thread_view.update(cx, |view, cx| {
-            view.message_editor
-                .update(cx, |editor, cx| editor.insert_text(&draft, window, cx));
-        });
-    }
-    log::warn!(
-        "C2-DEBUG editor text after restore={:?}",
-        thread_view.read(cx).message_editor.read(cx).text(cx)
-    );
     Ok(())
 }
 
