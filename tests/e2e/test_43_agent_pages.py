@@ -48,10 +48,13 @@ def ask_html(session_id: str = SESSION_ID) -> str:
     that would change the heading if it ran. Every interactive element is an absolutely
     positioned, full box of its own, at a known position, so a test can click it precisely.
     """
+    # The driver exposes the page rectangle, not DOM element rectangles.
+    # A flow root keeps the h1's margin inside the body, so its positioned boxes
+    # use the page origin assumed by click_in_page instead of a collapsed margin.
     box = "position:absolute;left:{left}px;top:{top}px;width:220px;height:30px;"
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
-        '<body style="margin:0;position:relative">'
+        '<body style="margin:0;position:relative;display:flow-root">'
         '<h1 id="heading">Ask</h1>'
         f'<input id="answer" type="text" autofocus style="{box.format(left=0, top=0)}">'
         f'<button data-cod="submit" data-cod-value-from="#answer" '
