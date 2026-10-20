@@ -3455,7 +3455,9 @@ dependencies = [
 name = "codctl"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -21641,6 +21643,7 @@ dependencies = [
  "objc2-web-kit",
  "paths",
  "project",
+ "rand 0.9.4",
  "serde_json",
  "settings",
  "smallvec",
