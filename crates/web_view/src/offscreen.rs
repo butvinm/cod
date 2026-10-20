@@ -568,10 +568,18 @@ impl OffscreenView {
                     log::info!("web_view: address {url}");
                     // RC review B2: once the main frame's address no longer names the agent
                     // document this page was built from, its bridge is refused for good, even if
-                    // a later navigation happens to return to the same address.
-                    if self.agent_document_url.as_deref().is_some_and(|agent_url| agent_url != url.as_str())
-                        && !self.agent_navigated_away
-                    {
+                    // a later navigation happens to return to the same address. The engine
+                    // truncates any address it reports to `protocol::MAX_URL_BYTES` (RC review
+                    // #1), so a long agent document's own address comes back shortened on every
+                    // load; treat that truncation of the original as still the same document.
+                    let is_agent_document = self.agent_document_url.as_deref().is_some_and(
+                        |agent_url| {
+                            agent_url == url.as_str()
+                                || protocol::limited(agent_url, protocol::MAX_URL_BYTES)
+                                    == url.as_str()
+                        },
+                    );
+                    if !is_agent_document && !self.agent_navigated_away {
                         self.agent_navigated_away = true;
                         log::warn!(
                             "web_view: {} navigated away from its agent document to {url:?}: its bridge is refused from now on",

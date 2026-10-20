@@ -20,23 +20,12 @@ use crate::protocol::{self, FromBrowser, ToBrowser};
 
 const MAX_CONSOLE_BYTES: usize = 4096;
 const MAX_TITLE_BYTES: usize = 1024;
-const MAX_URL_BYTES: usize = 8192;
 const MAX_PENDING_CONSOLE: usize = 64;
 
 /// Console messages queued for sending and not yet written.
 static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 
-/// Cuts text from the page to at most `limit` bytes on a character boundary, so no message can exceed what Cod accepts.
-fn limited(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_owned()
-}
+use protocol::{MAX_URL_BYTES, limited};
 
 enum Outgoing {
     Message(FromBrowser),

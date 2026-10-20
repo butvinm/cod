@@ -75,6 +75,54 @@ def ask_html(session_id: str = SESSION_ID, open_file_path: str = "src/invoice.rs
     )
 
 
+def large_ask_html() -> str:
+    """RC review new defect #1: well over 6 KiB of invented filler, so the page's own `data:`
+    address is longer than the engine's 8192-byte diagnostic cap and every reported address
+    comes back truncated, starting with the very first load. Submitting must still answer
+    `--wait`.
+    """
+    box = "position:absolute;left:{left}px;top:{top}px;width:220px;height:30px;"
+    filler = "invented filler text for RC review new defect number one. " * 200
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+        f"<!-- {filler} -->"
+        '<body style="margin:0;position:relative;display:flow-root">'
+        '<h1 id="heading">Ask (large page)</h1>'
+        f'<input id="answer" type="text" autofocus value="half-even" style="{box.format(left=0, top=0)}">'
+        f'<button data-cod="submit" data-cod-value-from="#answer" '
+        f'style="{box.format(left=230, top=0)}">Send</button>'
+        "</body></html>"
+    )
+
+
+def head_in_comment_onerror_html() -> str:
+    """RC review B1: `<head>` only ever appears inside an HTML comment, which used to capture
+    Cod's CSP and bootstrap injection point; the onerror handler then tries to forge a submit.
+    """
+    return (
+        "<!-- <head> -->"
+        "<body>"
+        "<img src=\"data:,\" onerror=\"window.cod.call('submit',{value:'forged'})\">"
+        "</body>"
+    )
+
+
+def subframe_bridge_forge_html() -> str:
+    """RC review B2: an agent page (no --js) with a same-origin `srcdoc` iframe that logs a
+    `cod:bridge:` console message of its own. Console messages carry no frame identity, so
+    without `frame-src 'none'` this could forge a submit from inside the subframe.
+    """
+    inner = (
+        "<script>console.log(\"cod:bridge:\" + JSON.stringify("
+        "{name:\"submit\",args:{value:\"forged-from-iframe\"}}));</script>"
+    )
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head><body>"
+        f"<iframe srcdoc='{inner}'></iframe>"
+        "</body></html>"
+    )
+
+
 def forged_onerror_html() -> str:
     """RC review B1: an inline event handler, not a `<script>` element, that tries to forge a
     submit through the bridge. Stripping `<script>` blocks alone does not stop it; only blocking
@@ -599,6 +647,89 @@ class AgentPagesTest(CodTestCase):
                         None,
                         process.poll(),
                     )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    # RC review new defect #1 (regression): a page over about 6 KiB must not trip the
+    # navigated-away latch on its own first load, just because the engine truncates the address
+    # it reports.
+
+    def test_rc1_a_large_agent_page_still_answers_wait(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open --html --wait on a page over 10 KiB, and submit by a real mouse click"):
+            html_path = self.write_html("large.html", large_ask_html())
+            fixture_size = len(html_path.read_text())
+            if fixture_size <= 10 * 1024:
+                raise AssertionError(f"the large-page fixture is only {fixture_size} bytes, not over 10 KiB")
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                page_id = None
+                deadline = time.monotonic() + LOAD_TIMEOUT
+                while page_id is None:
+                    state = self.state()
+                    candidates = [page["id"] for page in pages(state) if page.get("state") == "loaded"]
+                    if candidates:
+                        page_id = candidates[-1]
+                    elif time.monotonic() > deadline:
+                        raise AssertionError("codctl open --html --wait never showed a loaded page")
+                    else:
+                        time.sleep(0.1)
+
+                # The Send button sits at left 230, top 0 (large_ask_html's own box layout).
+                self.click_in_page(page_id, 240, 10)
+                stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+            self.expect_equal("codctl open --html --wait exit code (large page)", 0, process.returncode)
+            self.expect_equal("codctl open --html --wait stdout (large page)", "half-even\n", stdout)
+            self.expect_equal("codctl open --html --wait stderr (large page)", "", stderr)
+
+    # RC review B1 (security): a `<head>` tag hidden inside an HTML comment must not capture
+    # Cod's CSP and bootstrap injection point.
+
+    def test_rc_b1_head_inside_a_comment_does_not_bypass_the_csp(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open a page whose only <head> is inside a comment, without --js"):
+            html_path = self.write_html("head-in-comment.html", head_in_comment_onerror_html())
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                time.sleep(SETTLE_TIME)
+                self.expect_equal(
+                    "codctl open --html --wait exited on its own (head in comment, forged onerror, no --js)",
+                    None,
+                    process.poll(),
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
+    # RC review B2 (security): a subframe must not be able to forge a bridge call, even without
+    # --js.
+
+    def test_rc_b2_an_iframe_cannot_forge_a_bridge_submit_without_js(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open a page with a same-origin srcdoc iframe that logs a forged cod:bridge message"):
+            html_path = self.write_html("subframe-forge.html", subframe_bridge_forge_html())
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                time.sleep(SETTLE_TIME)
+                self.expect_equal(
+                    "codctl open --html --wait exited on its own (forged submit from an iframe, no --js)",
+                    None,
+                    process.poll(),
+                )
             finally:
                 if process.poll() is None:
                     process.kill()

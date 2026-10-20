@@ -5,6 +5,25 @@
 
 use std::io::{self, Read, Write};
 
+/// The most bytes a reported address can carry on the wire (RC review #1): the engine truncates
+/// any longer address to this many bytes on a character boundary, so Cod's side must compare
+/// against the same truncation to recognize its own agent document after a long page loads.
+pub const MAX_URL_BYTES: usize = 8192;
+
+/// Cuts `text` to at most `limit` bytes on a character boundary, so no message can exceed what
+/// the receiving side accepts. Shared by the engine (outgoing diagnostics) and Cod's side (RC
+/// review #1), so both agree on exactly where a long address gets cut.
+pub fn limited(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 pub const KEY_RAW_DOWN: u8 = 0;
 pub const KEY_UP: u8 = 2;
 pub const KEY_CHAR: u8 = 3;
