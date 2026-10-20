@@ -55,6 +55,9 @@ const WINDOW_POLL: Duration = Duration::from_millis(50);
 /// The pause between two key presses of one request, so the app runs its event loop in between as it does for a person typing.
 const KEY_PAUSE: Duration = Duration::from_millis(10);
 
+/// The longest the driver waits for the window to draw before the first key press of a request (see `settle_frames`). Without frames (an idle or hidden window) it presses the keys after this.
+const FRAME_SETTLE_LIMIT: Duration = Duration::from_millis(250);
+
 /// Starts the driver when `COD_E2E_SOCKET` is set. Does nothing otherwise.
 #[cfg(unix)]
 pub fn init(cx: &mut App) {
@@ -398,6 +401,7 @@ async fn run(
 ) -> Result<Option<Value>> {
     match request {
         Request::Keys(keystrokes) | Request::Type(keystrokes) => {
+            settle_frames(memory, cx).await;
             for (index, keystroke) in keystrokes.into_iter().enumerate() {
                 if index > 0 {
                     cx.background_executor().timer(KEY_PAUSE).await;
@@ -452,6 +456,35 @@ fn workspace_window(cx: &App, memory: &Memory) -> Option<WindowHandle<MultiWorks
 
 /// Presses one key: key down, then key up, as the platform layer delivers them.
 #[cfg(unix)]
+/// Waits until the window drew two more frames, at most `FRAME_SETTLE_LIMIT`, before a request presses keys.
+///
+/// Zed moves the focus to a popover menu (for example the agent panel's new thread menu) two frames after it opens (`ui::popover_menu::show_menu`). A person cannot type inside those two frames, but the driver could: its first key went to the old focus, so "end up enter" right after "agent: toggle new thread menu" picked another row than the test meant. The two frame callbacks registered here run after the ones the menu registered earlier (GPUI runs them in order), so the focus has moved when the keys arrive.
+#[cfg(unix)]
+async fn settle_frames(memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) {
+    use futures::FutureExt as _;
+
+    let Some(window) = cx.update(|cx| workspace_window(cx, &memory.borrow())) else {
+        return;
+    };
+    let (drawn, frames) = futures::channel::oneshot::channel::<()>();
+    let registered = cx.update_window(window.into(), |_, window, _| {
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| {
+                drawn.send(()).ok();
+            });
+        });
+    });
+    if registered.is_err() {
+        return;
+    }
+    let mut frames = frames.fuse();
+    let mut limit = cx.background_executor().timer(FRAME_SETTLE_LIMIT).fuse();
+    futures::select_biased! {
+        _ = frames => {}
+        _ = limit => log::debug!("e2e driver: no frame within {FRAME_SETTLE_LIMIT:?}; pressing the keys anyway"),
+    }
+}
+
 fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) -> Result<()> {
     use gpui::{Capslock, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, PlatformInput};
 
