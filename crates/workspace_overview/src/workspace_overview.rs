@@ -13,6 +13,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -488,7 +489,7 @@ impl WorkspaceOverview {
                     rows,
                     matches: Vec::new(),
                     selected_index: 0,
-                    visible_rows: RefCell::new(VisibleRows::default()),
+                    visible_rows: Rc::new(RefCell::new(VisibleRows::default())),
                 };
                 let picker = cx.new(|cx| {
                     // Every row has the same shape (icon, two lines, an optional dot), so
@@ -545,6 +546,13 @@ impl WorkspaceOverview {
 
 impl Render for WorkspaceOverview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every frame renders the overview before its list prepaints the rows on screen.
+        self.picker
+            .read(cx)
+            .delegate
+            .visible_rows
+            .borrow_mut()
+            .begin_pass();
         v_flex()
             .key_context("WorkspaceOverview")
             .w(rems(PANEL_WIDTH_REMS))
@@ -554,37 +562,35 @@ impl Render for WorkspaceOverview {
     }
 }
 
-/// Which rows of the matched list the virtualized list last drew (#26 AC5): `render_match` is
-/// called only for the rows currently on screen (the uniform list's own virtualization), in
-/// ascending order, so a non-increasing index starts a new drawing pass and replaces the range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which rows of the matched list the virtualized list last drew on screen (#26 AC5).
+///
+/// A row is recorded when it is prepainted, not when `render_match` builds it: the uniform list
+/// also builds row 0 on every frame only to measure the row height (`layout_as_root`, never
+/// prepainted), so counting `render_match` calls made the range always start at 0. The overview
+/// starts a pass each time it renders; the rows on screen are then prepainted in ascending
+/// order, and the first of them replaces the range.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct VisibleRows {
-    last_ix: Option<usize>,
+    pass_started: bool,
     range: Range<usize>,
 }
 
-impl Default for VisibleRows {
-    fn default() -> Self {
-        Self {
-            last_ix: None,
-            range: 0..0,
-        }
-    }
-}
-
 impl VisibleRows {
-    /// Records that the row at this list index was just drawn.
+    /// A new frame of the overview starts: the next prepainted row starts the range.
+    fn begin_pass(&mut self) {
+        self.pass_started = true;
+    }
+
+    /// Records that the row at this list index was just prepainted on screen.
     fn record(&mut self, ix: usize) {
-        let starts_new_pass = match self.last_ix {
-            Some(last) => ix <= last,
-            None => true,
-        };
-        if starts_new_pass {
+        // The rows on screen are contiguous, so a row that does not follow the range also starts
+        // a new one (a pass the overview's render did not announce).
+        if self.pass_started || ix != self.range.end {
             self.range = ix..ix + 1;
+            self.pass_started = false;
         } else {
             self.range.end = ix + 1;
         }
-        self.last_ix = Some(ix);
     }
 }
 
@@ -596,7 +602,7 @@ pub struct OverviewDelegate {
     rows: Vec<OverviewRow>,
     matches: Vec<RowMatch>,
     selected_index: usize,
-    visible_rows: RefCell<VisibleRows>,
+    visible_rows: Rc<RefCell<VisibleRows>>,
 }
 
 impl OverviewDelegate {
@@ -617,7 +623,7 @@ impl OverviewDelegate {
 }
 
 impl PickerDelegate for OverviewDelegate {
-    type ListItem = ListItem;
+    type ListItem = Div;
 
     fn name() -> &'static str {
         "workspace overview"
@@ -696,7 +702,6 @@ impl PickerDelegate for OverviewDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        self.visible_rows.borrow_mut().record(ix);
         let found = self.matches.get(ix)?;
         let row = self.rows.get(found.row)?;
         let icon = match row.kind {
@@ -720,15 +725,22 @@ impl PickerDelegate for OverviewDelegate {
                         .truncate(),
                 )
             });
+        let item = ListItem::new(ix)
+            .spacing(ListItemSpacing::Sparse)
+            .inset(true)
+            .toggle_state(selected)
+            .when(row.kind != RowKind::Workspace, |item| item.indent_level(1))
+            .start_slot::<Icon>(Icon::new(icon).color(Color::Muted))
+            .child(h_flex().w_full().min_w_0().overflow_hidden().child(lines))
+            .end_slot::<Div>(dot);
+        // Prepainted only when the row is on screen: the row the uniform list builds to measure
+        // the row height is laid out but never prepainted (see `VisibleRows`).
+        let visible_rows = self.visible_rows.clone();
         Some(
-            ListItem::new(ix)
-                .spacing(ListItemSpacing::Sparse)
-                .inset(true)
-                .toggle_state(selected)
-                .when(row.kind != RowKind::Workspace, |item| item.indent_level(1))
-                .start_slot::<Icon>(Icon::new(icon).color(Color::Muted))
-                .child(h_flex().w_full().min_w_0().overflow_hidden().child(lines))
-                .end_slot::<Div>(dot),
+            div()
+                .w_full()
+                .on_children_prepainted(move |_, _, _| visible_rows.borrow_mut().record(ix))
+                .child(item),
         )
     }
 }
@@ -743,6 +755,7 @@ mod tests {
     fn visible_rows_records_the_ascending_range_of_one_drawing_pass() {
         let mut visible = VisibleRows::default();
         assert_eq!(visible.range, 0..0);
+        visible.begin_pass();
         for ix in 3..7 {
             visible.record(ix);
         }
@@ -752,14 +765,27 @@ mod tests {
     #[test]
     fn visible_rows_replaces_the_range_on_the_next_drawing_pass() {
         let mut visible = VisibleRows::default();
-        for ix in 3..7 {
+        visible.begin_pass();
+        for ix in 0..8 {
             visible.record(ix);
         }
-        // Scrolled down: the next pass starts lower and does not start at 0.
-        for ix in 5..9 {
+        // Scrolled down by exactly one page: the next pass starts right after the last one.
+        visible.begin_pass();
+        for ix in 8..16 {
             visible.record(ix);
         }
-        assert_eq!(visible.range, 5..9);
+        assert_eq!(visible.range, 8..16);
+    }
+
+    #[test]
+    fn visible_rows_starts_a_new_range_at_a_gap_without_a_new_pass() {
+        let mut visible = VisibleRows::default();
+        visible.begin_pass();
+        visible.record(0);
+        for ix in 5..13 {
+            visible.record(ix);
+        }
+        assert_eq!(visible.range, 5..13);
     }
 
     fn entry(key: &str, title: &str, status: CodStatus, context: &str, age: u64) -> CodEntry {
