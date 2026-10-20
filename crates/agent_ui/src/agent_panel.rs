@@ -1203,6 +1203,8 @@ pub struct AgentPanel {
     /// Cod (#28): the fresh chat of a new workspace waits for the workspace's first folder.
     cod_fresh_chat_pending: bool,
     _cod_fresh_chat_subscription: Option<Subscription>,
+    /// Cod (#28 AC3): the session keys this panel last published into its workspace's status store, so a chat that went away (such as the empty draft replaced by the first real chat) is removed from it too.
+    cod_published_sessions: std::cell::RefCell<HashSet<SharedString>>,
 }
 
 impl AgentPanel {
@@ -1721,6 +1723,7 @@ impl AgentPanel {
             is_active: false,
             cod_fresh_chat_pending: false,
             _cod_fresh_chat_subscription: None,
+            cod_published_sessions: Default::default(),
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -4531,21 +4534,29 @@ impl AgentPanel {
         let Some(workspace_id) = self.workspace_id else {
             return;
         };
-        let views = self.conversation_views();
-        if views.is_empty() {
-            return;
-        }
         let mut entries: Vec<CodEntry> = Vec::new();
-        for view in &views {
+        for view in &self.conversation_views() {
             if let Some(entry) = self.cod_chat_entry(view, cx) {
                 entries.push(entry);
             }
         }
-        if entries.is_empty() {
+        let published: HashSet<SharedString> =
+            entries.iter().map(|entry| entry.key.clone()).collect();
+        // Only the keys this panel published itself: other Session entries of the workspace are not this panel's to remove.
+        let gone: Vec<SharedString> = self
+            .cod_published_sessions
+            .replace(published)
+            .into_iter()
+            .filter(|key| !entries.iter().any(|entry| &entry.key == key))
+            .collect();
+        if entries.is_empty() && gone.is_empty() {
             return;
         }
         let store = CodStatusStore::global(cx);
         store.update(cx, |store, cx| {
+            for key in &gone {
+                store.remove_entry(workspace_id, key, cx);
+            }
             for entry in entries {
                 store.set_entry(workspace_id, entry, cx);
             }
