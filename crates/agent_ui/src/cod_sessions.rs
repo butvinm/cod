@@ -169,19 +169,32 @@ pub fn send_message(
         .root_thread_view()
         .context("the chat has no message box yet")?;
     let draft = thread_view.read(cx).message_editor.read(cx).text(cx);
+    log::warn!("C2-DEBUG draft before={draft:?}");
     thread_view.update(cx, |view, cx| {
         view.message_editor.update(cx, |editor, cx| {
             editor.clear(window, cx);
             editor.insert_text(text, window, cx);
         });
     });
+    log::warn!(
+        "C2-DEBUG editor text after clear+insert={:?}",
+        thread_view.read(cx).message_editor.read(cx).text(cx)
+    );
     thread_view.update(cx, |view, cx| view.send(window, cx));
+    log::warn!(
+        "C2-DEBUG editor text after send={:?}",
+        thread_view.read(cx).message_editor.read(cx).text(cx)
+    );
     if !draft.is_empty() {
         thread_view.update(cx, |view, cx| {
             view.message_editor
                 .update(cx, |editor, cx| editor.insert_text(&draft, window, cx));
         });
     }
+    log::warn!(
+        "C2-DEBUG editor text after restore={:?}",
+        thread_view.read(cx).message_editor.read(cx).text(cx)
+    );
     Ok(())
 }
 
