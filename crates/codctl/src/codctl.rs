@@ -63,6 +63,65 @@ pub fn default_socket_path() -> PathBuf {
     socket_path(&|name| std::env::var(name).ok())
 }
 
+/// What `codctl` (the client) needs to know about the socket path before trusting it (#A3):
+/// facts about its folder and about the socket file itself, from a filesystem stat.
+#[derive(Debug, Clone, Copy)]
+pub struct SocketFacts {
+    pub dir_is_symlink: bool,
+    pub dir_owner: u32,
+    pub dir_mode: u32,
+    pub socket_is_symlink: bool,
+    pub socket_is_socket: bool,
+    pub socket_owner: u32,
+    pub socket_mode: u32,
+}
+
+/// Why `codctl` must refuse this socket, or `None` when its folder and the socket file both
+/// belong to `user` and are closed to group and others.
+///
+/// Cod's own server refuses to listen on a folder it does not already own and control this way
+/// (`codctl_server::socket::folder_problem`), but until this check existed `codctl` itself never
+/// checked before connecting. When `$XDG_RUNTIME_DIR` is unset, the socket falls back under a
+/// shared temp directory (`<temp>/cod-<user>/codctl.sock`); another user able to write there
+/// could pre-create that folder and a socket of their own before the real Cod ever starts, and
+/// `codctl` would connect to them and send session text and file paths (#A3).
+pub fn socket_problem(facts: SocketFacts, user: u32) -> Option<String> {
+    if facts.dir_is_symlink {
+        return Some("its folder is a symbolic link".to_owned());
+    }
+    if facts.dir_owner != user {
+        return Some(format!(
+            "its folder belongs to user {} instead of this user ({user})",
+            facts.dir_owner
+        ));
+    }
+    if facts.dir_mode & 0o077 != 0 {
+        return Some(format!(
+            "its folder has mode {:o}: group and others must have no access (for example mode 700)",
+            facts.dir_mode & 0o777
+        ));
+    }
+    if facts.socket_is_symlink {
+        return Some("is a symbolic link".to_owned());
+    }
+    if !facts.socket_is_socket {
+        return Some("is not a socket".to_owned());
+    }
+    if facts.socket_owner != user {
+        return Some(format!(
+            "belongs to user {} instead of this user ({user})",
+            facts.socket_owner
+        ));
+    }
+    if facts.socket_mode & 0o077 != 0 {
+        return Some(format!(
+            "has mode {:o}: group and others must have no access (for example mode 600)",
+            facts.socket_mode & 0o777
+        ));
+    }
+    None
+}
+
 /// One request to Cod.
 // Only `PartialEq`, not `Eq`: `SessionWait`'s `timeout` is an `f64` (#39 AC4).
 #[derive(Debug, Clone, PartialEq)]
@@ -1549,6 +1608,33 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn socket_problem_refuses_anything_not_privately_owned_by_this_user() {
+        // #A3: another user able to write under a shared temp directory could pre-create
+        // `cod-<user>/codctl.sock` before Cod starts; codctl must refuse it, not connect and
+        // send session text and file paths to them.
+        const USER: u32 = 1000;
+        fn facts() -> SocketFacts {
+            SocketFacts {
+                dir_is_symlink: false,
+                dir_owner: USER,
+                dir_mode: 0o040700,
+                socket_is_symlink: false,
+                socket_is_socket: true,
+                socket_owner: USER,
+                socket_mode: 0o140600,
+            }
+        }
+        assert_eq!(socket_problem(facts(), USER), None);
+        assert!(socket_problem(SocketFacts { dir_is_symlink: true, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { dir_owner: USER + 1, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { dir_mode: 0o040750, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { socket_is_symlink: true, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { socket_is_socket: false, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { socket_owner: USER + 1, ..facts() }, USER).is_some());
+        assert!(socket_problem(SocketFacts { socket_mode: 0o140606, ..facts() }, USER).is_some());
     }
 
     #[test]
