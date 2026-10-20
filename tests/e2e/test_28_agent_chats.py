@@ -48,7 +48,8 @@ BILLING_API = {
 
 TRACKER_URL = "https://tracker.example.com/PAY-1234"
 GUIDE_URL = "https://wiki.example.com/billing/rounding"
-GUIDE_LINK = f"[the rounding guide]({GUIDE_URL})"
+GUIDE_TEXT = "the rounding guide"
+GUIDE_LINK = f"[{GUIDE_TEXT}]({GUIDE_URL})"
 REPLY = (
     f"The rounding happens in src/invoice.rs:18. The ticket is {TRACKER_URL} "
     f"and the rule is in {GUIDE_LINK}."
@@ -121,9 +122,10 @@ class AgentChatLinksTest(CodTestCase):
             self.expect_equal("focused link", None, focused_link_text(state))
 
         with self.step("press tab through the links in reading order"):
-            for expected in ["src/invoice.rs:18", TRACKER_URL, GUIDE_LINK]:
+            for expected in ["src/invoice.rs:18", TRACKER_URL, GUIDE_TEXT]:
                 self.keys("tab")
                 self.wait_for(lambda state, expected=expected: focused_link_text(state) == expected, 10, f"the focus on {expected}")
+            self.expect_equal("guide link target", GUIDE_URL, chat(self.state())["focused_link"]["url"])
 
         with self.step("press shift-tab back to the file mention"):
             for expected in [TRACKER_URL, "src/invoice.rs:18"]:
