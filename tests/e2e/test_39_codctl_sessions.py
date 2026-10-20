@@ -212,6 +212,11 @@ class CodctlSessionsTest(CodTestCase):
 
         with self.step("start a session, type an unsent draft, then send a different message"):
             session_id = self.new_session("claude")
+            self.wait_for(
+                lambda state: state.get("agent_panel_focused") is True,
+                SHOW_TIMEOUT,
+                "the new chat's message box to take the focus",
+            )
             self.type("unsent draft about the ledger export")
             result = self.codctl.run("session", "send", session_id, "Fix the rounding in src/invoice.rs")
             self.expect_result(result, 0, stdout="", stderr="")
