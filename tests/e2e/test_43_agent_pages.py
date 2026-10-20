@@ -388,11 +388,17 @@ class AgentPagesTest(CodTestCase):
             )
 
         with self.step("return to the page tab from the keyboard after opening invoice.rs"):
-            # The file may replace the page in the active pane. The global tab
-            # switcher also works if the two tabs happen to be in separate panes.
-            # Only the file and page are open; the page is the older entry.
-            self.run_command("tab switcher: toggle all")
-            self.keys("end enter")
+            # The file opens in the active pane (its own doc comment), so the page and the file
+            # are always two items of the same pane here: "pane: activate previous item" is
+            # enough, real keyboard-only navigation that needs no modal. The global tab switcher
+            # would also work in a real session, but its own confirm relies on a blur-driven
+            # dismiss that stock Zed gates on the platform's window-active flag (same in plain
+            # Zed 1.23.2, see crates/picker/src/picker.rs on_input_editor_event), which the
+            # headless e2e compositor never raises (no input devices to assign it): the switcher
+            # would then leave a dismissed-but-still-registered modal behind that swallows the
+            # next click, a harness artifact rather than anything a real keyboard or mouse user
+            # hits.
+            self.run_command("pane: activate previous item")
             self.wait_for(
                 lambda state: (page_by_id(state, page_id) or {}).get("active") is True
                 and (page_by_id(state, page_id) or {}).get("focused") is True
