@@ -1,13 +1,15 @@
 //! Cod (#25): the workspaces of the window as quiet tabs in the title bar, in window order, each
 //! with a status dot only when something is happening, followed by a "+" that opens a new
-//! workspace. Clicking a tab shows its workspace (a pending one loads first).
+//! workspace. Pressing a tab shows its workspace (a pending one loads first).
 //!
 //! Names follow "[ISSUE-ID] title" (D27): the leading "[ID]" is always shown whole and only the
 //! rest is cut with "...". The full name is the tab's tooltip.
 
 use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 
-use gpui::{Animation, AnimationExt as _, Bounds, Entity, WeakEntity, pulsating_between};
+use gpui::{
+    Animation, AnimationExt as _, Bounds, Entity, MouseButton, WeakEntity, pulsating_between,
+};
 use ui::{Indicator, Tooltip, prelude::*};
 use workspace::{CodMember, CodStatus, MultiWorkspace, NewWorkspace};
 
@@ -256,7 +258,11 @@ pub fn render_cod_workspace_tabs(
             .cursor_pointer()
             .child(content)
             .tooltip(Tooltip::text(name.clone()))
-            .on_click(move |_, window, cx| {
+            // The press shows the workspace, not the release (#25 AC5): each workspace draws its
+            // own title bar, so when a pending workspace finishes loading and is shown between
+            // the press and the release, the release lands on another title bar's tab and a
+            // click would be lost; the newest press must win.
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 weak.update(cx, |multi_workspace, cx| {
                     multi_workspace.cod_show_member(member.clone(), window, cx)
                 })
