@@ -583,7 +583,18 @@ class WorkspaceChatsTest(CodTestCase):
             self.type("Fix the rounding.")
             self.keys("enter")
             # #28 AC3: within one second of the agent asking, not a lenient 10 s poll.
-            state = self.wait_for(lambda state: chat(state).get("status") == "needs_input", 2, "the chat to need input")
+            # The title bar reports the dot from its last drawn frame, so wait
+            # for all three observations within the same existing timeout.
+            state = self.wait_for_values(
+                "chat and workspace status",
+                {"chat": "needs_input", "workspace": "needs_input", "dot": "yellow"},
+                lambda state: {
+                    "chat": chat(state).get("status"),
+                    "workspace": state["workspaces"][state["active_workspace"]]["status"],
+                    "dot": state["title_bar"]["tabs"][state["active_workspace"]]["dot"],
+                },
+                2,
+            )
 
         with self.step("the workspace tab dot and the overview's session row both show needs_input too"):
             active = state["active_workspace"]
@@ -601,7 +612,16 @@ class WorkspaceChatsTest(CodTestCase):
 
         with self.step("allow it once: the turn ends and the workspace tab dot follows to done"):
             self.run_command("agent: allow once")
-            state = self.wait_for(lambda state: chat(state).get("status") == "done", 2, "the chat to be done")
+            state = self.wait_for_values(
+                "chat and workspace status",
+                {"chat": "done", "workspace": "done", "dot": "green"},
+                lambda state: {
+                    "chat": chat(state).get("status"),
+                    "workspace": state["workspaces"][state["active_workspace"]]["status"],
+                    "dot": state["title_bar"]["tabs"][state["active_workspace"]]["dot"],
+                },
+                2,
+            )
             active = state["active_workspace"]
             self.expect_equal("workspace status", "done", state["workspaces"][active]["status"])
             self.expect_equal("title bar dot", "green", state["title_bar"]["tabs"][active]["dot"])
