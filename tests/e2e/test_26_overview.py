@@ -259,7 +259,13 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
                 self.set_entry(0, f"s{index}", "idle", title=f"Session {index:02d}")
 
         with self.step("open the overview: fewer rows are drawn than the list holds"):
-            state = self.open_overview()
+            self.open_overview()
+            # The visible range is recorded at prepaint, after the overview opens.
+            state = self.wait_for(
+                lambda state: is_open(state) and overview(state)["visible_range"]["end"] > 0,
+                SHOW_TIMEOUT,
+                "the overview to draw its first frame",
+            )
             total_rows = len(overview(state)["rows"])
             visible = overview(state)["visible_range"]
             visible_count = visible["end"] - visible["start"]
