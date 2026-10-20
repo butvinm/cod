@@ -52,6 +52,35 @@ pub(crate) const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(400);
 pub(crate) const DOUBLE_CLICK_DISTANCE: Pixels = px(5.0);
 pub(crate) const KEYRING_LABEL: &str = "zed-github-account";
 
+/// Opens the keyring used for credential storage, without creating it.
+///
+/// `oo7::Keyring::new()` resolves to the "default" collection alias and
+/// creates it if missing (see oo7 0.6.0's `dbus::Service::default_collection`,
+/// which calls `with_alias_or_create`). On a session where gnome-keyring has
+/// no default keyring yet, every unrelated credential read at startup (for
+/// example each configured language model's API key lookup) queues its own
+/// CreateCollection prompt. A gnome-keyring 50.0 bug leaves the later queued
+/// prompts stuck once the first one is answered, so the user has to answer
+/// or cancel a prompt per lookup, and Chromium's own keyring lookup for
+/// os_crypt (used when a page loads) waits on the stuck queue forever.
+///
+/// Reads and deletes have nothing to gain from creating a keyring: a missing
+/// one simply means there are no stored credentials yet. Writes still create
+/// it on demand, since the user is explicitly asking to save a secret.
+async fn existing_keyring_without_creating() -> Result<Option<oo7::Keyring>> {
+    if oo7::ashpd::is_sandboxed() {
+        // The file backend keeps its own on-disk store behind the Secrets
+        // portal; it is not the Secret Service collection the prompt storm
+        // above is about, so the existing behavior is kept as is.
+        return Ok(Some(oo7::Keyring::new().await?));
+    }
+    let service = oo7::dbus::Service::new().await?;
+    Ok(service
+        .with_alias(oo7::dbus::Service::DEFAULT_COLLECTION)
+        .await?
+        .map(oo7::Keyring::DBus))
+}
+
 #[cfg(any(feature = "wayland", feature = "x11"))]
 const FILE_PICKER_PORTAL_MISSING: &str =
     "Couldn't open file picker due to missing xdg-desktop-portal implementation.";
@@ -738,7 +767,9 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>> {
         let url = url.to_string();
         self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
+            let Some(keyring) = existing_keyring_without_creating().await? else {
+                return Ok(None);
+            };
             keyring.unlock().await?;
 
             let items = keyring.search_items(&vec![("url", &url)]).await?;
@@ -766,7 +797,9 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
     fn delete_credentials(&self, url: &str) -> Task<Result<()>> {
         let url = url.to_string();
         self.background_executor().spawn(async move {
-            let keyring = oo7::Keyring::new().await?;
+            let Some(keyring) = existing_keyring_without_creating().await? else {
+                return Ok(());
+            };
             keyring.unlock().await?;
 
             let items = keyring.search_items(&vec![("url", &url)]).await?;
