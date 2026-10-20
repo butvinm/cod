@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use acp_thread::{AcpThread, AgentThreadEntry, ToolCallStatus};
+use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp_v1;
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, Window};
@@ -160,6 +160,13 @@ fn find_chat(
 /// so a draft restored right after that call returns can still be swept up by that task once it
 /// runs. `ThreadView::send_content` takes finished content blocks directly and never reads the
 /// box at all, so the draft is never at risk.
+///
+/// `send_content` always starts a turn right away; calling it unconditionally used to interrupt
+/// an active turn on the legacy transport and overtake whatever the user had already queued
+/// behind it (RC review C2 new defect #2). While the thread is generating, or already has
+/// messages waiting, this instead queues the codctl message the same way the message box's own
+/// non-empty send does once busy (`ThreadView::add_to_queue`): with its own content only, never
+/// reading or clearing the user's draft, and in the same FIFO order as everything else queued.
 pub fn send_message(
     workspace: &Entity<Workspace>,
     session_id: &str,
@@ -176,7 +183,12 @@ pub fn send_message(
     let contents: Vec<acp_v1::ContentBlock> =
         vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(text.to_owned()))];
     thread_view.update(cx, |view, cx| {
-        view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+        let is_generating = view.thread.read(cx).status() != ThreadStatus::Idle;
+        if is_generating || !view.message_queue.is_empty() {
+            view.add_to_queue(contents, Vec::new(), window, cx);
+        } else {
+            view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+        }
     });
     Ok(())
 }
