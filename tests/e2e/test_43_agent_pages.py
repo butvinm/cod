@@ -188,7 +188,9 @@ class AgentPagesTest(CodTestCase):
 
     def output_log(self) -> str:
         assert self.cod is not None
-        return self.cod.output_path.read_text(errors="replace") if self.cod.output_path.exists() else ""
+        # Without a terminal, Zed's logger writes to the data folder instead of stdout.
+        paths = (self.cod.preview_dir / "logs" / "Zed.log", self.cod.output_path)
+        return "\n".join(path.read_text(errors="replace") for path in paths if path.exists())
 
     # AC1
 
