@@ -13,7 +13,7 @@
 //! it, so a caller never has to pre-borrow the workspace itself: that would conflict with also
 //! passing `cx` by the mutable reference these functions need for the window and the entities.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use acp_thread::{AcpThread, AgentThreadEntry, ToolCallStatus};
 use anyhow::{Context as _, Result};
@@ -75,10 +75,26 @@ pub fn new_session(
             cx,
         );
     });
-    panel
+    let thread_id = panel
         .read(cx)
         .active_thread_id(cx)
-        .context("no chat opened after starting the session")
+        .context("no chat opened after starting the session")?;
+    cx.default_global::<RequestedSessions>().0.insert(thread_id);
+    Ok(thread_id)
+}
+
+/// The chats `codctl session new` started (#39 AC1). The caller asked for each of them, so an
+/// empty one stays a chat tab instead of being dropped as an unused draft (#28 AC1) when the next
+/// session opens.
+#[derive(Default)]
+struct RequestedSessions(HashSet<ThreadId>);
+
+impl Global for RequestedSessions {}
+
+/// Whether `codctl session new` started this chat.
+pub fn is_requested_session(thread_id: ThreadId, cx: &App) -> bool {
+    cx.try_global::<RequestedSessions>()
+        .is_some_and(|sessions| sessions.0.contains(&thread_id))
 }
 
 /// The provider session id of this chat, once the agent has assigned one. `codctl session new`

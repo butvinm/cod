@@ -4628,7 +4628,8 @@ impl AgentPanel {
             .read(cx)
             .root_thread(cx)
             .is_some_and(|thread| thread.read(cx).is_draft_thread())
-            && !self.draft_has_content(&conversation_view, cx);
+            && !self.draft_has_content(&conversation_view, cx)
+            && !crate::cod_sessions::is_requested_session(conversation_view.read(cx).thread_id, cx);
 
         if is_current_draft {
             if !is_empty_draft {
