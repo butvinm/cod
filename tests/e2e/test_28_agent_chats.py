@@ -522,10 +522,13 @@ class WorkspaceChatsTest(CodTestCase):
             a_second = self.start_chat("What does the ledger export read?", LEDGER_REPLY, [a_first])
 
         with self.step("the panel header shows both of workspace A's chats as tabs, each named, the second one active"):
+            # start_chat returns once the reply is in the transcript, which can be a frame before the turn's end
+            # moves the chat from working (blue) to done (green), so wait for the finished turns too.
             state = self.wait_for(
-                lambda state: sorted(tab["session_id"] for tab in state["chat_tabs"]) == sorted([a_first, a_second]),
+                lambda state: sorted(tab["session_id"] for tab in state["chat_tabs"]) == sorted([a_first, a_second])
+                and all(tab["dot"] == "green" for tab in state["chat_tabs"]),
                 SHOW_TIMEOUT,
-                "both of workspace A's chats as tabs",
+                "both of workspace A's chats as tabs, their turns done",
             )
             tabs = state["chat_tabs"]
             self.expect_equal("tab count", 2, len(tabs))
