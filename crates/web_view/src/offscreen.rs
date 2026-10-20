@@ -796,23 +796,14 @@ fn open_file_from_page(
         log::warn!("web_view: {page_id} refused to open {raw:?}: not inside the workspace's folders");
         return;
     };
-    // The file opens beside the page, never in the page's own pane: the agent's page stays visible (its question, its other buttons) while the user reads the file. That is another pane when the workspace has one, else a new split to the right of the page.
-    let page_view = pages::find(page_id, cx);
-    let target_pane = workspace.update(cx, |workspace, cx| {
-        let page_pane = page_view.as_ref().and_then(|view| workspace.pane_for(view))?;
-        let other = workspace.panes().iter().find(|pane| **pane != page_pane).cloned();
-        Some(other.unwrap_or_else(|| {
-            workspace.split_pane(page_pane, SplitDirection::Right, window, cx)
-        }))
-    });
+    // The file opens the way Zed opens a file: in the active pane.
     let page_id = page_id.clone();
     let path_text = path_text.to_owned();
     window
         .spawn(cx, async move |cx| {
             let item = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let pane = target_pane.as_ref().map(|pane| pane.downgrade());
-                    workspace.open_path(project_path, pane, true, window, cx)
+                    workspace.open_path(project_path, None, true, window, cx)
                 })?
                 .await?;
             if let Some(line) = line {
