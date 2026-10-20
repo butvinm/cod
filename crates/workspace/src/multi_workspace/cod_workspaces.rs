@@ -674,7 +674,8 @@ impl MultiWorkspace {
     /// `cod_activate_pending` does, without loading anything; returns the request's stamp.
     #[cfg(any(test, feature = "test-support"))]
     pub fn cod_test_begin_load(&mut self, id: WorkspaceId, cx: &mut Context<Self>) -> u64 {
-        let stamp = CodActivationIntents::bump(cx, cx.entity_id());
+        let window_entity = cx.entity_id();
+        let stamp = CodActivationIntents::bump(cx, window_entity);
         self.cod_loading = Some((id, stamp));
         stamp
     }
