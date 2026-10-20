@@ -227,25 +227,46 @@ pub fn strip_inline_scripts(html: &str) -> String {
     out
 }
 
-/// Inserts `script` right before the last `</body>` (case-insensitive), or at the end when the
-/// document has none.
-pub fn inject_before_body_close(html: &str, script: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    match lower.rfind("</body>") {
-        Some(offset) => format!("{}{}{}", &html[..offset], script, &html[offset..]),
-        None => format!("{html}{script}"),
+/// The byte offset just past the first opening tag `<name ...>` (ASCII case-insensitive) in `lower`, the lowercased document, or None without one. A longer tag name that only starts with `name` (`<header>` for `head`) does not count.
+fn after_open_tag(lower: &str, name: &str) -> Option<usize> {
+    let open = format!("<{name}");
+    let mut from = 0;
+    while let Some(found) = lower[from..].find(&open) {
+        let start = from + found;
+        let after_name = start + open.len();
+        let next = lower[after_name..].chars().next();
+        if next.is_some_and(|ch| ch.is_ascii_whitespace() || ch == '>' || ch == '/') {
+            return lower[after_name..].find('>').map(|offset| after_name + offset + 1);
+        }
+        from = after_name;
     }
+    None
 }
 
-/// Cod's whole processing of an agent page's source (#43 AC1, AC4, AC6): strips the page's own
-/// inline scripts unless `allow_js`, then appends Cod's bootstrap script.
+/// Inserts `script` as early as the document allows: right after the opening `<head>` tag, else after `<html>`, else after the `<!doctype>`, else at the very start. Cod's bootstrap must run before any of the page's own scripts, so a `--js` page script can call `window.cod` while the document loads (#43 AC4).
+pub fn inject_at_document_start(html: &str, script: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let at = after_open_tag(&lower, "head")
+        .or_else(|| after_open_tag(&lower, "html"))
+        .or_else(|| {
+            lower
+                .trim_start()
+                .starts_with("<!doctype")
+                .then(|| lower.find('>').map(|offset| offset + 1))
+                .flatten()
+        })
+        .unwrap_or(0);
+    format!("{}{}{}", &html[..at], script, &html[at..])
+}
+
+/// Cod's whole processing of an agent page's source (#43 AC1, AC4, AC6): strips the page's own inline scripts unless `allow_js`, then inserts Cod's bootstrap script before everything else in the document.
 pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars) -> String {
     let body = if allow_js {
         source_html.to_owned()
     } else {
         strip_inline_scripts(source_html)
     };
-    inject_before_body_close(&body, &bootstrap_script(vars))
+    inject_at_document_start(&body, &bootstrap_script(vars))
 }
 
 /// A `data:` URL that loads `html` as a document (#43 AC1, AC5, open question 1): used instead of
@@ -351,14 +372,33 @@ mod tests {
     }
 
     #[test]
-    fn the_bootstrap_script_is_appended_before_the_closing_body_tag() {
-        let html = "<html><body><h1>Ask</h1></body></html>";
+    fn the_bootstrap_script_starts_the_head() {
+        let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body><h1>Ask</h1></body></html>";
         let built = build_agent_document(html, false, &vars());
         assert!(built.contains("<h1>Ask</h1>"));
-        assert!(built.contains("window.cod"));
-        let body_close = built.find("</body>").unwrap();
-        let script_start = built.find("window.cod").unwrap();
-        assert!(script_start < body_close);
+        assert!(built.starts_with("<!doctype html><html><head><script>"));
+        assert!(built.find("window.cod").unwrap() < built.find("<meta").unwrap());
+    }
+
+    #[test]
+    fn the_bootstrap_script_runs_before_the_pages_own_scripts() {
+        // A page script that calls window.cod while the document loads must find it defined (#43 AC4).
+        let html = "<!doctype html><html><head><script>var early = 1;</script></head><body><script>window.cod.call('submit', {value: 'x'});</script></body></html>";
+        let built = build_agent_document(html, true, &vars());
+        let bootstrap = built.find("window.cod={").unwrap();
+        assert!(bootstrap < built.find("var early").unwrap());
+        assert!(bootstrap < built.find("window.cod.call('submit'").unwrap());
+    }
+
+    #[test]
+    fn the_bootstrap_script_goes_first_in_a_document_without_head_or_html_tags() {
+        assert!(build_agent_document("<p>hi</p>", false, &vars()).starts_with("<script>"));
+        let built = build_agent_document("<!DOCTYPE html><p>hi</p>", false, &vars());
+        assert!(built.starts_with("<!DOCTYPE html><script>"));
+        let built = build_agent_document("<HTML lang=\"en\"><Body><p>hi</p></Body></HTML>", false, &vars());
+        assert!(built.starts_with("<HTML lang=\"en\"><script>"));
+        let built = build_agent_document("<html><header>x</header></html>", false, &vars());
+        assert!(built.starts_with("<html><script>"));
     }
 
     #[test]
