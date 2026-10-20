@@ -206,8 +206,16 @@ fn new_nonce() -> String {
 /// bootstrap from running (#43 security requirement, RC review B1): this blocks `<script>`
 /// elements the page's own content still carries as well as inline event handler attributes
 /// (`onerror`, `onclick`, ...), which stripping `<script>` tags alone never touched.
+///
+/// `frame-src`, `child-src` and `object-src` are all `'none'` (RC review B2): without `--js`, a
+/// page cannot embed any subframe at all, so an `<iframe>` with a `srcdoc` or `data:` document of
+/// its own can never run console script that forges a `cod:bridge:` message. Console messages
+/// carry no frame identity today, so refusing every subframe is the only thing that stops one
+/// from impersonating the top document while this policy applies.
 fn csp_meta_tag(nonce: &str) -> String {
-    format!("<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'nonce-{nonce}'\">")
+    format!(
+        "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'nonce-{nonce}'; frame-src 'none'; child-src 'none'; object-src 'none'\">"
+    )
 }
 
 /// The script that updates an already-open page's theme variables without a reload (#43 AC6).
@@ -255,56 +263,41 @@ pub fn strip_inline_scripts(html: &str) -> String {
     out
 }
 
-/// The byte offset just past the first opening tag `<name ...>` (ASCII case-insensitive) in `lower`, the lowercased document, or None without one. A longer tag name that only starts with `name` (`<header>` for `head`) does not count.
-fn after_open_tag(lower: &str, name: &str) -> Option<usize> {
-    let open = format!("<{name}");
-    let mut from = 0;
-    while let Some(found) = lower[from..].find(&open) {
-        let start = from + found;
-        let after_name = start + open.len();
-        let next = lower[after_name..].chars().next();
-        if next.is_some_and(|ch| ch.is_ascii_whitespace() || ch == '>' || ch == '/') {
-            return lower[after_name..].find('>').map(|offset| after_name + offset + 1);
-        }
-        from = after_name;
-    }
-    None
-}
-
-/// Inserts `script` as early as the document allows: right after the opening `<head>` tag, else after `<html>`, else after the `<!doctype>`, else at the very start. Cod's bootstrap must run before any of the page's own scripts, so a `--js` page script can call `window.cod` while the document loads (#43 AC4).
-pub fn inject_at_document_start(html: &str, script: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let at = after_open_tag(&lower, "head")
-        .or_else(|| after_open_tag(&lower, "html"))
-        .or_else(|| {
-            lower
-                .trim_start()
-                .starts_with("<!doctype")
-                .then(|| lower.find('>').map(|offset| offset + 1))
-                .flatten()
-        })
-        .unwrap_or(0);
-    format!("{}{}{}", &html[..at], script, &html[at..])
-}
-
 /// Cod's whole processing of an agent page's source (#43 AC1, AC4, AC6): strips the page's own
-/// inline scripts unless `allow_js`, then inserts Cod's bootstrap script before everything else
-/// in the document.
+/// inline scripts unless `allow_js`, then always emits Cod's own prelude first, followed by the
+/// page's original markup unchanged (RC review B1).
+///
+/// Earlier builds looked for the page's own `<head>`, `<html>` or `<!doctype>` to splice into,
+/// which a source document could defeat just by hiding its `<head>` inside an HTML comment
+/// (`<!-- <head> -->`): the splice landed inside the comment, so neither the CSP nor the
+/// bootstrap ever took effect. Instead, Cod now always writes a complete, fixed document of its
+/// own - `<!doctype html><html><head>{csp}{bootstrap}</head>` - and appends the page's original
+/// markup after it, untouched. A real HTML parser treats a second `<!doctype>`, `<html>` or
+/// `<head>` start tag appearing later as a parse error and ignores it, while tags that belong in
+/// `<head>` (`<meta>`, `<title>`, `<link>`, `<style>`) are still moved there even when they show
+/// up in the body, so the page's own head content still ends up in the right place; only Cod's
+/// own prelude ever decides where the CSP and the bootstrap go.
 ///
 /// Without `allow_js`, a Content-Security-Policy that allows only Cod's own, freshly nonced
-/// bootstrap script is injected alongside it (RC review B1): stripping `<script>` elements alone
+/// bootstrap script is emitted alongside it (RC review B1): stripping `<script>` elements alone
 /// leaves inline event handlers (`onerror="..."`, `onclick="..."`, ...) free to run and forge a
 /// bridge call, which the CSP blocks at the engine instead. `allow_js` is explicit, informed
 /// consent to run the page's own JavaScript, so no CSP is added for it: the page's scripts run as
 /// they always have, Cod's bootstrap included.
 pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars) -> String {
     if allow_js {
-        return inject_at_document_start(source_html, &bootstrap_script(vars, None));
+        return format!(
+            "<!doctype html><html><head>{}</head>{source_html}",
+            bootstrap_script(vars, None)
+        );
     }
     let body = strip_inline_scripts(source_html);
     let nonce = new_nonce();
-    let head = format!("{}{}", csp_meta_tag(&nonce), bootstrap_script(vars, Some(&nonce)));
-    inject_at_document_start(&body, &head)
+    format!(
+        "<!doctype html><html><head>{}{}</head>{body}",
+        csp_meta_tag(&nonce),
+        bootstrap_script(vars, Some(&nonce))
+    )
 }
 
 /// A `data:` URL that loads `html` as a document (#43 AC1, AC5, open question 1): used instead of
@@ -456,16 +449,40 @@ mod tests {
         assert!(bootstrap < built.find("window.cod.call('submit'").unwrap());
     }
 
+    // RC review B1: Cod's prelude is now a complete, fixed document of its own, always first,
+    // regardless of whatever doctype, `<html>` or `<head>` tags the page's own source carries.
     #[test]
-    fn the_bootstrap_script_goes_first_in_a_document_without_head_or_html_tags() {
-        const CSP: &str = "<meta http-equiv=\"Content-Security-Policy\"";
-        assert!(build_agent_document("<p>hi</p>", false, &vars()).starts_with(CSP));
+    fn cods_prelude_always_comes_first_no_matter_what_the_pages_own_markup_starts_with() {
+        const PRELUDE: &str = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\"";
+        assert!(build_agent_document("<p>hi</p>", false, &vars()).starts_with(PRELUDE));
+        assert!(build_agent_document("<!DOCTYPE html><p>hi</p>", false, &vars()).starts_with(PRELUDE));
+        assert!(
+            build_agent_document("<HTML lang=\"en\"><Body><p>hi</p></Body></HTML>", false, &vars())
+                .starts_with(PRELUDE)
+        );
+        assert!(
+            build_agent_document("<html><header>x</header></html>", false, &vars())
+                .starts_with(PRELUDE)
+        );
+        // The page's own markup, comment included, survives unchanged after Cod's prelude.
         let built = build_agent_document("<!DOCTYPE html><p>hi</p>", false, &vars());
-        assert!(built.starts_with(&format!("<!DOCTYPE html>{CSP}")));
-        let built = build_agent_document("<HTML lang=\"en\"><Body><p>hi</p></Body></HTML>", false, &vars());
-        assert!(built.starts_with(&format!("<HTML lang=\"en\">{CSP}")));
-        let built = build_agent_document("<html><header>x</header></html>", false, &vars());
-        assert!(built.starts_with(&format!("<html>{CSP}")));
+        assert!(built.contains("<!DOCTYPE html><p>hi</p>"));
+    }
+
+    // RC review B1: a page that hides its own `<head>` inside a comment used to fool the old
+    // splice-based injection into placing the CSP and bootstrap inside that comment, where
+    // neither ever took effect; an onerror handler could then forge a bridge call freely.
+    #[test]
+    fn a_head_tag_hidden_inside_a_comment_does_not_capture_cods_prelude() {
+        let html = "<!-- <head> --><body><img src=\"data:,\" onerror=\"window.cod.call('submit',{value:'forged'})\"></body>";
+        let built = build_agent_document(html, false, &vars());
+        assert!(built.starts_with("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\""));
+        let head_close = built.find("</head>").expect("Cod's own </head>");
+        let comment = built.find("<!--").expect("the page's own comment, unchanged");
+        assert!(
+            head_close < comment,
+            "Cod's prelude must close before the page's own comment starts: {built}"
+        );
     }
 
     #[test]
