@@ -511,6 +511,7 @@ class WorkspaceChatsTest(CodTestCase):
                 turns=[
                     {"steps": [{"title": "fix invoice rounding"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]},
                     {"steps": [{"title": "read the ledger export"}, {"chunk": LEDGER_REPLY}, {"end": "end_turn"}]},
+                    {"steps": [{"title": "fix invoice rounding"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]},
                 ],
             )
 
