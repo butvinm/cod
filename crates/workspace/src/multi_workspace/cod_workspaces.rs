@@ -688,12 +688,23 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         // Cod (#25 review): this call is itself a fresh "show this workspace" request, however
-        // it was asked for (a tab click through `cod_show_member`, a path opened from the CLI,
-        // or retrying a queued request once its turn comes around below): bump the window's
-        // activation intent and keep this request's own stamp, so its completion can tell
-        // whether a still newer request (for this id again, or any other) arrived first.
+        // it was asked for (a tab click through `cod_show_member`, a path opened from the CLI):
+        // bump the window's activation intent and keep this request's own stamp, so its load
+        // can tell whether a still newer request (for this id again, or any other) arrived first.
         let window_entity = cx.entity_id();
         let activation_intent = CodActivationIntents::bump(cx, window_entity);
+        self.cod_load_pending(id, activation_intent, window, cx)
+    }
+
+    /// Loads the pending member `id` for the request stamped `activation_intent`, and shows it
+    /// unless a newer request came in meanwhile (see `cod_activate_pending`).
+    fn cod_load_pending(
+        &mut self,
+        id: WorkspaceId,
+        activation_intent: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
         if self.cod_materializing {
             // Another member is loading: wait for it, then load or show this one by its id.
             // Success is never reported for a member that was not shown.
@@ -702,8 +713,11 @@ impl MultiWorkspace {
             return cx.spawn_in(window, async move |this, cx| {
                 done_rx.await.ok();
                 this.update_in(cx, |this, window, cx| {
+                    // Cod (#25 AC5): a queued request keeps its own stamp when its turn comes.
+                    // It is no newer than the requests that came in while it waited, so a click
+                    // on another tab meanwhile still wins; the member loads without being shown.
                     if this.cod_pending.contains_key(&id) {
-                        return this.cod_activate_pending(id, window, cx);
+                        return this.cod_load_pending(id, activation_intent, window, cx);
                     }
                     let loaded = this
                         .held
