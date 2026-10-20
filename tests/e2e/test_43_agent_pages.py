@@ -385,8 +385,21 @@ class AgentPagesTest(CodTestCase):
                 SHOW_TIMEOUT,
             )
 
+        with self.step("return to the page tab from the keyboard after opening invoice.rs"):
+            # The file may replace the page in the active pane. The global tab
+            # switcher also works if the two tabs happen to be in separate panes.
+            # Only the file and page are open; the page is the older entry.
+            self.run_command("tab switcher: toggle all")
+            self.keys("end enter")
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("active") is True
+                and (page_by_id(state, page_id) or {}).get("focused") is True
+                and (page_by_id(state, page_id) or {}).get("hidden") is False,
+                SHOW_TIMEOUT,
+                "the original page tab to be active, visible and focused again",
+            )
+
         with self.step("activate focus-session: the agent panel and that chat are focused again"):
-            # Opening invoice.rs just above already moved the keyboard focus to the editor.
             self.expect_equal("agent panel not focused before focus-session", False, self.state().get("agent_panel_focused") is True)
             self.click_in_page(page_id, 50, 95)
             self.wait_for(
