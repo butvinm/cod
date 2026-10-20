@@ -153,9 +153,18 @@ fn js_string(text: &str) -> String {
 /// Cod's bootstrap script for an agent page (#43 AC3, AC4, AC6): theme variables, `window.cod.call`
 /// and the `[data-cod]` click wiring. It always runs, even when the page's own inline scripts do
 /// not: it is Cod's own code, appended after they are stripped, never the page's.
-pub fn bootstrap_script(vars: &ThemeVars) -> String {
+///
+/// `nonce`, when given, is Cod's own Content-Security-Policy nonce (#43 security requirement,
+/// RC review B1): it names this `<script>` element as the one the page's CSP allows to run, so
+/// the bootstrap keeps working even while every other script and inline event handler the page's
+/// own content tries to run is blocked.
+pub fn bootstrap_script(vars: &ThemeVars, nonce: Option<&str>) -> String {
+    let nonce_attr = match nonce {
+        Some(nonce) => format!(" nonce=\"{nonce}\""),
+        None => String::new(),
+    };
     format!(
-        "<script>(function(){{\
+        "<script{nonce_attr}>(function(){{\
          {theme_vars}\
          function codSend(name,args){{console.log({prefix}+JSON.stringify({{name:name,args:args||{{}}}}));}}\
          window.cod={{call:codSend}};\
@@ -180,6 +189,25 @@ pub fn bootstrap_script(vars: &ThemeVars) -> String {
         theme_vars = vars.set_script(),
         prefix = js_string(BRIDGE_PREFIX),
     )
+}
+
+/// A fresh, unpredictable Content-Security-Policy nonce (#43 security requirement, RC review
+/// B1): generated after the page's own HTML has already been read, so nothing in that HTML can
+/// ever carry a matching value, however it was built.
+fn new_nonce() -> String {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The `<meta>` Content-Security-Policy that keeps every script but Cod's own nonce-tagged
+/// bootstrap from running (#43 security requirement, RC review B1): this blocks `<script>`
+/// elements the page's own content still carries as well as inline event handler attributes
+/// (`onerror`, `onclick`, ...), which stripping `<script>` tags alone never touched.
+fn csp_meta_tag(nonce: &str) -> String {
+    format!("<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'nonce-{nonce}'\">")
 }
 
 /// The script that updates an already-open page's theme variables without a reload (#43 AC6).
@@ -259,14 +287,24 @@ pub fn inject_at_document_start(html: &str, script: &str) -> String {
     format!("{}{}{}", &html[..at], script, &html[at..])
 }
 
-/// Cod's whole processing of an agent page's source (#43 AC1, AC4, AC6): strips the page's own inline scripts unless `allow_js`, then inserts Cod's bootstrap script before everything else in the document.
+/// Cod's whole processing of an agent page's source (#43 AC1, AC4, AC6): strips the page's own
+/// inline scripts unless `allow_js`, then inserts Cod's bootstrap script before everything else
+/// in the document.
+///
+/// Without `allow_js`, a Content-Security-Policy that allows only Cod's own, freshly nonced
+/// bootstrap script is injected alongside it (RC review B1): stripping `<script>` elements alone
+/// leaves inline event handlers (`onerror="..."`, `onclick="..."`, ...) free to run and forge a
+/// bridge call, which the CSP blocks at the engine instead. `allow_js` is explicit, informed
+/// consent to run the page's own JavaScript, so no CSP is added for it: the page's scripts run as
+/// they always have, Cod's bootstrap included.
 pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars) -> String {
-    let body = if allow_js {
-        source_html.to_owned()
-    } else {
-        strip_inline_scripts(source_html)
-    };
-    inject_at_document_start(&body, &bootstrap_script(vars))
+    if allow_js {
+        return inject_at_document_start(source_html, &bootstrap_script(vars, None));
+    }
+    let body = strip_inline_scripts(source_html);
+    let nonce = new_nonce();
+    let head = format!("{}{}", csp_meta_tag(&nonce), bootstrap_script(vars, Some(&nonce)));
+    inject_at_document_start(&body, &head)
 }
 
 /// A `data:` URL that loads `html` as a document (#43 AC1, AC5, open question 1): used instead of
@@ -404,8 +442,8 @@ mod tests {
         let html = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body><h1>Ask</h1></body></html>";
         let built = build_agent_document(html, false, &vars());
         assert!(built.contains("<h1>Ask</h1>"));
-        assert!(built.starts_with("<!doctype html><html><head><script>"));
-        assert!(built.find("window.cod").unwrap() < built.find("<meta").unwrap());
+        assert!(built.starts_with("<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\""));
+        assert!(built.find("window.cod").unwrap() < built.find("<meta charset").unwrap());
     }
 
     #[test]
@@ -420,13 +458,14 @@ mod tests {
 
     #[test]
     fn the_bootstrap_script_goes_first_in_a_document_without_head_or_html_tags() {
-        assert!(build_agent_document("<p>hi</p>", false, &vars()).starts_with("<script>"));
+        const CSP: &str = "<meta http-equiv=\"Content-Security-Policy\"";
+        assert!(build_agent_document("<p>hi</p>", false, &vars()).starts_with(CSP));
         let built = build_agent_document("<!DOCTYPE html><p>hi</p>", false, &vars());
-        assert!(built.starts_with("<!DOCTYPE html><script>"));
+        assert!(built.starts_with(&format!("<!DOCTYPE html>{CSP}")));
         let built = build_agent_document("<HTML lang=\"en\"><Body><p>hi</p></Body></HTML>", false, &vars());
-        assert!(built.starts_with("<HTML lang=\"en\"><script>"));
+        assert!(built.starts_with(&format!("<HTML lang=\"en\">{CSP}")));
         let built = build_agent_document("<html><header>x</header></html>", false, &vars());
-        assert!(built.starts_with("<html><script>"));
+        assert!(built.starts_with(&format!("<html>{CSP}")));
     }
 
     #[test]
@@ -434,6 +473,44 @@ mod tests {
         let html = "<body><script>window.ranInlineScript = true;</script></body>";
         assert!(!build_agent_document(html, false, &vars()).contains("ranInlineScript"));
         assert!(build_agent_document(html, true, &vars()).contains("ranInlineScript"));
+    }
+
+    // RC review B1: stripping `<script>` elements alone does not stop an inline event handler
+    // (`onerror`, `onclick`, ...) from running. Without `--js`, the built document must carry a
+    // Content-Security-Policy that allows only Cod's own, freshly nonced bootstrap script; a
+    // real browser engine enforcing it is what actually blocks the handler (checked end to end
+    // in tests/e2e/test_43_agent_pages.py), but the document itself must be built right first.
+
+    #[test]
+    fn without_js_the_document_carries_a_csp_naming_cods_own_nonce() {
+        let html = "<body><img src=\"data:,\" onerror=\"window.cod.call('submit',{value:'forged'})\"></body>";
+        let built = build_agent_document(html, false, &vars());
+        assert!(built.contains("Content-Security-Policy"));
+        let nonce = built
+            .split("script-src 'nonce-")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("a nonce in the CSP")
+            .to_owned();
+        assert!(!nonce.is_empty());
+        // Cod's own bootstrap carries the exact nonce the CSP names; the page's own handler, left
+        // untouched as plain text, carries none and so has nothing to match.
+        assert!(built.contains(&format!("<script nonce=\"{nonce}\">")));
+        assert!(built.contains("onerror=\"window.cod.call('submit',{value:'forged'})\""));
+        assert!(!built.contains(&format!("onerror=\"window.cod.call('submit',{{value:'forged'}})\" nonce=\"{nonce}\"")));
+    }
+
+    #[test]
+    fn two_documents_never_share_a_csp_nonce() {
+        let first = build_agent_document("<p>a</p>", false, &vars());
+        let second = build_agent_document("<p>a</p>", false, &vars());
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn allow_js_adds_no_content_security_policy() {
+        let built = build_agent_document("<p>hi</p>", true, &vars());
+        assert!(!built.contains("Content-Security-Policy"));
     }
 
     #[test]

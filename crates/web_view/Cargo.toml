@@ -23,6 +23,9 @@ gpui.workspace = true
 log.workspace = true
 menu.workspace = true
 project.workspace = true
+# A per-document Content-Security-Policy nonce, unpredictable to a page's own content (RC review
+# B1): generated after the page's own HTML is read, so nothing in it can carry a matching value.
+rand.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 theme.workspace = true
