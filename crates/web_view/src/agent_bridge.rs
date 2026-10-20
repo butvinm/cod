@@ -287,33 +287,61 @@ pub enum SubmitOutcome {
     Closed,
 }
 
+/// One `codctl open --html --wait` waiting for its page, and the value the page submitted, if any.
+struct Waiter {
+    sender: futures::channel::oneshot::Sender<SubmitOutcome>,
+    submitted: Option<String>,
+}
+
+/// The pages `codctl open --html --wait` waits for (#43 AC2). A submit only records its value: the waiter is answered once the page tab is gone, so `codctl` exits after the tab closed, as AC2 orders it, and the next command never still sees the submitted page.
 #[derive(Default)]
-struct Waiters(std::collections::BTreeMap<PageId, futures::channel::oneshot::Sender<SubmitOutcome>>);
+struct Waiters(std::collections::BTreeMap<PageId, Waiter>);
 
 impl Global for Waiters {}
 
-/// Registers a waiter for the page's submit or close, for `codctl open --html --wait` (#43 AC2).
-pub fn wait_for_submit(page: PageId, cx: &mut App) -> futures::channel::oneshot::Receiver<SubmitOutcome> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    cx.default_global::<Waiters>().0.insert(page, tx);
-    rx
-}
+impl Waiters {
+    fn register(&mut self, page: PageId) -> futures::channel::oneshot::Receiver<SubmitOutcome> {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.0.insert(
+            page,
+            Waiter {
+                sender,
+                submitted: None,
+            },
+        );
+        receiver
+    }
 
-fn resolve_waiter(page: &PageId, outcome: SubmitOutcome, cx: &mut App) {
-    if let Some(sender) = cx.default_global::<Waiters>().0.remove(page) {
-        sender.send(outcome).ok();
+    fn record_submit(&mut self, page: &PageId, value: String) {
+        if let Some(waiter) = self.0.get_mut(page) {
+            waiter.submitted = Some(value);
+        }
+    }
+
+    fn finish(&mut self, page: &PageId) {
+        if let Some(waiter) = self.0.remove(page) {
+            let outcome = match waiter.submitted {
+                Some(value) => SubmitOutcome::Submitted(value),
+                None => SubmitOutcome::Closed,
+            };
+            waiter.sender.send(outcome).ok();
+        }
     }
 }
 
-/// Tells a pending waiter the user submitted `value`; a no-op without one.
-pub fn submit(page: &PageId, value: String, cx: &mut App) {
-    resolve_waiter(page, SubmitOutcome::Submitted(value), cx);
+/// Registers a waiter for the page's submit or close, for `codctl open --html --wait` (#43 AC2).
+pub fn wait_for_submit(page: PageId, cx: &mut App) -> futures::channel::oneshot::Receiver<SubmitOutcome> {
+    cx.default_global::<Waiters>().register(page)
 }
 
-/// Tells a pending waiter the tab closed instead; a no-op without one (not waited for, or already
-/// resolved by a submit).
+/// Records that the user submitted `value` on the page; its waiter gets it once the page tab is gone (`closed`). A no-op without a waiter.
+pub fn submit(page: &PageId, value: String, cx: &mut App) {
+    cx.default_global::<Waiters>().record_submit(page, value);
+}
+
+/// Answers the page's waiter now that its tab is gone: the submitted value, or `Closed` when the user closed the tab without submitting. A no-op without a waiter.
 pub fn closed(page: &PageId, cx: &mut App) {
-    resolve_waiter(page, SubmitOutcome::Closed, cx);
+    cx.default_global::<Waiters>().finish(page);
 }
 
 #[cfg(test)]
@@ -424,6 +452,29 @@ mod tests {
         assert!(script.contains("--cod-background"));
         assert!(script.contains("'rgba(10, 10, 10, 1.000)'"));
         assert!(script.contains("Zed Sans"));
+    }
+
+    fn page(id: &str) -> PageId {
+        PageId(id.to_owned().into())
+    }
+
+    #[test]
+    fn a_submit_is_answered_only_once_the_page_is_gone() {
+        let mut waiters = Waiters::default();
+        let mut receiver = waiters.register(page("page-1"));
+        waiters.record_submit(&page("page-1"), "half-even".into());
+        assert_eq!(receiver.try_recv(), Ok(None));
+        waiters.finish(&page("page-1"));
+        assert_eq!(receiver.try_recv(), Ok(Some(SubmitOutcome::Submitted("half-even".into()))));
+    }
+
+    #[test]
+    fn a_page_closed_without_a_submit_answers_closed() {
+        let mut waiters = Waiters::default();
+        let mut receiver = waiters.register(page("page-2"));
+        waiters.record_submit(&page("page-3"), "other page".into());
+        waiters.finish(&page("page-2"));
+        assert_eq!(receiver.try_recv(), Ok(Some(SubmitOutcome::Closed)));
     }
 
     #[test]

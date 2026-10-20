@@ -749,7 +749,6 @@ impl OffscreenView {
     }
 }
 
-/// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
 /// Runs one allowed bridge call of the agent page `page_id` (#43 AC2, AC3). It runs deferred, with no page view being updated (see `OffscreenView::dispatch_bridge_call`).
 fn run_bridge_action(
     page_id: PageId,
@@ -766,7 +765,10 @@ fn run_bridge_action(
             let value = arg_str(&call, "value");
             log::info!("web_view: {page_id} submitted {value:?}");
             crate::agent_bridge::submit(&page_id, value, cx);
-            pages::close(&page_id, window, cx);
+            // The waiter gets the value when the page view is released (its `on_release`); a page that cannot be closed answers at once.
+            if !pages::close(&page_id, window, cx) {
+                crate::agent_bridge::closed(&page_id, cx);
+            }
         }
         "open-file" => open_file_from_page(&page_id, workspace, arg_str(&call, "path"), window, cx),
         "focus-session" => {
@@ -794,13 +796,23 @@ fn open_file_from_page(
         log::warn!("web_view: {page_id} refused to open {raw:?}: not inside the workspace's folders");
         return;
     };
+    // The file opens beside the page, never in the page's own pane: the agent's page stays visible (its question, its other buttons) while the user reads the file. That is another pane when the workspace has one, else a new split to the right of the page.
+    let page_view = pages::find(page_id, cx);
+    let target_pane = workspace.update(cx, |workspace, cx| {
+        let page_pane = page_view.as_ref().and_then(|view| workspace.pane_for(view))?;
+        let other = workspace.panes().iter().find(|pane| **pane != page_pane).cloned();
+        Some(other.unwrap_or_else(|| {
+            workspace.split_pane(page_pane, SplitDirection::Right, window, cx)
+        }))
+    });
     let page_id = page_id.clone();
     let path_text = path_text.to_owned();
     window
         .spawn(cx, async move |cx| {
             let item = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_path(project_path, None, true, window, cx)
+                    let pane = target_pane.as_ref().map(|pane| pane.downgrade());
+                    workspace.open_path(project_path, pane, true, window, cx)
                 })?
                 .await?;
             if let Some(line) = line {
@@ -860,6 +872,7 @@ fn focus_session_from_page(
     }
 }
 
+/// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
 fn page_context(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => format!("{}{}", parsed.host_str().unwrap_or_default(), parsed.path()),
