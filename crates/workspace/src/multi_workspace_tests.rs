@@ -1745,12 +1745,14 @@ async fn cod_pending_load_fixture(
 ) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree("/billing-api", json!({ "README.md": "" })).await;
+    fs.insert_tree("/billing-api", json!({ "README.md": "" }))
+        .await;
     fs.insert_tree("/infra", json!({ "README.md": "" })).await;
     let project_ops = Project::test(fs.clone(), ["/infra".as_ref()], cx).await;
     let project_pay = Project::test(fs, ["/billing-api".as_ref()], cx).await;
     let (multi_workspace, cx) = setup_multi_workspace(&[project_ops], cx);
-    let ops = multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let ops =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
     let pay_id = WorkspaceId::from_i64(1234);
     let pay = multi_workspace.update_in(cx, |_, window, cx| {
         cx.new(|cx| {
@@ -1777,9 +1779,15 @@ async fn test_cod_newest_click_wins_over_a_pending_load_that_shows_its_workspace
     });
     cx.run_until_parked();
     multi_workspace.read_with(cx, |multi_workspace, _| {
-        assert_eq!(multi_workspace.workspace(), &ops, "the newest click (OPS-77) must stay shown");
+        assert_eq!(
+            multi_workspace.workspace(),
+            &ops,
+            "the newest click (OPS-77) must stay shown"
+        );
         assert!(
-            multi_workspace.workspaces().any(|workspace| workspace == &pay),
+            multi_workspace
+                .workspaces()
+                .any(|workspace| workspace == &pay),
             "the loaded workspace must still join the window"
         );
     });
@@ -1805,7 +1813,15 @@ async fn test_cod_a_pending_load_shows_its_workspace_without_a_newer_request(
     });
     cx.run_until_parked();
     multi_workspace.read_with(cx, |multi_workspace, _| {
-        assert_eq!(multi_workspace.workspace(), &pay, "the only request must show PAY-1234");
-        assert!(multi_workspace.workspaces().any(|workspace| workspace == &ops));
+        assert_eq!(
+            multi_workspace.workspace(),
+            &pay,
+            "the only request must show PAY-1234"
+        );
+        assert!(
+            multi_workspace
+                .workspaces()
+                .any(|workspace| workspace == &ops)
+        );
     });
 }
