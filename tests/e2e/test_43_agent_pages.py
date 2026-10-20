@@ -48,10 +48,13 @@ def ask_html(session_id: str = SESSION_ID) -> str:
     that would change the heading if it ran. Every interactive element is an absolutely
     positioned, full box of its own, at a known position, so a test can click it precisely.
     """
+    # The driver exposes the page rectangle, not DOM element rectangles.
+    # A flow root keeps the h1's margin inside the body, so its positioned boxes
+    # use the page origin assumed by click_in_page instead of a collapsed margin.
     box = "position:absolute;left:{left}px;top:{top}px;width:220px;height:30px;"
     return (
         "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
-        '<body style="margin:0;position:relative">'
+        '<body style="margin:0;position:relative;display:flow-root">'
         '<h1 id="heading">Ask</h1>'
         f'<input id="answer" type="text" autofocus style="{box.format(left=0, top=0)}">'
         f'<button data-cod="submit" data-cod-value-from="#answer" '
@@ -349,8 +352,30 @@ class AgentPagesTest(CodTestCase):
             self.keys("end up enter")
             self.wait_for(lambda state: chat(state).get("session_id") == SESSION_ID, SHOW_TIMEOUT, "the fake agent's chat")
 
-        with self.step("open ask.html and activate its open-file link: src/invoice.rs opens at line 18"):
+        with self.step("open ask.html and focus the page before testing its actions"):
             page_id = self.open_agent_page(repo)
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("focused") is True,
+                SHOW_TIMEOUT,
+                "the agent page to have the focus",
+            )
+
+        with self.step("activate the button whose action is not in the allowlist: nothing happens, and it is logged as refused"):
+            # Focus is already in the page: the click's normal focus change must
+            # not be confused with an effect of the refused bridge action.
+            before = self.state()
+            self.click_in_page(page_id, 50, 135)
+            time.sleep(SETTLE_TIME)
+            after = self.state()
+            self.expect_equal("active tab unchanged", before["active_tab"], after["active_tab"])
+            self.expect_equal("tabs unchanged", before["tabs"], after["tabs"])
+            self.expect_equal("chat unchanged", chat(before).get("session_id"), chat(after).get("session_id"))
+            self.expect_equal("agent panel focus unchanged", before.get("agent_panel_focused"), after.get("agent_panel_focused"))
+            log_text = self.output_log()
+            if "refused the action" not in log_text or "erase-everything" not in log_text:
+                raise AssertionError(f"expected the refused action logged; last 4000 chars of the log: {log_text[-4000:]!r}")
+
+        with self.step("activate the open-file link: src/invoice.rs opens at line 18"):
             # The open-file link is the absolutely positioned box at left 0, top 40.
             self.click_in_page(page_id, 50, 55)
             self.wait_for_values(
@@ -360,8 +385,21 @@ class AgentPagesTest(CodTestCase):
                 SHOW_TIMEOUT,
             )
 
+        with self.step("return to the page tab from the keyboard after opening invoice.rs"):
+            # The file may replace the page in the active pane. The global tab
+            # switcher also works if the two tabs happen to be in separate panes.
+            # Only the file and page are open; the page is the older entry.
+            self.run_command("tab switcher: toggle all")
+            self.keys("end enter")
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("active") is True
+                and (page_by_id(state, page_id) or {}).get("focused") is True
+                and (page_by_id(state, page_id) or {}).get("hidden") is False,
+                SHOW_TIMEOUT,
+                "the original page tab to be active, visible and focused again",
+            )
+
         with self.step("activate focus-session: the agent panel and that chat are focused again"):
-            # Opening invoice.rs just above already moved the keyboard focus to the editor.
             self.expect_equal("agent panel not focused before focus-session", False, self.state().get("agent_panel_focused") is True)
             self.click_in_page(page_id, 50, 95)
             self.wait_for(
@@ -369,17 +407,6 @@ class AgentPagesTest(CodTestCase):
                 SHOW_TIMEOUT,
                 "focus-session to focus the chat",
             )
-
-        with self.step("activate the button whose action is not in the allowlist: nothing happens, and it is logged as refused"):
-            before = self.state()
-            self.click_in_page(page_id, 50, 135)
-            time.sleep(SETTLE_TIME)
-            after = self.state()
-            self.expect_equal("active tab unchanged", before["active_tab"], after["active_tab"])
-            self.expect_equal("agent panel focus unchanged", before.get("agent_panel_focused"), after.get("agent_panel_focused"))
-            log_text = self.output_log()
-            if "refused the action" not in log_text or "erase-everything" not in log_text:
-                raise AssertionError(f"expected the refused action logged; last 4000 chars of the log: {log_text[-4000:]!r}")
 
     # AC4
 
