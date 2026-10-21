@@ -11769,6 +11769,41 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_cod_restore_background_chat_subscribes_to_status(cx: &mut TestAppContext) {
+        // RC review C5: background restoration used to insert straight into
+        // `retained_threads`, bypassing `insert_retained_thread` and the status subscription it
+        // sets up. A background chat restored this way could change status without ever telling
+        // the overview or the workspace dot.
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        let connection = StubAgentConnection::new();
+        open_thread_with_connection(&panel, connection, &mut cx);
+        send_message(&panel, &mut cx);
+
+        let thread_id = active_thread_id(&panel, &cx);
+        let entry = cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .cloned()
+                .expect("the sent thread should have a metadata row")
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.cod_restore_background_chat(entry, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_thread_subscriptions.contains_key(&thread_id),
+                "a chat resumed by background restoration should subscribe to its status \
+                 updates the same way `insert_retained_thread` does for every other chat"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_idle_non_loadable_thread_retained_when_navigating_away(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
 
