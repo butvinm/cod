@@ -21647,6 +21647,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
+ "tempfile",
  "theme",
  "theme_settings",
  "ui",
