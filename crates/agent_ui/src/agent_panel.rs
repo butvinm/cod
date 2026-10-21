@@ -9406,6 +9406,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_cod_session_new_twice_creates_two_fresh_sessions(cx: &mut TestAppContext) {
+        // RC review C3: `codctl session new --agent X` twice with nothing sent between the calls
+        // used to hand back the very same empty draft both times, because `activate_new_thread`
+        // reuses an empty draft whose agent already matches. Each call must create a distinct
+        // thread.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let _ = panel;
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+
+        let first_thread_id = cx.update(|window, cx| {
+            crate::cod_sessions::new_session(&workspace, "stub", window, cx)
+                .expect("first session new should succeed")
+        });
+        cx.run_until_parked();
+
+        let second_thread_id = cx.update(|window, cx| {
+            crate::cod_sessions::new_session(&workspace, "stub", window, cx)
+                .expect("second session new should succeed")
+        });
+        cx.run_until_parked();
+
+        assert_ne!(
+            first_thread_id, second_thread_id,
+            "a second `session new` for the same agent, with nothing sent in between, \
+             must create a fresh session rather than handing back the first empty draft"
+        );
+    }
+
+    #[gpui::test]
     async fn test_new_draft_survives_reload_when_real_thread_is_active(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
