@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from cod_e2e import CodTestCase, make_repo
+from cod_status_fixtures import CodStatusFixtures
 
 PAY_NAME = "[PAY-1234] (billing-api) Fix invoice rounding"
 WEB_NAME = "[PAY-1234] (billing-web) Show rounded totals"
@@ -86,7 +87,7 @@ class Codctl:
         )
 
 
-class CodctlTest(CodTestCase):
+class CodctlTest(CodStatusFixtures, CodTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.home = self.workdir / "home"
@@ -374,6 +375,36 @@ class CodctlTest(CodTestCase):
             after = [(workspace["id"], [real(path) for path in workspace["folders"]]) for workspace in listed]
             self.expect_equal("listed workspaces after the restart", before, after)
             self.expect_equal("every entry tells whether it is loaded", True, all(isinstance(workspace.get("loaded"), bool) for workspace in listed))
+
+    def test_a8_list_reports_the_workspaces_real_status_not_always_idle(self) -> None:
+        """RC review A8: `workspace list --json` used to print the placeholder "idle"
+        unconditionally, never the workspace's real status, even while an entry of its own
+        needed input or had failed."""
+        with self.step("create the fixture repos billing-api and billing-web, and start on both"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            first = self.start_on(api)
+            second = self.new_workspace("--folder", str(web))
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+
+        with self.step("both workspaces start idle"):
+            self.expect_equal(
+                "statuses before any entry",
+                {first: "idle", second: "idle"},
+                {workspace["id"]: workspace["status"] for workspace in self.list_json()},
+            )
+
+        with self.step("give the first workspace a needs-input entry and the second a working one"):
+            self.set_entry(0, "demo-session", "needs_input")
+            self.set_entry(1, "demo-session", "working")
+
+        with self.step("workspace list --json now reports each workspace's real status"):
+            self.wait_for(
+                lambda _: {workspace["id"]: workspace["status"] for workspace in self.list_json()}
+                == {first: "needs_input", second: "working"},
+                SHOW_TIMEOUT,
+                "workspace list --json to report the real statuses",
+            )
 
     # AC4
 
