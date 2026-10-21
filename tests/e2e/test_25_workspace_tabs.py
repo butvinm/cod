@@ -634,7 +634,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
 
 
-class FirstUseWelcomeTest(CodTestCase):
+class FirstUseWelcomeTest(CodStatusFixtures, CodTestCase):
     """Issue #77 AC(f): a fresh profile's first workspace shows Cod's own welcome text, never "Zed"."""
 
     def test_ac7_fresh_profile_shows_cod_welcome_text_not_zed(self) -> None:
