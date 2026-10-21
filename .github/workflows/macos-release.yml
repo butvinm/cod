@@ -157,10 +157,11 @@ jobs:
           cat cod-macos-aarch64.zip.sha256
           shasum -a 256 -c cod-macos-aarch64.zip.sha256
 
-      # Tests the shipped zip, not the build tree: unzips it fresh, starts Cod.app through its
-      # launcher with an isolated, temporary data folder, and waits for the window before poking
-      # at it with codctl. A crash report under ~/Library/Logs/DiagnosticReports for this run's
-      # process also fails the job, even if the process looked alive at the check below.
+      # Tests the shipped zip, not the build tree: extracts it fresh with ditto (keeping the
+      # signature's extended attributes), verifies the extracted signature, and opens Cod.app the
+      # way Finder does (open -n) with an isolated, temporary data folder, waiting for the window
+      # before poking at it with codctl. A crash report for one of Cod's own executables, created
+      # after this run's own launch, also fails the job, even if the process looked alive below.
       - name: Smoke test the zip
         id: smoke
         run: |
