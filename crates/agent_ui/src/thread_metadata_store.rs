@@ -1403,6 +1403,17 @@ impl ThreadMetadataStore {
         })
     }
 
+    /// The thread ids of the workspace's parked drafts, in tab order (RC review C7
+    /// continuation): see `ThreadMetadataDb::cod_workspace_draft_thread_ids`.
+    pub fn cod_workspace_draft_thread_ids(
+        &self,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<Vec<ThreadId>>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.cod_workspace_draft_thread_ids(workspace_id) })
+    }
+
     /// Deletes the chats of a workspace that left its window for good.
     pub fn cod_delete_workspace_chats(&self, workspace_id: i64, cx: &mut Context<Self>) {
         let db = self.db.clone();
@@ -1601,6 +1612,19 @@ impl ThreadMetadataDb {
     pub fn cod_workspace_thread_ids(&self, workspace_id: i64) -> anyhow::Result<Vec<ThreadId>> {
         self.select_bound::<i64, ThreadId>(
             "SELECT thread_id FROM sidebar_threads WHERE cod_workspace_id = ?1",
+        )?(workspace_id)
+    }
+
+    /// The rows of the workspace's parked drafts (no provider session id yet), in tab order (RC
+    /// review C7 continuation): kept apart from `cod_workspace_sessions`, which excludes them
+    /// with `session_id IS NOT NULL`, so a draft parked in this workspace and never sent before
+    /// quitting is still enumerated, and restored with the rest of the workspace's chats, after
+    /// a restart.
+    pub fn cod_workspace_draft_thread_ids(&self, workspace_id: i64) -> anyhow::Result<Vec<ThreadId>> {
+        self.select_bound::<i64, ThreadId>(
+            "SELECT thread_id FROM sidebar_threads \
+             WHERE cod_workspace_id = ?1 AND session_id IS NULL \
+             ORDER BY cod_tab_order ASC",
         )?(workspace_id)
     }
 }
@@ -2180,6 +2204,53 @@ mod tests {
         let mut expected = vec![rounding_id, migration_id];
         expected.sort_by_key(|id| id.to_key_string());
         assert_eq!(ids, expected);
+    }
+
+    // RC review C7 continuation: `cod_workspace_sessions`, the query restart enumeration used
+    // to rely on exclusively, excludes rows with no provider session id (`session_id IS NOT
+    // NULL`), so a draft parked in a workspace and never sent before quitting was skipped and
+    // never came back after a restart even though `cod_assign_chat_by_thread_id` had already
+    // assigned its row to the workspace.
+    #[gpui::test]
+    async fn test_cod_workspace_draft_thread_ids_enumerates_parked_drafts(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let folder = PathList::new(&[Path::new("/billing-api")]);
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let mut draft = make_metadata("ignored-draft-session", "", now, folder.clone());
+        draft.session_id = None;
+        let draft_id = draft.thread_id;
+        db.save(draft).await.unwrap();
+
+        let sent = make_metadata("claude-session-rounding", "fix invoice rounding", now, folder);
+        db.save(sent).await.unwrap();
+
+        db.cod_assign_chat_by_thread_id(draft_id, 1).await.unwrap();
+        db.cod_assign_chat("claude-session-rounding".to_string(), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.cod_workspace_sessions(1).unwrap(),
+            vec!["claude-session-rounding".to_string()],
+            "sanity: the sent chat is enumerated the same way as before"
+        );
+        assert_eq!(
+            db.cod_workspace_draft_thread_ids(1).unwrap(),
+            vec![draft_id],
+            "a parked draft owned by the workspace must be enumerated too, by thread id, so \
+             restart enumeration restores it along with the workspace's other chats"
+        );
+        assert_eq!(
+            db.cod_workspace_draft_thread_ids(2).unwrap(),
+            Vec::<ThreadId>::new(),
+            "a workspace that owns no draft reports none"
+        );
     }
 
     #[gpui::test]
