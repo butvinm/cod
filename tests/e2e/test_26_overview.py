@@ -492,15 +492,17 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
         """RC fixes item 2: Enter on a session row must open that chat with the keyboard focus
         in it (the agent panel focused on that session), not leave the focus where it was in the
         pane. A fake agent chat (#28) gives a session row a real open callback; the set_entry
-        fixture's rows never do (tests/e2e/cod_status_fixtures.py), so they cannot show this."""
-        with self.step("create the fixture repo billing-api and an agent script with one scripted reply"):
+        fixture's rows never do (tests/e2e/cod_status_fixtures.py), so they cannot show this.
+        The chat is left "waiting for you" (a pending permission request), the story's own
+        example of a session row."""
+        with self.step("create the fixture repo billing-api and an agent script that asks permission and waits"):
             repo = self.make_repo("billing-api", BILLING_API)
             script = self.workdir / "agent-script.json"
             script.write_text(
                 json.dumps(
                     {
                         "session_ids": ["claude-session-pay-1234"],
-                        "turns": [{"steps": [{"chunk": "The rounding happens in src/main.rs."}, {"end": "end_turn"}]}],
+                        "turns": [{"steps": [{"permission": "Allow edit to src/main.rs?"}]}],
                     }
                 )
             )
@@ -518,11 +520,9 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
             self.run_command("agent: toggle new thread menu")
             self.keys("end up enter")
             self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, SHOW_TIMEOUT, "a chat with the fake agent")
-            self.type("Where does the rounding happen?")
+            self.type("Edit the rounding")
             self.keys("enter")
-            self.wait_for(
-                lambda state: "src/main.rs" in chat(state).get("transcript", ""), SHOW_TIMEOUT, "the scripted reply in the transcript"
-            )
+            self.wait_for(lambda state: chat(state).get("status") == "needs_input", SHOW_TIMEOUT, "the chat waiting for permission")
             session_id = chat(self.state()).get("session_id")
 
         with self.step("move the focus out of the agent panel and into an editor item"):
