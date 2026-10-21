@@ -201,6 +201,79 @@ class AgentChatLinksTest(CodTestCase):
             self.expect_equal("page active", True, page["active"])
             self.expect_equal("window count", 1, state["window_count"])
 
+    def test_links_in_an_earlier_reply_stay_keyboard_reachable_after_a_second_reply_arrives(self) -> None:
+        """RC review B7/C4: Tab/Shift-Tab used to stay inside the newest reply's last block, so a second reply's arrival made the first reply's links unreachable from the keyboard. Shift-Tab must keep moving back across reply boundaries, and Tab forward, not stop at the one block AC5 already covers."""
+        first_url = "https://tracker.example.com/PAY-1234"
+        second_url = "https://tracker.example.com/PAY-5678"
+        reply_one = f"The ticket is {first_url}."
+        reply_two = f"The follow-up ticket is {second_url}."
+
+        with self.step("create the fixture repo billing-api and an agent script with two scripted replies"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            script = self.workdir / "agent-script.json"
+            script.write_text(
+                json.dumps(
+                    {
+                        "session_ids": ["claude-session-pay-1234"],
+                        "turns": [
+                            {"steps": [{"chunk": reply_one}, {"end": "end_turn"}]},
+                            {"steps": [{"chunk": reply_two}, {"end": "end_turn"}]},
+                        ],
+                    }
+                )
+            )
+            agent_servers = {AGENT_ID: fake_agent_settings(script, log=self.workdir / "agent.log")}
+
+        with self.step("start Cod, start a chat with the fake agent and send two prompts"):
+            self.start_cod(repo, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                30,
+                "the billing-api folder to open",
+            )
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            self.keys("end up enter")
+            self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
+            self.type("Where is the ticket?")
+            self.keys("enter")
+            self.wait_for(lambda state: reply_one in chat(state).get("transcript", ""), 30, "the first scripted reply")
+            self.type("Is there a follow-up ticket?")
+            self.keys("enter")
+            self.wait_for(lambda state: reply_two in chat(state).get("transcript", ""), 30, "the second scripted reply")
+
+        with self.step("move the focus into the newest reply: unchanged AC5 behaviour, the second reply's block"):
+            self.keys("alt-up")
+            self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
+            self.expect_equal("no link focused yet", None, focused_link_text(self.state()))
+
+        with self.step("shift-tab into the newest reply's own (only) link"):
+            self.keys("shift-tab")
+            self.wait_for(
+                lambda state: focused_link_text(state) == second_url,
+                10,
+                "the focus on the follow-up ticket link",
+            )
+
+        with self.step("shift-tab twice more: past the newest reply's last link, into the first reply's link"):
+            self.keys("shift-tab")
+            self.keys("shift-tab")
+            self.wait_for(
+                lambda state: focused_link_text(state) == first_url,
+                10,
+                "the focus to continue back into the first reply's link",
+            )
+
+        with self.step("tab forward again: back into the newest reply's link"):
+            self.keys("tab")
+            self.keys("tab")
+            self.wait_for(
+                lambda state: focused_link_text(state) == second_url,
+                10,
+                "tab to continue forward into the second reply's link",
+            )
+
 
 PAY_SESSION = "claude-session-pay-1234"
 LEDGER_SESSION = "claude-session-ledger-1300"
