@@ -317,7 +317,7 @@ fn find_open_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> 
     Some(members.swap_remove(position))
 }
 
-/// The pure half of `find_open_with_same_folders`: the position of the member `workspace new` must reuse for `folders`, given each member's folders, whether it is loaded and whether it is local. A loaded one wins over a pending one.
+/// The pure half of `find_open_with_same_folders`: the position of the member `workspace new` must reuse for `folders`, given each member's folders, whether it is loaded and whether it is local. Only a local one counts, since the request names local folders, and a loaded one wins over a pending one.
 fn open_member_position<'a>(
     folders: &[PathBuf],
     members: impl IntoIterator<Item = (&'a [String], bool, bool)>,
@@ -325,7 +325,7 @@ fn open_member_position<'a>(
     let matching: Vec<(usize, bool)> = members
         .into_iter()
         .enumerate()
-        .filter(|(_, (open, _, _))| same_folder_set(folders, open))
+        .filter(|(_, (open, _, local))| *local && same_folder_set(folders, open))
         .map(|(position, (_, live, _))| (position, live))
         .collect();
     matching
@@ -471,6 +471,7 @@ async fn new_workspace_leader(
                     multi_workspace.cod_show_member_awaiting(target, window, cx)
                 })?
                 .await?;
+            ensure_loaded(id, cx)?;
         }
         return Ok(json!({ "id": i64::from(id), "already_open": true }));
     }
@@ -534,7 +535,21 @@ async fn focus_workspace(reference: &str, cx: &mut AsyncApp) -> Result<Value> {
             multi_workspace.cod_show_member_awaiting(target, window, cx)
         })?
         .await?;
+    ensure_loaded(id, cx)?;
     Ok(json!({ "id": i64::from(id) }))
+}
+
+/// Fails unless the workspace `id` is still open and loaded after `cod_show_member_awaiting` waited for it (RC delta review). The loader only logs a tab that was closed, or stayed pending, while it loaded, so a command that showed it would otherwise report success for a tab the user does not have.
+fn ensure_loaded(id: WorkspaceId, cx: &mut AsyncApp) -> Result<()> {
+    let loaded = cx.update(|cx| {
+        members(cx)
+            .iter()
+            .any(|member| member.id == Some(id) && member.live.is_some())
+    });
+    if !loaded {
+        bail!("workspace {} was closed or did not finish loading", i64::from(id));
+    }
+    Ok(())
 }
 
 async fn add_folders(reference: &str, folders: Vec<PathBuf>, cx: &mut AsyncApp) -> Result<Value> {
