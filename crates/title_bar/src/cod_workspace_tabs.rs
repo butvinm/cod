@@ -42,6 +42,11 @@ pub struct CodTabInfo {
     /// it got. A tab is cut both at the maximum width and when the title bar is too narrow for
     /// all tabs at their full width.
     pub cut: bool,
+    /// Where the tab's close button was drawn (issue #77 F3), None when the tab has none (a
+    /// pending, not yet loaded, member). Its space is always reserved on a loaded tab, so this is
+    /// set regardless of hover or active state; whether it is currently visible to a person is a
+    /// paint-time style (`visible_on_hover`), not reported here.
+    pub close_bounds: Option<Bounds<Pixels>>,
 }
 
 impl CodTabInfo {
@@ -165,12 +170,13 @@ pub fn render_cod_workspace_tabs(
     let multi_workspace = multi_workspace.read(cx);
     let active = multi_workspace.workspace().clone();
     let members = multi_workspace.cod_shown_members(cx);
+    // #77 F2: the same ghost tokens Zed's own title bar buttons use (a toggled IconButton), so
+    // every theme stays coherent: ghost_element_selected for the active tab, ghost_element_hover
+    // on hover, no background (the title bar shows through) otherwise, and no separate border
+    // color on any tab (the previous `border` token was unrelated to either the fill or the bar,
+    // and read as a third, incoherent grey against them).
     let colors = cx.theme().colors();
-    let (active_text, active_bg, border) = (
-        colors.text,
-        colors.tab_active_background,
-        colors.border,
-    );
+    let (active_text, active_bg) = (colors.text, colors.ghost_element_selected);
     let (inactive_text, hover_bg) = (colors.text_muted, colors.ghost_element_hover);
 
     let mut infos = Vec::with_capacity(members.len());
@@ -189,6 +195,7 @@ pub fn render_cod_workspace_tabs(
             tooltip: name.clone(),
             bounds: None,
             cut: false,
+            close_bounds: None,
         });
 
         let (id, rest) = split_workspace_name(&name);
@@ -198,8 +205,13 @@ pub fn render_cod_workspace_tabs(
         // against the room it got, to report whether the name was cut.
         let rest_text: SharedString = rest.to_string().into();
         let measured_layout = layout.clone();
+        // #77 F1: no `min_w_0` here. Only the label div below needs it (to let its own text
+        // shrink and ellipsize); giving it to every ancestor too told the layout this whole
+        // group could shrink arbitrarily, and it measured its natural (max-content) width as
+        // far smaller than "New workspace" actually needs, even with the title bar mostly
+        // empty. `tab` below keeps its own `min_w_0` (with `max_w`): that is the level meant to
+        // shrink, only once the row truly runs out of room.
         let content = h_flex()
-            .min_w_0()
             .gap_1()
             .children(status_dot(status, index, &layout))
             .when_some(id, |content, id| {
@@ -242,27 +254,62 @@ pub fn render_cod_workspace_tabs(
                     tab.cut = is_cut(text_width, room.size.width);
                 }
             });
+        // #77 F3: a close control, after the name, visible on the active tab and on hover; its
+        // space is always reserved (`invisible()`/`visible_on_hover`, never added or removed) so
+        // the tab's own width never jumps when the mouse moves over it. A pending (not yet
+        // loaded) member has no live `Workspace` to close this way, so it gets none: a pending
+        // tab is slightly narrower than a loaded one until it loads.
+        let close_button = match &member {
+            CodMember::Live(workspace) => {
+                let workspace = workspace.clone();
+                let weak = weak.clone();
+                Some(
+                    IconButton::new(("cod-workspace-tab-close", index), IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .tooltip(Tooltip::text("Close Workspace"))
+                        .when(!is_active, |button| button.visible_on_hover(""))
+                        .on_click(move |_, window, cx| {
+                            weak.update(cx, |multi_workspace, cx| {
+                                multi_workspace.cod_close_live_workspace(workspace.clone(), window, cx)
+                            })
+                            .ok();
+                        }),
+                )
+            }
+            CodMember::Pending(_) => None,
+        };
+        let has_close = close_button.is_some();
+        let close_layout = layout.clone();
         let tab = h_flex()
             .id(("cod-workspace-tab", index))
+            .group("")
             .h_full()
             .min_w_0()
             .max_w(px(COD_TAB_MAX_WIDTH))
             .px_2()
-            .border_x_1()
+            .gap_1()
             .text_color(text_color)
-            .when(is_active, |tab| tab.bg(active_bg).border_color(border))
-            .when(!is_active, |tab| {
-                tab.border_color(gpui::transparent_black())
-                    .hover(move |style| style.bg(hover_bg))
-            })
+            .when(is_active, |tab| tab.bg(active_bg))
+            .when(!is_active, |tab| tab.hover(move |style| style.bg(hover_bg)))
             .cursor_pointer()
             .child(content)
+            .children(close_button)
+            .when(has_close, |tab| {
+                tab.on_children_prepainted(move |bounds, _window, _cx| {
+                    if let Some(tab_info) = close_layout.borrow_mut().tabs.get_mut(index) {
+                        tab_info.close_bounds = bounds.last().copied();
+                    }
+                })
+            })
             .tooltip(Tooltip::text(name.clone()))
             // A click shows the workspace, as a click on a Zed tab does: the press and then the
             // release over the same workspace's tab (#25 AC5). The press is kept by the window's
             // `MultiWorkspace`, not by this element: each workspace draws its own title bar, so
             // when a pending workspace finishes loading and is shown between the press and the
             // release, the release lands on the new title bar's tab for the same workspace.
+            // The close button above stops its own mouse down/up from reaching here (ButtonLike
+            // already does, for every button in this codebase), so clicking it never also
+            // selects the tab.
             .on_mouse_down(MouseButton::Left, {
                 let weak = weak.clone();
                 let member = member.clone();
@@ -300,10 +347,12 @@ pub fn render_cod_workspace_tabs(
         weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
             .ok();
     };
+    // #77 F1: no `min_w_0`/`overflow_x_hidden` here (see the comment on `content` above): each
+    // tab already shrinks on its own (its own `min_w_0` and `max_w`), and the title bar's own
+    // outer row already clips (`platform_title_bar.rs`'s `overflow_x_hidden`); this row only
+    // needs to report its true natural width when there is room for it.
     h_flex()
         .h_full()
-        .min_w_0()
-        .overflow_x_hidden()
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
         .on_children_prepainted(move |bounds, _window, _cx| {

@@ -310,9 +310,12 @@ impl Render for TitleBar {
 
         let cod_tabs = self.render_cod_tabs(cx);
         children.push(
+            // #77 F1: no `min_w_0` here either (see cod_workspace_tabs.rs): this group (the
+            // tabs, or Zed's own project/branch items on a non-Cod build) should report its
+            // true natural width to the title bar's three-group row, and only the tabs
+            // themselves shrink once the bar runs out of room for them.
             h_flex()
                 .h_full()
-                .min_w_0()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = COD_SHOW_ZED_ITEMS
