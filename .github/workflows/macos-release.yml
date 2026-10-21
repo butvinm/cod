@@ -452,6 +452,37 @@ jobs:
           cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
             || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
 
+          # Round 2 diagnosis Q2: CEF's own log (crates/cod_browser/src/engine.rs sets
+          # Settings::log_file to <cache>/cef.log the same way on every platform, cache being
+          # data_dir.join("cef"), i.e. $data/cef/cef.log here) was never collected before, so any
+          # CEF-side CHECK/DCHECK or renderer-launch failure never reached the uploaded artifacts.
+          cp "$data/cef/cef.log" smoke-artifacts/cef.log 2>/dev/null \
+            || echo "no cef.log was written" > smoke-artifacts/cef.log
+
+          # Round 2 diagnosis Q2: a crash report for cod-browser or its "Cod Helper" subprocess
+          # bundle, created after this run's launch, with its full content (unlike the zed/cod/
+          # codctl check above, kept name-only): this is a background helper this smoke test
+          # itself starts well after launch_epoch, through codctl open above, so its own crash
+          # reports need their own check, after that point, not the earlier one.
+          echo "== crash reports for cod-browser or Cod Helper since launch =="
+          if [ -d ~/Library/Logs/DiagnosticReports ]; then
+            found=0
+            while IFS= read -r -d '' report; do
+              mtime=$(stat -f %m "$report" 2>/dev/null || echo 0)
+              if [ "$mtime" -ge "$launch_epoch" ]; then
+                found=1
+                echo "::error::a crash report for cod-browser or Cod Helper appeared: $report"
+                cp "$report" "smoke-artifacts/$(basename "$report")"
+                cat "$report"
+                status=1
+              fi
+            done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
+              \( -iname 'cod-browser-*' -o -iname 'Cod Helper-*' \) -print0 2>/dev/null)
+            [ "$found" = 1 ] || echo "none"
+          else
+            echo "none (no DiagnosticReports directory)"
+          fi
+
           # AC-R1: Zed.log must be under $data, not under stock Zed's ~/Library/Logs/Zed
           # (already checked above); a missing Zed.log here is itself a failure, not silently
           # ignored, since it would mean the smoke test cannot tell whether Cod ever wrote one.
