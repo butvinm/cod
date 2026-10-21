@@ -269,7 +269,10 @@ wrap_display_handler! {
             // Diagnostics are best effort: a page that logs in a loop must not grow the queue or crowd out frames.
             let Some(message) = message else { return 0 };
             if PENDING_CONSOLE.fetch_add(1, Ordering::AcqRel) < MAX_PENDING_CONSOLE {
-                let message = limited(&message.to_string(), MAX_CONSOLE_BYTES);
+                // A bridge call (RC review B5) keeps a far larger limit than ordinary console
+                // output, and one that still does not fit becomes a clear sentinel instead of
+                // truncated, invalid JSON that `codctl open --html --wait` would never answer.
+                let message = protocol::console_payload(&message.to_string(), MAX_CONSOLE_BYTES);
                 state.send(FromBrowser::Console { page: state.id, message });
             } else {
                 PENDING_CONSOLE.fetch_sub(1, Ordering::AcqRel);

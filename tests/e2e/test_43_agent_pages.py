@@ -31,6 +31,7 @@ from page_server import PageServer
 COMMAND_TIMEOUT = 30.0
 SHOW_TIMEOUT = 15.0
 LOAD_TIMEOUT = 30.0
+RESTORE_TIMEOUT = 45.0
 SETTLE_TIME = 2.0
 
 AGENT_ID = "claude-acp"
@@ -89,6 +90,23 @@ def large_ask_html() -> str:
         '<body style="margin:0;position:relative;display:flow-root">'
         '<h1 id="heading">Ask (large page)</h1>'
         f'<input id="answer" type="text" autofocus value="half-even" style="{box.format(left=0, top=0)}">'
+        f'<button data-cod="submit" data-cod-value-from="#answer" '
+        f'style="{box.format(left=230, top=0)}">Send</button>'
+        "</body></html>"
+    )
+
+
+def long_value_ask_html(length: int) -> str:
+    """RC review B5: a field prefilled with `length` ASCII characters, so a real mouse click on
+    Send submits a value this long through the bridge's console-line transport.
+    """
+    box = "position:absolute;left:{left}px;top:{top}px;width:220px;height:30px;"
+    value = "v" * length
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
+        '<body style="margin:0;position:relative;display:flow-root">'
+        '<h1 id="heading">Ask (long value)</h1>'
+        f'<input id="answer" type="text" value="{value}" style="{box.format(left=0, top=0)}">'
         f'<button data-cod="submit" data-cod-value-from="#answer" '
         f'style="{box.format(left=230, top=0)}">Send</button>'
         "</body></html>"
@@ -254,9 +272,9 @@ class AgentPagesTest(CodTestCase):
         if stderr is not None:
             self.expect_equal(f"stderr of {result.args[1:]}", stderr, result.stderr)
 
-    def start_on_billing_api(self) -> Path:
+    def start_on_billing_api(self, persistent: bool = False) -> Path:
         repo = self.make_repo("billing-api", BILLING_API)
-        self.start_cod(repo)
+        self.start_cod(repo, persistent=persistent)
         self.wait_for(
             lambda state: [os.path.realpath(path) for path in state["worktrees"]] == [os.path.realpath(repo)],
             SHOW_TIMEOUT,
@@ -690,6 +708,120 @@ class AgentPagesTest(CodTestCase):
             self.expect_equal("codctl open --html --wait exit code (large page)", 0, process.returncode)
             self.expect_equal("codctl open --html --wait stdout (large page)", "half-even\n", stdout)
             self.expect_equal("codctl open --html --wait stderr (large page)", "", stderr)
+
+    # RC review B5 (data loss): a bridge submission well over the old 4096-byte diagnostic cap
+    # must still answer --wait with the whole value, not lose it to silent truncation.
+
+    def test_b5_a_submit_well_over_4kib_still_answers_wait_with_the_full_value(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open --html --wait on a page whose field holds 20000 characters, and submit by a real click"):
+            length = 20_000
+            html_path = self.write_html("long-value.html", long_value_ask_html(length))
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                page_id = None
+                deadline = time.monotonic() + LOAD_TIMEOUT
+                while page_id is None:
+                    state = self.state()
+                    candidates = [page["id"] for page in pages(state) if page.get("state") == "loaded"]
+                    if candidates:
+                        page_id = candidates[-1]
+                    elif time.monotonic() > deadline:
+                        raise AssertionError("codctl open --html --wait never showed a loaded page")
+                    else:
+                        time.sleep(0.1)
+
+                # The Send button sits at left 230, top 0 (long_value_ask_html's own box layout).
+                self.click_in_page(page_id, 240, 10)
+                stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+            self.expect_equal("codctl open --html --wait exit code (long value)", 0, process.returncode)
+            self.expect_equal(
+                "codctl open --html --wait stdout (long value)", "v" * length + "\n", stdout
+            )
+            self.expect_equal("codctl open --html --wait stderr (long value)", "", stderr)
+
+    # RC review B5 (data loss, defensive): a bridge submission beyond even the new, much larger
+    # cap must still give codctl a clear, bounded outcome instead of leaving --wait blocked
+    # forever on a value it will never receive.
+
+    def test_b5_a_submit_beyond_the_bridge_cap_closes_instead_of_hanging_forever(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open --html --wait on a page whose field holds 200000 characters, and submit by a real click"):
+            html_path = self.write_html("oversized-value.html", long_value_ask_html(200_000))
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", cwd=repo)
+            try:
+                page_id = None
+                deadline = time.monotonic() + LOAD_TIMEOUT
+                while page_id is None:
+                    state = self.state()
+                    candidates = [page["id"] for page in pages(state) if page.get("state") == "loaded"]
+                    if candidates:
+                        page_id = candidates[-1]
+                    elif time.monotonic() > deadline:
+                        raise AssertionError("codctl open --html --wait never showed a loaded page")
+                    else:
+                        time.sleep(0.1)
+
+                self.click_in_page(page_id, 240, 10)
+                stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+            self.expect_equal(
+                "codctl open --html --wait exit code (value beyond the bridge cap, closed instead of hanging)",
+                2,
+                process.returncode,
+            )
+            self.expect_equal(
+                "codctl open --html --wait stdout (value beyond the bridge cap)", "", stdout
+            )
+
+    # RC review B3 (data loss): an agent page whose document is over about 6 KiB must restore
+    # intact after a restart, not corrupted by the engine's address-diagnostic truncation.
+
+    def test_b3_a_large_agent_page_restores_intact_after_a_restart(self) -> None:
+        with self.step("start Cod with a saved session and open a page over 10 KiB"):
+            repo = self.start_on_billing_api(persistent=True)
+            html_path = self.write_html("large-restart.html", large_ask_html())
+            result = self.codctl("open", "--html", str(html_path), cwd=repo)
+            self.expect_result(result, 0, stderr="")
+            page_id = result.stdout.strip()
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("state") == "loaded",
+                LOAD_TIMEOUT,
+                "the large agent page to load",
+            )
+
+        with self.step("restart Cod"):
+            self.restart_cod()
+
+        with self.step("the restored page loads again, intact, and its bridge still works"):
+            state = self.wait_for(
+                lambda state: len(pages(state)) == 1 and pages(state)[0].get("state") == "loaded",
+                RESTORE_TIMEOUT,
+                "the large agent page to come back and load",
+            )
+            restored_id = pages(state)[0]["id"]
+            # The Send button sits at left 230, top 0 (large_ask_html's own box layout); if the
+            # restored document were truncated mid-markup, this button would not be there to
+            # click, and the page would never close.
+            self.click_in_page(restored_id, 240, 10)
+            self.wait_for(
+                lambda state: page_by_id(state, restored_id) is None,
+                SHOW_TIMEOUT,
+                "the restored page to close once its intact bridge submits",
+            )
 
     # RC review B1 (security): a `<head>` tag hidden inside an HTML comment must not capture
     # Cod's CSP and bootstrap injection point.

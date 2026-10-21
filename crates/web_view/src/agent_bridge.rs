@@ -13,12 +13,14 @@
 use gpui::{App, Global};
 use serde_json::Value;
 
+use crate::browser_client::protocol;
 use crate::pages::PageId;
 
 /// Every line the page's bootstrap script prints on Cod's behalf starts with this, so Cod can
 /// tell a bridge call from the page's own console output. No real page is expected to start a log
-/// line this way.
-pub const BRIDGE_PREFIX: &str = "cod:bridge:";
+/// line this way. Defined once, in `protocol.rs` (RC review B5), so the engine process (which has
+/// no notion of `agent_bridge` at all) can give a bridge call its own, larger byte limit.
+pub const BRIDGE_PREFIX: &str = protocol::BRIDGE_PREFIX;
 
 /// Every action an agent page may ask for; anything else is refused and logged (#43 AC3, AC4).
 pub const ALLOWED_ACTIONS: &[&str] = &["submit", "open-file", "focus-session"];

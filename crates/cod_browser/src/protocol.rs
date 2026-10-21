@@ -10,6 +10,25 @@ use std::io::{self, Read, Write};
 /// against the same truncation to recognize its own agent document after a long page loads.
 pub const MAX_URL_BYTES: usize = 8192;
 
+/// Every line an agent page's bootstrap script prints on Cod's behalf starts with this (RC
+/// review B5), so the engine can tell a bridge call apart from the page's own console output and
+/// give it a larger byte limit than ordinary diagnostics. Shared with `web_view::agent_bridge`,
+/// which defines the rest of the bridge wire format (the JSON payload after this prefix). No real
+/// page is expected to start a log line this way.
+pub const BRIDGE_PREFIX: &str = "cod:bridge:";
+
+/// The name of the sentinel bridge call the engine sends in place of a bridge console line it
+/// cannot carry whole (RC review B5): `args` is always empty. Cod's side recognizes this name
+/// specially and closes the page instead of leaving `codctl open --html --wait` blocked forever
+/// on a value it will never receive.
+pub const BRIDGE_OVERSIZED_ACTION: &str = "__bridge_oversized__";
+
+/// The most bytes a bridge call's console line keeps (RC review B5): far more than ordinary
+/// diagnostics need, so a real agent-page submission is never silently cut into invalid JSON and
+/// lost, while still comfortably inside the protocol's own 1 MiB message budget alongside the
+/// `Console` message's own tag, page id and length-prefix overhead.
+pub const MAX_BRIDGE_BYTES: usize = 65536;
+
 /// Cuts `text` to at most `limit` bytes on a character boundary, so no message can exceed what
 /// the receiving side accepts. Shared by the engine (outgoing diagnostics) and Cod's side (RC
 /// review #1), so both agree on exactly where a long address gets cut.
@@ -22,6 +41,22 @@ pub fn limited(text: &str, limit: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+
+/// What the engine's `on_console_message` should put on the wire for one console line (RC
+/// review B5): ordinary diagnostics are cut to `console_limit` as before, but a bridge call
+/// (`BRIDGE_PREFIX`) that still fits under `MAX_BRIDGE_BYTES` goes out whole, and one that does
+/// not becomes the sentinel `BRIDGE_OVERSIZED_ACTION` call instead of silently truncated, invalid
+/// JSON. A real browser engine is not required to exercise this from Rust, so it is a plain
+/// function of its inputs and unit-tested directly.
+pub fn console_payload(text: &str, console_limit: usize) -> String {
+    if !text.starts_with(BRIDGE_PREFIX) {
+        return limited(text, console_limit);
+    }
+    if text.len() <= MAX_BRIDGE_BYTES {
+        return text.to_owned();
+    }
+    format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}")
 }
 
 pub const KEY_RAW_DOWN: u8 = 0;
@@ -785,5 +820,36 @@ mod tests {
         write_frame(&mut bytes, 1, 2, 2, &[0; 16]).unwrap();
         bytes[0] = bytes[0].wrapping_add(1);
         assert!(FromBrowser::read_from(&mut bytes.as_slice()).is_err());
+    }
+
+    // RC review B5: a bridge call well over the old 4096-byte diagnostic cap must still cross
+    // the wire whole, not truncated into invalid JSON that `codctl open --html --wait` never
+    // answers for.
+
+    #[test]
+    fn a_bridge_call_over_the_old_console_cap_still_crosses_whole() {
+        let value = "x".repeat(20_000);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}}}}");
+        assert!(line.len() > 4096, "the fixture must exceed the old cap");
+        assert!(line.len() <= MAX_BRIDGE_BYTES, "the fixture must fit the new one");
+        assert_eq!(console_payload(&line, 4096), line);
+    }
+
+    #[test]
+    fn ordinary_console_output_still_gets_the_small_cap() {
+        let line = "x".repeat(20_000);
+        assert!(!line.starts_with(BRIDGE_PREFIX));
+        let payload = console_payload(&line, 4096);
+        assert_eq!(payload.len(), 4096);
+    }
+
+    #[test]
+    fn a_bridge_call_over_the_new_cap_becomes_the_oversized_sentinel_instead_of_garbled_json() {
+        let value = "x".repeat(200_000);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}}}}");
+        assert!(line.len() > MAX_BRIDGE_BYTES);
+        let payload = console_payload(&line, 4096);
+        let expected = format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}");
+        assert_eq!(payload, expected);
     }
 }
