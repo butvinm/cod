@@ -143,6 +143,41 @@ def hex_color(rgb: tuple[int, int, int]) -> str:
     return "#{:02x}{:02x}{:02x}".format(*rgb)
 
 
+def bounds_pixel(width: int, height: int, pixels: bytes, scale: float, bounds: dict[str, Any], dx: float = 0.5, dy: float = 0.5) -> tuple[int, int, int]:
+    """The pixel at a fraction (dx, dy) of `bounds` (a driver bounds dict in logical pixels), at the screenshot's `scale`. (0.5, 0.5) is the center."""
+    x = round((bounds["x"] + bounds["width"] * dx) * scale)
+    y = round((bounds["y"] + bounds["height"] * dy) * scale)
+    return ppm_pixel(width, height, pixels, x, y)
+
+
+def ink_vertical_center(width: int, height: int, pixels: bytes, scale: float, bounds: dict[str, Any]) -> float:
+    """The vertical center, in logical pixels, of the ink (any pixel that differs from the box's own most common color) inside `bounds`.
+
+    Used to check that a tab's drawn content (its label and dot) sits in the middle of the tab's
+    own box (issue #77 AC(d)), without needing new bounds of the label or the dot: the background
+    occupies most of the box, so its most common color is read as the background and any
+    different pixel counts as ink.
+    """
+    left = max(0, round(bounds["x"] * scale))
+    right = min(width, round((bounds["x"] + bounds["width"]) * scale))
+    top = max(0, round(bounds["y"] * scale))
+    bottom = min(height, round((bounds["y"] + bounds["height"]) * scale))
+    if left >= right or top >= bottom:
+        raise AssertionError(f"bounds {bounds!r} at scale {scale} are empty in a {width}x{height} screenshot")
+    counts: dict[tuple[int, int, int], int] = {}
+    sampled: list[tuple[int, int, tuple[int, int, int]]] = []
+    for y in range(top, bottom):
+        for x in range(left, right, 2):
+            color = ppm_pixel(width, height, pixels, x, y)
+            counts[color] = counts.get(color, 0) + 1
+            sampled.append((x, y, color))
+    background = max(counts, key=lambda color: counts[color])
+    ink_rows = sorted({y for x, y, color in sampled if color_distance(color, background) > 20})
+    if not ink_rows:
+        raise AssertionError(f"no ink found in bounds {bounds!r} (background {hex_color(background)})")
+    return (ink_rows[0] + ink_rows[-1]) / 2 / scale
+
+
 def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
     """Euclidean distance between two (r, g, b) colors, for a tolerance check against a theme token."""
     return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5

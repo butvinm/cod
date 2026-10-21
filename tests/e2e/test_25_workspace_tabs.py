@@ -19,7 +19,13 @@ from cod_status_fixtures import (
     TAB_MAX_WIDTH,
     CodStatusFixtures,
     active_tabs,
+    bounds_pixel,
+    color_distance,
     drawn,
+    hex_color,
+    ink_vertical_center,
+    read_ppm,
+    screenshot_ppm,
     tab_dots,
     tab_names,
     title_bar,
@@ -37,6 +43,28 @@ NAMES = [PAY_NAME, DOC_NAME, OPS_NAME]
 
 # The name of a tab whose workspace has no name and no folder.
 UNNAMED = "New workspace"
+
+# Issue #77 (follow-up of #25): the stakeholder's first-use screenshot was 1280x800, the default
+# dark theme (One Dark), sway scale 1. Run the width-sensitive tests below with
+# COD_E2E_OUTPUT_MODE=1280x800 (script/e2e sets sway's output to that size only for this run); at
+# script/e2e's own default (1440x900) the title bar has even more free room, so the bug (tabs cut
+# far under their own max width while the bar sits mostly empty) reproduces there too, but 1280 is
+# the exact width the report measured.
+FIRST_USE_OUTPUT_SCALE = 1.0
+
+# One Dark's own tokens (crates/theme/src/default_colors.rs: the "Sand" neutral scale of
+# crates/theme/src/default_colors.rs:777; crates/theme/src/assets lists no per-theme override for
+# these, so the computed defaults apply): title_bar_background = neutral().dark().step_2(),
+# opaque. The fix this reproduction proposes uses the same ghost tokens Zed's own title bar
+# buttons use (a toggled IconButton: ghost_element_selected when active, ghost_element_hover on
+# hover, no separate border), composited over title_bar_background:
+#   ghost_element_hover    = neutral().dark_alpha().step_4() ("#fefef31b") over #191918 ~= #31312f
+#   ghost_element_selected = neutral().dark_alpha().step_5() ("#fbfbeb23") over #191918 ~= #383835
+DARK_TITLE_BAR_BG = (0x19, 0x19, 0x18)
+DARK_GHOST_HOVER = (0x31, 0x31, 0x2F)
+DARK_GHOST_SELECTED = (0x38, 0x38, 0x35)
+# Generous: real compositing (pixman software rendering, PPM round-tripping) is not bit-exact.
+COLOR_TOLERANCE = 12.0
 
 # How long a workspace command or a click may take to show.
 SHOW_TIMEOUT = 15.0
@@ -360,6 +388,171 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step("previous workspace from the first tab wraps to the last"):
             self.run_command(PREVIOUS_WORKSPACE)
             self.wait_for_tabs("previous", {"active": one_hot(3, 2), "active_workspace": 2, "modal": None})
+
+    # Issue #77 AC(a): two default workspaces, neither tab cut, both full names drawn.
+
+    def test_ac7_two_default_workspaces_are_not_cut(self) -> None:
+        """The stakeholder's screenshot (1280x800): two "New workspace" tabs both read "New work..."
+        although about 1000 px of the 1280 px title bar was empty. Run with
+        COD_E2E_OUTPUT_MODE=1280x800 for the exact reported width."""
+        with self.step("start Cod with a fresh profile (no folder): one default workspace"):
+            self.start_cod(None)
+            state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+
+        with self.step("open a second workspace with +: two default-named tabs"):
+            self.click_add_button(state)
+            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True]})
+
+        with self.step('check neither tab is cut: both read "New workspace" in full'):
+            tabs = title_bar(state)["tabs"]
+            for index, tab in enumerate(tabs):
+                self.expect_equal(f"tab {index} truncated", False, tab["truncated"])
+
+    # Issue #77 AC(b): a long name ellipsizes only as needed and stays distinguishable.
+
+    def test_ac7_long_names_use_their_full_max_width_and_stay_distinguishable(self) -> None:
+        """Two long names without an "[ID]" prefix, differing only near the end (the part ellipsis
+        would cut first): if #77's layout bug squeezes both tabs far under their own 280 px max
+        width, they lose that distinguishing tail and look identical. 1280 px comfortably fits two
+        280 px tabs (560 px), so both should reach the max width, not something much smaller."""
+        long_a = "Fix invoice rounding for every annual plan in the EU region"
+        long_b = "Fix invoice rounding for every annual plan in the US region"
+
+        with self.step("start Cod, name the first workspace, add a second with another long name"):
+            self.start_cod(None)
+            self.rename_workspace(long_a)
+            self.new_workspace()
+            self.rename_workspace(long_b)
+            state = self.wait_for_tabs("two long-named tabs", {"names": [long_a, long_b], "active": [False, True]})
+
+        with self.step("check the tooltips carry the full names"):
+            tabs = title_bar(state)["tabs"]
+            self.expect_equal("tooltips", [long_a, long_b], [tab["tooltip"] for tab in tabs])
+
+        with self.step(f"check neither tab is squeezed under its own {TAB_MAX_WIDTH} px max width"):
+            for index, tab in enumerate(tabs):
+                width = tab["bounds"]["width"]
+                if width < TAB_MAX_WIDTH - 1:
+                    raise AssertionError(
+                        f"expected tab {index} at its max width {TAB_MAX_WIDTH} px (two long tabs fit the "
+                        f"title bar), actual {width} px; a narrower tab has less of its name showing and "
+                        "both tabs can look the same"
+                    )
+
+    # Issue #77 AC(c): tab colors match chosen ghost tokens, with no extra border color.
+
+    def test_ac7_tab_colors_match_the_ghost_tokens_with_no_extra_border(self) -> None:
+        """One Dark, sway scale 1: an inactive tab should look like the title bar itself
+        (ghost_element_background is transparent), a hovered tab ghost_element_hover, the active
+        tab ghost_element_selected, and no tab should carry a border in a different, colder grey."""
+        with self.step("start Cod: one default workspace, add a second (first stays inactive)"):
+            self.start_cod(None)
+            state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            self.click_add_button(state)
+            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True]})
+
+        shot = self.workdir / "colors.ppm"
+        with self.step("screenshot the inactive and the active tab"):
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            tabs = title_bar(state)["tabs"]
+            inactive_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["bounds"])
+            active_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"])
+            # Just inside the left edge, where border_x_1 draws a border if the tab has one.
+            active_edge = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"], dx=0.02)
+
+        with self.step("check the inactive tab looks like the title bar itself"):
+            if color_distance(inactive_bg, DARK_TITLE_BAR_BG) > COLOR_TOLERANCE:
+                raise AssertionError(
+                    f"expected the inactive tab close to the title bar {hex_color(DARK_TITLE_BAR_BG)}, "
+                    f"actual {hex_color(inactive_bg)}"
+                )
+
+        with self.step("check the active tab uses ghost_element_selected"):
+            if color_distance(active_bg, DARK_GHOST_SELECTED) > COLOR_TOLERANCE:
+                raise AssertionError(
+                    f"expected the active tab close to ghost_element_selected {hex_color(DARK_GHOST_SELECTED)}, "
+                    f"actual {hex_color(active_bg)}"
+                )
+
+        with self.step("check the active tab has no separate border color"):
+            if color_distance(active_edge, active_bg) > COLOR_TOLERANCE:
+                raise AssertionError(
+                    f"expected the active tab's edge the same color as its own fill {hex_color(active_bg)}, "
+                    f"actual {hex_color(active_edge)} (a border in a different grey)"
+                )
+
+        with self.step("hover the inactive tab and check it now uses ghost_element_hover"):
+            self.hover_tab(state, 0)
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            hover_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["bounds"])
+            if color_distance(hover_bg, DARK_GHOST_HOVER) > COLOR_TOLERANCE:
+                raise AssertionError(
+                    f"expected the hovered tab close to ghost_element_hover {hex_color(DARK_GHOST_HOVER)}, "
+                    f"actual {hex_color(hover_bg)}"
+                )
+
+    # Issue #77 AC(d): tab content (label and dot) is vertically centered within 1 px.
+
+    def test_ac7_tab_content_is_vertically_centered(self) -> None:
+        with self.step("start Cod and give the first (only) workspace a visible dot"):
+            self.start_cod(None)
+            state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            self.set_entry(0, "s1", "working", title="Codex: review migration")
+            state = self.wait_for_tabs("the dot", {"dots": ["blue"]})
+
+        shot = self.workdir / "align.ppm"
+        with self.step("check the drawn content (dot and label) sits within 1 px of the tab's own vertical center"):
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            bounds = title_bar(state)["tabs"][0]["bounds"]
+            ink_center = ink_vertical_center(width, height, pixels, FIRST_USE_OUTPUT_SCALE, bounds)
+            tab_center = bounds["y"] + bounds["height"] / 2
+            if abs(ink_center - tab_center) > 1.0:
+                raise AssertionError(
+                    f"expected the tab's content centered within 1 px of {tab_center:.1f}, actual ink center {ink_center:.1f}"
+                )
+
+    # Issue #77 AC(e): a hovered or active tab shows a close control that closes that workspace.
+
+    def test_ac7_hovered_tab_has_a_close_control_that_closes_it(self) -> None:
+        """No close control exists on a tab today (#77): clicking near where one would sit (the
+        tab's right edge) only re-selects the tab, so the workspace count never drops and this
+        times out."""
+        with self.step("start Cod: one default workspace, add a second"):
+            self.start_cod(None)
+            state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            self.click_add_button(state)
+            state = self.wait_for_tabs(
+                "the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True], "workspace_count": 2}
+            )
+
+        with self.step("hover the inactive tab and click where its close control should be, its right edge"):
+            tabs = title_bar(state)["tabs"]
+            bounds = tabs[0]["bounds"]
+            self.hover_tab(state, 0)
+            self.click_at(bounds["x"] + bounds["width"] - 10, bounds["y"] + bounds["height"] / 2)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 1, SHOW_TIMEOUT, "the hovered workspace to close, leaving one"
+            )
+
+        with self.step("the remaining workspace is the one that was active, not the one closed"):
+            self.expect_equal("remaining tab active", True, title_bar(state)["tabs"][0]["active"])
+
+
+class FirstUseWelcomeTest(CodTestCase):
+    """Issue #77 AC(f): a fresh profile's first workspace shows Cod's own welcome text, never "Zed"."""
+
+    def test_ac7_fresh_profile_shows_cod_welcome_text_not_zed(self) -> None:
+        with self.step("start Cod with a fresh profile and no folder"):
+            self.start_cod(None)
+            state = self.wait_for(lambda state: state["welcome"] is not None, SHOW_TIMEOUT, "the welcome page")
+
+        with self.step("check the greeting names Cod, never Zed"):
+            welcome = state["welcome"]
+            if "Zed" in welcome:
+                raise AssertionError(f'expected the welcome greeting to never say "Zed", actual {welcome!r}')
 
 
 if __name__ == "__main__":
