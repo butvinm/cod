@@ -1602,14 +1602,12 @@ impl AgentPanel {
                                 // Cod (#39, RC review C8): every chat the workspace owns is part
                                 // of its inventory, whether or not it ends up resident in
                                 // `retained_threads` right away.
-                                panel
-                                    .update(cx, |panel, _cx| {
-                                        panel
-                                            .cod_workspace_session_ids
-                                            .borrow_mut()
-                                            .insert(session_id.0.to_string());
-                                    })
-                                    .ok();
+                                panel.update(cx, |panel, _cx| {
+                                    panel
+                                        .cod_workspace_session_ids
+                                        .borrow_mut()
+                                        .insert(session_id.0.to_string());
+                                });
                                 if Some(entry.thread_id) == active_thread_id_to_skip {
                                     continue;
                                 }
