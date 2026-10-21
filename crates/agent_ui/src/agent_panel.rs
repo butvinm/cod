@@ -12631,9 +12631,9 @@ mod tests {
         .expect("sending into an evicted session must wait for its reload, not report it unknown");
         cx.run_until_parked();
 
-        connection.end_turn(evicted_session_id.clone(), acp::StopReason::EndTurn);
-        cx.run_until_parked();
-
+        // Queuing a reply through `set_next_prompt_updates` (above) already resolves the turn
+        // with `StopReason::EndTurn` on its own once applied; there is no separate pending turn
+        // here for `connection.end_turn` to end.
         let snapshot = cx.update(|window, cx| {
             crate::cod_sessions::session_snapshot(&workspace, evicted_session_id.0.as_ref(), window, cx)
         });
@@ -12653,6 +12653,7 @@ mod tests {
         // instead of a terminal status left `codctl session wait`/`status` polling forever for
         // a reply that would never arrive.
         use crate::conversation_view::tests::FlakyAgentServer;
+        use crate::thread_metadata_store::ThreadMetadata;
 
         init_test(cx);
         cx.update(|cx| {
@@ -12681,7 +12682,33 @@ mod tests {
         // `FlakyAgentServer` fails to connect unconditionally here (its `fail` flag is left at
         // its default `true`), landing the restored chat in `ServerState::LoadError` with no
         // root thread, the same shape eviction-then-reload-failure leaves behind.
+        //
+        // `open_restored_thread_with_server` maps the session id back to a `ThreadId` through
+        // the metadata store, so (as with a real restored thread) there must already be a row
+        // for it; without one, `ConversationView` never even learns the session id it was asked
+        // to resume, and `root_session_id` would stay `None` instead of the id this test checks.
         let resume_session_id = acp::SessionId::new("flaky-session");
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(
+                    ThreadMetadata {
+                        thread_id: ThreadId::new(),
+                        session_id: Some(resume_session_id.clone()),
+                        agent_id: project::AgentId::new("Flaky"),
+                        title: Some("Flaky chat".into()),
+                        title_override: None,
+                        updated_at: Utc::now(),
+                        created_at: Some(Utc::now()),
+                        interacted_at: None,
+                        worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
+                        remote_connection: None,
+                        archived: false,
+                    },
+                    cx,
+                );
+            });
+        });
+
         let (server, _fail) =
             FlakyAgentServer::new(StubAgentConnection::new().with_supports_load_session(true));
         panel.update_in(cx, |panel, window, cx| {
