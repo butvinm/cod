@@ -7484,12 +7484,19 @@ impl ThreadView {
         let Some((entry_ix, markdown)) = next_index.and_then(|index| markdowns.get(index)) else {
             return;
         };
-        // An earlier reply can be outside the rendered part of the list, where its block is not
-        // drawn and cannot take the keyboard focus (the executed beta found links in older
-        // replies unreachable). `scroll_to_reveal_item` is not enough: while the list follows
-        // its tail, every layout puts the scroll position back at the end. `scroll_to` stops
-        // following and shows the reply from its top.
-        if self.list_state.bounds_for_item(*entry_ix).is_none() {
+        // A reply outside the visible part of the list cannot keep the keyboard focus: the
+        // executed beta found links in older replies unreachable. Laid out is not enough, since
+        // the list also lays out items in its off-screen overdraw, and a focus moved there is
+        // lost by the next frame. While the list follows its tail, every layout also puts the
+        // scroll position back at the end, so tail-following pauses (as when the user scrolls
+        // up) and a reply that does not reach into the viewport is shown from its top.
+        self.list_state.pause_following_tail();
+        let viewport = self.list_state.viewport_bounds();
+        let visible = self
+            .list_state
+            .bounds_for_item(*entry_ix)
+            .is_some_and(|bounds| bounds.intersects(&viewport));
+        if !visible {
             self.list_state.scroll_to(ListOffset {
                 item_ix: *entry_ix,
                 offset_in_item: px(0.),
