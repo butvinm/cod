@@ -189,14 +189,26 @@ pub fn state_dir() -> &'static PathBuf {
     })
 }
 
+/// On macOS, the cache directory used when no custom data directory is set with
+/// `set_custom_data_dir`: `~/Library/Caches/Zed`, Apple's usual place for this kind of data.
+/// With a custom data directory (Cod's launcher always sets one with `--user-data-dir`), the
+/// cache goes under it instead (`<data dir>/cache`, #23), so nothing is written outside that
+/// folder: a stock Zed installed on the same Mac keeps `~/Library/Caches/Zed` to itself.
+fn macos_temp_dir(custom_data_dir: Option<&Path>) -> PathBuf {
+    match custom_data_dir {
+        Some(dir) => dir.join("cache"),
+        None => dirs::cache_dir()
+            .expect("failed to determine cachesDirectory directory")
+            .join(APP_NAME),
+    }
+}
+
 /// Returns the path to the temp directory used by Zed.
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
     TEMP_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            return dirs::cache_dir()
-                .expect("failed to determine cachesDirectory directory")
-                .join(APP_NAME);
+            return macos_temp_dir(CUSTOM_DATA_DIR.get().map(PathBuf::as_path));
         }
 
         if cfg!(target_os = "windows") {
@@ -224,12 +236,22 @@ pub fn hang_traces_dir() -> &'static PathBuf {
     LOGS_DIR.get_or_init(|| data_dir().join("hang_traces"))
 }
 
+/// On macOS, the logs directory used when no custom data directory is set: `~/Library/Logs/Zed`,
+/// Apple's usual place for this kind of data. With a custom data directory, logs go under it
+/// instead (`<data dir>/logs`, #23), for the same reason as `macos_temp_dir` above.
+fn macos_logs_dir(custom_data_dir: Option<&Path>) -> PathBuf {
+    match custom_data_dir {
+        Some(dir) => dir.join("logs"),
+        None => home_dir().join("Library/Logs").join(APP_NAME),
+    }
+}
+
 /// Returns the path to the logs directory.
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
         if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs").join(APP_NAME)
+            macos_logs_dir(CUSTOM_DATA_DIR.get().map(PathBuf::as_path))
         } else {
             data_dir().join("logs")
         }
@@ -620,6 +642,38 @@ fn add_vscode_user_data_paths(paths: &mut Vec<PathBuf>, product_name: &str) {
                 .unwrap_or(home_dir().join(".config"))
                 .join(product_name),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // macos_logs_dir and macos_temp_dir are plain functions of their argument, not of
+    // CUSTOM_DATA_DIR (a OnceLock that, once set by a real run, cannot be reset between tests
+    // in the same process), so they are tested directly here instead of through logs_dir() and
+    // temp_dir(). This mirrors the real macOS code path (#23 AC-R1): with a custom data
+    // directory, Cod's logs and cache stay inside it; without one, a plain Zed install keeps
+    // using ~/Library/Logs/Zed and ~/Library/Caches/Zed, unchanged.
+
+    #[test]
+    fn macos_logs_dir_follows_the_custom_data_dir_when_set() {
+        let custom = Path::new("/tmp/cod-preview-test-data");
+        assert_eq!(macos_logs_dir(Some(custom)), custom.join("logs"));
+    }
+
+    #[test]
+    fn macos_logs_dir_falls_back_to_library_logs_zed_without_a_custom_data_dir() {
+        assert_eq!(
+            macos_logs_dir(None),
+            home_dir().join("Library/Logs").join(APP_NAME)
+        );
+    }
+
+    #[test]
+    fn macos_temp_dir_follows_the_custom_data_dir_when_set() {
+        let custom = Path::new("/tmp/cod-preview-test-data");
+        assert_eq!(macos_temp_dir(Some(custom)), custom.join("cache"));
     }
 }
 
