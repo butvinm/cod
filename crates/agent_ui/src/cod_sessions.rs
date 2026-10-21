@@ -17,12 +17,12 @@ use std::collections::{HashMap, HashSet};
 
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp_v1;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, Window};
 use project::AgentId;
 use workspace::Workspace;
 
-use crate::{Agent, AgentPanel, ThreadId, cod_chat_status::CodChatStatus};
+use crate::{Agent, AgentInitialContent, AgentPanel, ThreadId, cod_chat_status::CodChatStatus};
 
 /// One session of a workspace, as `codctl session list` reports it (#39 AC2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,25 +184,43 @@ pub fn send_message(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    // RC review C8: a session the idle-eviction cache dropped from `retained_threads` is still
-    // owned by the workspace; bring it back before giving up on it as unknown.
-    ensure_resident(workspace, session_id, window, cx);
-    let view = find_chat(workspace, session_id, cx)
-        .with_context(|| format!("unknown session {session_id}"))?;
-    let thread_view = view
-        .read(cx)
-        .root_thread_view()
-        .context("the chat has no message box yet")?;
     let contents: Vec<acp_v1::ContentBlock> =
         vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(text.to_owned()))];
-    thread_view.update(cx, |view, cx| {
-        let is_generating = view.thread.read(cx).status() != ThreadStatus::Idle;
-        if is_generating || !view.message_queue.is_empty() {
-            view.add_to_queue(contents, Vec::new(), window, cx);
-        } else {
-            view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
-        }
+    if let Some(view) = find_chat(workspace, session_id, cx) {
+        let thread_view = view
+            .read(cx)
+            .root_thread_view()
+            .context("the chat has no message box yet")?;
+        thread_view.update(cx, |view, cx| {
+            let is_generating = view.thread.read(cx).status() != ThreadStatus::Idle;
+            if is_generating || !view.message_queue.is_empty() {
+                view.add_to_queue(contents, Vec::new(), window, cx);
+            } else {
+                view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+            }
+        });
+        return Ok(());
+    }
+    // RC review C8 new defect #2: a session the idle-eviction cache dropped from
+    // `retained_threads` is still owned by the workspace, but connecting to its agent and
+    // loading its history both resolve asynchronously, never within this same call; looking the
+    // chat up again right after starting that reload (as this used to) raced it and reported
+    // "unknown session" before it ever had a chance to finish. Handing the reload this text as
+    // its `AgentInitialContent` instead sends it the moment the chat actually becomes ready,
+    // exactly as `ThreadView::send` sends an ordinary message, with no race to lose.
+    let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+        bail!("unknown session {session_id}");
+    };
+    let initial_content = AgentInitialContent::ContentBlock {
+        blocks: contents,
+        auto_submit: true,
+    };
+    let started = panel.update(cx, |panel, cx| {
+        panel.cod_ensure_session_resident_with_content(session_id, Some(initial_content), window, cx)
     });
+    if !started {
+        bail!("unknown session {session_id}");
+    }
     Ok(())
 }
 
@@ -257,15 +275,22 @@ pub fn session_snapshot(
     // The session is owned by the workspace but its chat is not fully resident yet: either
     // `ensure_resident` just started reloading it (connecting to its agent and loading its
     // session history both resolve asynchronously, never within this same call) or it has no
-    // chat entity at all. Report `Working`, not a terminal `Idle`: `codctl session wait` polls
-    // this repeatedly and must keep going instead of taking this one placeholder snapshot as the
-    // final answer; `codctl session status` shows the chat as busy becoming available rather
-    // than falsely idle.
+    // chat entity at all.
     let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
-    panel
-        .read(cx)
-        .cod_owns_session(session_id, cx)
-        .then(|| (CodChatStatus::Working, String::new()))
+    let panel = panel.read(cx);
+    if !panel.cod_owns_session(session_id, cx) {
+        return None;
+    }
+    // RC review new defect #3: a reload that already ended in `LoadError` (no agent executable,
+    // an unsupported agent, and so on) has no root thread coming; reporting it `Working` left
+    // `codctl session wait` polling forever for a status that would never arrive. Report a
+    // terminal `Error` instead, so `wait` stops and exits non-zero, and `status` says so too.
+    if panel.cod_session_load_failed(session_id, cx) {
+        return Some((CodChatStatus::Error, String::new()));
+    }
+    // Still connecting or loading: report `Working`, not a terminal `Idle`, so `wait` keeps
+    // polling and `status` shows the chat as busy becoming available rather than falsely idle.
+    Some((CodChatStatus::Working, String::new()))
 }
 
 /// Whether the workspace has a chat with this session id, for `codctl session status` (#39 AC5,

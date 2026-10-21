@@ -1618,6 +1618,32 @@ impl AgentPanel {
                                     .ok();
                             }
                         }
+                        // RC review C7 continuation: a parked draft's row has no provider
+                        // session id, so the loop above (keyed by `cod_workspace_sessions`)
+                        // never sees it; enumerate it separately by thread id instead.
+                        let draft_ids = store.read_with(cx, |store, cx| {
+                            store.cod_workspace_draft_thread_ids(i64::from(workspace_id), cx)
+                        });
+                        if let Ok(draft_thread_ids) = draft_ids.await {
+                            for thread_id in draft_thread_ids {
+                                if Some(thread_id) == active_thread_id_to_skip {
+                                    continue;
+                                }
+                                let entry = store
+                                    .read_with(cx, |store, _cx| store.entry(thread_id).cloned());
+                                let Some(entry) = entry else {
+                                    continue;
+                                };
+                                if entry.archived || !entry.is_draft() {
+                                    continue;
+                                }
+                                panel
+                                    .update_in(cx, |panel, window, cx| {
+                                        panel.cod_restore_background_draft(entry, window, cx);
+                                    })
+                                    .ok();
+                            }
+                        }
                     }
                     Ok(None) => {
                         log::warn!("failed to restore background chats: metadata store missing");
@@ -4561,6 +4587,23 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cod_restore_background_chat_with_content(entry, None, window, cx);
+    }
+
+    /// `cod_restore_background_chat`, optionally handing the reload the content to send the
+    /// moment it finishes connecting and loading the session's history (RC review new defect
+    /// #2): both resolve asynchronously, never within the same call that starts them, so a
+    /// caller that already has text to send cannot just look the chat up again once this
+    /// returns. Passing the text through as `AgentInitialContent` instead lets the normal
+    /// "new chat with initial content" machinery send it once the chat is actually ready,
+    /// instead of racing that and reporting the session unknown while it is still loading.
+    pub(crate) fn cod_restore_background_chat_with_content(
+        &mut self,
+        entry: crate::thread_metadata_store::ThreadMetadata,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.retained_threads.contains_key(&entry.thread_id) {
             return;
         }
@@ -4572,7 +4615,7 @@ impl AgentPanel {
             Some(entry.thread_id),
             Some(entry.folder_paths().clone()),
             entry.title(),
-            None,
+            initial_content,
             None,
             AgentThreadSource::AgentPanel,
             window,
@@ -4582,6 +4625,45 @@ impl AgentPanel {
         // `insert_retained_thread`'s status subscription, so this chat's later status changes
         // never reached the overview or the workspace dot until unrelated activity on the active
         // chat republished everything.
+        self.insert_retained_thread(entry.thread_id, thread.conversation_view, cx);
+        self.selected_agent = selected_agent;
+    }
+
+    /// Resumes one parked (unsent) draft this workspace held before quitting, the same way
+    /// `cod_restore_background_chat` resumes a sent chat (RC review C7 continuation): restart
+    /// enumeration used to look only at `cod_workspace_sessions`, which excludes a draft's row
+    /// (it has no provider session id yet), so a draft parked in this workspace and never sent
+    /// stayed lost after a restart even though `cod_assign_chat_by_thread_id` had already
+    /// assigned its row to the workspace. Does nothing when the draft is already in memory.
+    pub(crate) fn cod_restore_background_draft(
+        &mut self,
+        entry: crate::thread_metadata_store::ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.retained_threads.contains_key(&entry.thread_id) {
+            return;
+        }
+        let selected_agent = self.selected_agent.clone();
+        let agent: Agent = entry.agent_id.clone().into();
+        let initial_content = crate::draft_prompt_store::read(entry.thread_id, cx).map(|blocks| {
+            AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: false,
+            }
+        });
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(entry.thread_id),
+            Some(entry.folder_paths().clone()),
+            entry.title(),
+            initial_content,
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
         self.insert_retained_thread(entry.thread_id, thread.conversation_view, cx);
         self.selected_agent = selected_agent;
     }
@@ -4610,6 +4692,18 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.cod_ensure_session_resident_with_content(session_id, None, window, cx)
+    }
+
+    /// `cod_ensure_session_resident`, optionally handing the reload content to send once it is
+    /// ready (RC review new defect #2): see `cod_restore_background_chat_with_content`.
+    pub(crate) fn cod_ensure_session_resident_with_content(
+        &mut self,
+        session_id: &str,
+        initial_content: Option<AgentInitialContent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !self.cod_owns_session(session_id, cx) {
             return false;
         }
@@ -4623,17 +4717,47 @@ impl AgentPanel {
         else {
             return false;
         };
-        self.cod_restore_background_chat(entry, window, cx);
+        self.cod_restore_background_chat_with_content(entry, initial_content, window, cx);
         true
+    }
+
+    /// Whether this workspace's chat with this session id ended its reload in `LoadError` (RC
+    /// review new defect #3): `codctl session wait`/`status` check this so a session whose
+    /// reload failed (its agent could not be reached, or it has no root thread to load) reports
+    /// a terminal error status instead of an unbounded "working" that never resolves.
+    pub(crate) fn cod_session_load_failed(&self, session_id: &str, cx: &App) -> bool {
+        self.conversation_views().into_iter().any(|view| {
+            let view = view.read(cx);
+            view.root_session_id
+                .as_ref()
+                .is_some_and(|id| id.0.as_ref() == session_id)
+                && view.has_load_error()
+        })
     }
 
     /// Shows this chat in the panel, promoting it from the background when it is only
     /// retained there (`activate_retained_thread`), and focuses it. Used to switch tabs and as
     /// the overview's open callback (Cod #28 AC1, #26 AC6).
+    ///
+    /// Also reloads a chat the idle-eviction cache dropped from `retained_threads` before
+    /// activating it (RC review C8 new defect #2): `activate_retained_thread` only promotes an
+    /// already-resident thread, so a tab `cod_chat_tabs` lists for an evicted chat used to do
+    /// nothing when clicked.
     fn cod_focus_chat(&mut self, thread_id: ThreadId, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_thread_id(cx) == Some(thread_id) {
             self.activation_focus_handle(cx).focus(window, cx);
             return;
+        }
+        let is_draft_slot = self
+            .draft_thread
+            .as_ref()
+            .is_some_and(|draft| draft.read(cx).thread_id == thread_id);
+        if !self.retained_threads.contains_key(&thread_id) && !is_draft_slot {
+            if let Some(entry) = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id).cloned())
+            {
+                self.cod_restore_background_chat(entry, window, cx);
+            }
         }
         self.activate_retained_thread(thread_id, true, window, cx);
     }
@@ -4872,6 +4996,13 @@ impl AgentPanel {
             cx.observe(&conversation_view, move |this, conversation_view, cx| {
                 if conversation_view.read(cx).root_thread(cx).is_some() {
                     this.observe_retained_thread(thread_id, conversation_view, cx);
+                    // RC review C5 partial: replacing the observer with the real status
+                    // subscription above only arms it for the *next* status change; the status
+                    // the chat already has the moment it finishes connecting was never
+                    // published on its own, so a background-restored chat could stay missing
+                    // from the overview and the workspace dot until unrelated activity on
+                    // another chat republished everything. Publish it here too.
+                    this.cod_publish_chat_statuses(cx);
                 }
             })
         };
@@ -12323,6 +12454,273 @@ mod tests {
         assert!(
             owns,
             "codctl commands should not report an evicted chat's still-valid session id unknown"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cod_focus_chat_reloads_an_evicted_tab_instead_of_doing_nothing(
+        cx: &mut TestAppContext,
+    ) {
+        // RC review C8 new defect #2: a tab `cod_chat_tabs` lists for a chat the idle-eviction
+        // cache dropped did nothing when clicked, because `cod_focus_chat` only promoted an
+        // already-resident thread (`activate_retained_thread` alone).
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let mut session_ids = Vec::new();
+        let mut thread_ids = Vec::new();
+
+        for _ in 0..7 {
+            let (session_id, thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, cx);
+            session_ids.push(session_id);
+            thread_ids.push(thread_id);
+        }
+
+        for session_id in session_ids.iter().take(6) {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        }
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+            panel.cleanup_retained_threads(cx);
+        });
+        cx.run_until_parked();
+
+        let evicted_thread_id = thread_ids[0];
+        panel.read_with(cx, |panel, _cx| {
+            assert!(
+                !panel.retained_threads.contains_key(&evicted_thread_id),
+                "sanity: the first chat should have been evicted"
+            );
+        });
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.cod_focus_chat(evicted_thread_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(evicted_thread_id),
+                "clicking an evicted chat's tab must reload it and bring it back as the active \
+                 chat, not do nothing"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cod_send_message_to_an_evicted_session_waits_for_the_reload(
+        cx: &mut TestAppContext,
+    ) {
+        // RC review C8 new defect #2 continuation: the first `codctl session send` into a
+        // session the idle-eviction cache had dropped started reloading it and immediately
+        // looked it up again, racing connecting to the agent and loading its history (both
+        // asynchronous) and reporting the still-valid session "unknown" before the reload ever
+        // had a chance to finish.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let mut session_ids = Vec::new();
+
+        for _ in 0..7 {
+            let (session_id, _thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, cx);
+            session_ids.push(session_id);
+        }
+        for session_id in session_ids.iter().take(6) {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        }
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+            panel.cleanup_retained_threads(cx);
+        });
+        cx.run_until_parked();
+
+        let evicted_session_id = session_ids[0].clone();
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                !panel.conversation_views().into_iter().any(|view| {
+                    view.read(cx).root_thread(cx).is_some_and(|thread| {
+                        thread.read(cx).session_id().0.as_ref() == evicted_session_id.0.as_ref()
+                    })
+                }),
+                "sanity: the first chat should have been evicted (not resident)"
+            );
+        });
+
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Reloaded reply".into()),
+        )]);
+
+        cx.update(|window, cx| {
+            crate::cod_sessions::send_message(
+                &workspace,
+                evicted_session_id.0.as_ref(),
+                "Fix it",
+                window,
+                cx,
+            )
+        })
+        .expect("sending into an evicted session must wait for its reload, not report it unknown");
+        cx.run_until_parked();
+
+        connection.end_turn(evicted_session_id.clone(), acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        let snapshot = cx.update(|window, cx| {
+            crate::cod_sessions::session_snapshot(&workspace, evicted_session_id.0.as_ref(), window, cx)
+        });
+        let (_status, text) =
+            snapshot.expect("the evicted session should be resident and known again");
+        assert!(
+            text.contains("Reloaded reply"),
+            "the message sent while the chat was evicted must actually reach the agent once \
+             the reload finishes, not get lost in the race: got {text:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_cod_session_snapshot_reports_error_when_a_reload_fails(cx: &mut TestAppContext) {
+        // RC review new defect #3: a reload that ends in `LoadError` (no agent executable, an
+        // unsupported agent, and so on) has no root thread coming; reporting it `Working`
+        // instead of a terminal status left `codctl session wait`/`status` polling forever for
+        // a reply that would never arrive.
+        use crate::conversation_view::tests::FlakyAgentServer;
+
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        // `FlakyAgentServer` fails to connect unconditionally here (its `fail` flag is left at
+        // its default `true`), landing the restored chat in `ServerState::LoadError` with no
+        // root thread, the same shape eviction-then-reload-failure leaves behind.
+        let resume_session_id = acp::SessionId::new("flaky-session");
+        let (server, _fail) =
+            FlakyAgentServer::new(StubAgentConnection::new().with_supports_load_session(true));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_restored_thread_with_server(
+                Rc::new(server),
+                resume_session_id.clone(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let session_id = resume_session_id.0.to_string();
+        // This chat is the workspace's active one here, not evicted, but `cod_owns_session`
+        // also consults `cod_workspace_session_ids` directly (how an evicted chat is
+        // recognized); set it up the same way so this test exercises the exact lookup
+        // `session_snapshot` does for an evicted-and-failed reload.
+        panel.update(cx, |panel, _cx| {
+            panel
+                .cod_workspace_session_ids
+                .borrow_mut()
+                .insert(session_id.clone());
+        });
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.cod_session_load_failed(&session_id, cx),
+                "a chat whose reload ended in LoadError must be detected as failed"
+            );
+        });
+
+        let snapshot = cx.update(|window, cx| {
+            crate::cod_sessions::session_snapshot(&workspace, &session_id, window, cx)
+        });
+        assert_eq!(
+            snapshot.map(|(status, _text)| status),
+            Some(crate::cod_chat_status::CodChatStatus::Error),
+            "a failed reload must report an Error status, not an unbounded Working, so \
+             `codctl session wait` stops instead of polling forever"
         );
     }
 

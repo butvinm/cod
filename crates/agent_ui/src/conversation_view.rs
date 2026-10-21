@@ -1630,6 +1630,12 @@ impl ConversationView {
         matches!(self.server_state, ServerState::Loading { .. })
     }
 
+    /// Whether this chat's connection ended in an error instead of connecting or loading (RC
+    /// review new defect #3): a reload with no root thread to show, and none coming.
+    pub fn has_load_error(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
+    }
+
     fn handle_thread_event(
         &mut self,
         thread: &Entity<AcpThread>,
