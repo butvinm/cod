@@ -22,7 +22,7 @@ use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, Window};
 use project::AgentId;
 use workspace::Workspace;
 
-use crate::{AgentPanel, NewExternalAgentThread, ThreadId, cod_chat_status::CodChatStatus};
+use crate::{Agent, AgentPanel, ThreadId, cod_chat_status::CodChatStatus};
 
 /// One session of a workspace, as `codctl session list` reports it (#39 AC2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,14 +67,9 @@ pub fn new_session(
         .read(cx)
         .panel::<AgentPanel>(cx)
         .context("the workspace has no agent panel")?;
+    let agent = Agent::from(AgentId(SharedString::from(agent_id.to_owned())));
     panel.update(cx, |panel, cx| {
-        panel.new_external_agent_thread(
-            &NewExternalAgentThread {
-                agent: AgentId(SharedString::from(agent_id.to_owned())),
-            },
-            window,
-            cx,
-        );
+        panel.force_new_external_agent_thread(agent, window, cx);
     });
     let thread_id = panel
         .read(cx)

@@ -2081,6 +2081,36 @@ impl AgentPanel {
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
+    /// Like `new_external_agent_thread`, but for `codctl session new` (#39 AC1, RC review C3):
+    /// the caller asked for a brand new session, so an empty new-draft slot that happens to match
+    /// the requested agent must not be handed back as if it were fresh. `activate_new_thread`'s
+    /// own reuse of a matching empty draft stays in place for the "+" button and the agent
+    /// toolbar, where re-selecting the same agent should just refocus the slot the user is
+    /// already looking at.
+    pub fn force_new_external_agent_thread(
+        &mut self,
+        agent: Agent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_open_project(cx) {
+            return;
+        }
+
+        self.selected_agent = agent;
+        if let Some(draft) = self.draft_thread.clone()
+            && !self.draft_has_content(&draft, cx)
+        {
+            let old_draft_id = draft.read(cx).thread_id;
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(old_draft_id, cx);
+            });
+            self.draft_thread = None;
+            self._draft_editor_observation = None;
+        }
+        self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
+    }
+
     fn set_selected_agent_and_persist(&mut self, agent: Agent, cx: &mut Context<Self>) {
         if self.selected_agent != agent {
             self.selected_agent = agent.clone();
