@@ -4522,7 +4522,32 @@ impl AgentPanel {
             })
             .collect();
 
-        let _ = seen_sessions;
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let store = store.read(cx);
+            for session_id in self.cod_workspace_session_ids.borrow().iter() {
+                if seen_sessions.contains(session_id) {
+                    continue;
+                }
+                let Some(entry) = store.entry_by_session(&acp::SessionId::new(session_id.clone()))
+                else {
+                    continue;
+                };
+                if entry.archived {
+                    continue;
+                }
+                let agent: Agent = entry.agent_id.clone().into();
+                let label = self.cod_agent_label(&agent, cx);
+                tabs.push(CodChatTab {
+                    thread_id: entry.thread_id,
+                    session_id: session_id.clone(),
+                    agent_id: entry.agent_id.0.to_string(),
+                    title: crate::cod_chat_status::cod_chat_title(&label, entry.title().as_deref()),
+                    status: crate::cod_chat_status::CodChatStatus::Idle,
+                    active: false,
+                });
+            }
+        }
+
         tabs
     }
 

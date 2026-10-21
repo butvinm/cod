@@ -169,6 +169,17 @@ pub fn send_message(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    // RC review C8: a session the idle-eviction cache dropped from `retained_threads` is still
+    // owned by the workspace; bring it back before giving up on it as unknown.
+    if find_chat(workspace, session_id, cx).is_none() {
+        let panel = workspace
+            .read(cx)
+            .panel::<AgentPanel>(cx)
+            .context("the workspace has no agent panel")?;
+        panel.update(cx, |panel, cx| {
+            panel.cod_ensure_session_resident(session_id, window, cx)
+        });
+    }
     let view = find_chat(workspace, session_id, cx)
         .with_context(|| format!("unknown session {session_id}"))?;
     let thread_view = view
@@ -215,22 +226,36 @@ pub fn session_snapshot(
     session_id: &str,
     cx: &App,
 ) -> Option<(CodChatStatus, String)> {
-    let view = find_chat(workspace, session_id, cx)?;
-    let thread_entity = view.read(cx).root_thread(cx)?;
-    let thread = thread_entity.read(cx);
-    let status = CodChatStatus::of_thread(thread);
-    let text = if status == CodChatStatus::NeedsInput {
-        pending_prompt(thread, cx).unwrap_or_default()
-    } else {
-        last_reply(thread, cx).unwrap_or_default()
-    };
-    Some((status, text))
+    if let Some(view) = find_chat(workspace, session_id, cx) {
+        let thread_entity = view.read(cx).root_thread(cx)?;
+        let thread = thread_entity.read(cx);
+        let status = CodChatStatus::of_thread(thread);
+        let text = if status == CodChatStatus::NeedsInput {
+            pending_prompt(thread, cx).unwrap_or_default()
+        } else {
+            last_reply(thread, cx).unwrap_or_default()
+        };
+        return Some((status, text));
+    }
+    // RC review C8: the chat is owned by the workspace but the idle-eviction cache dropped it
+    // from `retained_threads`. It was necessarily idle when evicted (`cleanup_retained_threads`
+    // only evicts idle chats), so report it idle; its transcript is not available without
+    // bringing it back resident first, which needs a window this read-only query does not have.
+    let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+    panel
+        .read(cx)
+        .cod_owns_session(session_id, cx)
+        .then(|| (CodChatStatus::Idle, String::new()))
 }
 
 /// Whether the workspace has a chat with this session id, for `codctl session status` (#39 AC5,
-/// AC6).
+/// AC6). Also true for a session the idle-eviction cache dropped from `retained_threads` (RC
+/// review C8): workspace membership (`cod_owns_session`) does not depend on that cache.
 pub fn has_session(workspace: &Entity<Workspace>, session_id: &str, cx: &App) -> bool {
-    find_chat(workspace, session_id, cx).is_some()
+    let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+        return false;
+    };
+    panel.read(cx).cod_owns_session(session_id, cx)
 }
 
 /// Re-publishes the workspace's chat statuses right away (#39 AC5): called after a status line
