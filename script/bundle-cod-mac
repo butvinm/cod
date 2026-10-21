@@ -11,9 +11,12 @@
 #   cod-macos-aarch64.zip           dist/Cod.app zipped with ditto (keeps the bundle structure)
 #   cod-macos-aarch64.zip.sha256    the zip's sha256, one line, same format as sha256sum -b
 #
-# COMMIT (env, defaults to git rev-parse HEAD) is stamped into Info.plist's CFBundleVersion and
-# into Contents/Resources/cod-commit.txt, and is checked against strings in the zed binary later
-# in the macOS release workflow, not by this script.
+# COMMIT (env, defaults to git rev-parse HEAD) is stamped into Contents/Resources/cod-commit.txt
+# and into Info.plist's custom CodCommit key, and is checked against strings in the zed binary
+# later in the macOS release workflow, not by this script. Apple's CFBundleVersion must be a
+# plain numeric string (https://developer.apple.com/documentation/BundleResources/Information-Property-List/CFBundleVersion),
+# so the commit (a hex SHA) cannot go there: RUN_NUMBER (env, defaults to 1) does instead, so
+# every build still has an increasing build number without needing the commit to be numeric.
 set -euo pipefail
 
 build_dir=${BUILD_DIR:-target/release-fast}
@@ -22,6 +25,7 @@ app_path="$dist_dir/Cod.app"
 zip_name=${ZIP_NAME:-cod-macos-aarch64.zip}
 icon_src=${ICON_SRC:-crates/zed/resources/cod-app-icon-1024.png}
 commit=${COMMIT:-${GITHUB_SHA:-$(git rev-parse HEAD)}}
+run_number=${RUN_NUMBER:-1}
 
 zed_bin="$build_dir/zed"
 codctl_bin="$build_dir/codctl"
@@ -57,8 +61,10 @@ cat > "$app_path/Contents/Info.plist" <<PLIST
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.0.1-preview</string>
+	<string>0.0.1</string>
 	<key>CFBundleVersion</key>
+	<string>$run_number</string>
+	<key>CodCommit</key>
 	<string>$commit</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>

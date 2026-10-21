@@ -91,12 +91,14 @@ jobs:
       - name: Bundle Cod.app (script/bundle-cod-mac)
         env:
           COMMIT: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: script/bundle-cod-mac
 
       # Fails the job on the first problem found, printing enough to diagnose it without a Mac at hand.
       - name: Bundle checks
         env:
           COMMIT: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
           app=dist/Cod.app
@@ -136,6 +138,18 @@ jobs:
           [ "$count" -ge 1 ] || { echo "::error::the zed binary does not contain the full commit $COMMIT"; exit 1; }
           stamped=$(cat "$app/Contents/Resources/cod-commit.txt")
           [ "$stamped" = "$COMMIT" ] || { echo "::error::cod-commit.txt has '$stamped', expected '$COMMIT'"; exit 1; }
+          plist_commit=$(plutil -extract CodCommit raw "$app/Contents/Info.plist")
+          [ "$plist_commit" = "$COMMIT" ] || { echo "::error::Info.plist's CodCommit has '$plist_commit', expected '$COMMIT'"; exit 1; }
+
+          echo "== version fields (#23 AC-R7: Apple requires CFBundleVersion to be numeric) =="
+          short_version=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          bundle_version=$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")
+          echo "CFBundleShortVersionString=$short_version CFBundleVersion=$bundle_version"
+          [ "$short_version" = "0.0.1" ] || { echo "::error::CFBundleShortVersionString is '$short_version', expected '0.0.1'"; exit 1; }
+          case "$bundle_version" in
+            ''|*[!0-9]*) echo "::error::CFBundleVersion '$bundle_version' is not a plain numeric string"; exit 1 ;;
+          esac
+          [ "$bundle_version" = "$RUN_NUMBER" ] || { echo "::error::CFBundleVersion is '$bundle_version', expected the run number '$RUN_NUMBER'"; exit 1; }
 
           echo "== zip checksum =="
           test -f cod-macos-aarch64.zip
