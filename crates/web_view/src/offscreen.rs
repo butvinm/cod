@@ -3,7 +3,15 @@
 //! The browser (CEF, in the `cod-browser` helper process, see `browser_client`) renders into memory. Every frame becomes a fresh `RenderImage` that GPUI paints inside the pane like any other image, so the page is part of Cod's own window and works on native Wayland.
 //! Mouse and keyboard events that GPUI delivers to the pane are forwarded to the browser.
 
-use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    path::Path,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+};
 
 use anyhow::Context as _;
 use futures::{StreamExt as _, channel::mpsc};
@@ -1019,6 +1027,19 @@ fn persisted_kind(kind: PageKind, agent_navigated_away: bool) -> PageKind {
     }
 }
 
+/// A process-wide counter, one higher every call (RC review B2, final batch): not a wall clock,
+/// since all a page row's write ever needs is "which of this process's own `serialize()` calls
+/// for it happened later," never a time another process could compare against. Workspace's own
+/// serialization can call `OffscreenView::serialize` for the same item more than once (its
+/// throttled background queue and its quit-time flush both can), each spawning its own
+/// independent write with no ordering between the two; reading this here, synchronously, before
+/// either write is spawned, is what lets `CodPagesDb::save_page` keep only the one whose call
+/// actually came last, regardless of which finishes last.
+fn serialize_clock() -> i64 {
+    static CLOCK: AtomicI64 = AtomicI64::new(0);
+    CLOCK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
 fn page_context(url: &str) -> String {
     match url::Url::parse(url) {
@@ -1304,8 +1325,12 @@ impl SerializableItem for OffscreenView {
         let kind = persisted_kind(self.kind, self.agent_navigated_away)
             .as_str()
             .to_string();
+        // RC review B2, final batch: read here, synchronously, before either this task or any
+        // other `serialize()` call for the same item is spawned, so it orders writes by when
+        // they were actually requested, not by whenever their background task happens to run.
+        let written_at = serialize_clock();
         Some(cx.background_spawn(async move {
-            db.save_page(item_id, workspace_id, page_id, url, title, kind)
+            db.save_page(item_id, workspace_id, page_id, url, title, kind, written_at)
                 .await
         }))
     }

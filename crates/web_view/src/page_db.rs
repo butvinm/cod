@@ -17,20 +17,29 @@ pub(crate) struct CodPagesDb(ThreadSafeConnection);
 impl Domain for CodPagesDb {
     const NAME: &str = stringify!(CodPagesDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE cod_pages (
-            item_id INTEGER NOT NULL,
-            workspace_id INTEGER NOT NULL,
-            page_id TEXT NOT NULL,
-            url TEXT NOT NULL,
-            title TEXT,
-            kind TEXT NOT NULL,
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE cod_pages (
+                item_id INTEGER NOT NULL,
+                workspace_id INTEGER NOT NULL,
+                page_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT,
+                kind TEXT NOT NULL,
 
-            PRIMARY KEY(item_id, workspace_id),
-            FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
-            ON DELETE CASCADE
-        ) STRICT;
-    )];
+                PRIMARY KEY(item_id, workspace_id),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+            ) STRICT;
+        ),
+        // RC review B2, final batch: two of this item's own `serialize()` calls (one from the
+        // workspace's throttled background queue, one from its quit-time flush) each spawn
+        // their own, independent write; nothing orders those two writes against each other, so
+        // the one reflecting an earlier moment (still `kind = "agent"`, before a navigation away)
+        // could finish second and clobber the later, correct one (`kind = "external"`). Compare
+        // `written_at` so only the write whose call actually happened last is ever kept.
+        sql!(ALTER TABLE cod_pages ADD COLUMN written_at INTEGER NOT NULL DEFAULT 0),
+    ];
 }
 
 db::static_connection!(CodPagesDb, [WorkspaceDb]);
@@ -45,16 +54,29 @@ pub(crate) struct SavedPage {
 
 impl CodPagesDb {
     query! {
+        // `written_at` (RC review B2, final batch) is the caller's own clock reading from the
+        // moment it decided what to write, not when this statement happens to run: two calls
+        // for the same item can finish in either order on the background executor, and the
+        // `WHERE` here keeps whichever one was actually requested last, never an earlier one
+        // that simply got its write in after.
         pub async fn save_page(
             item_id: ItemId,
             workspace_id: WorkspaceId,
             page_id: String,
             url: String,
             title: Option<String>,
-            kind: String
+            kind: String,
+            written_at: i64
         ) -> Result<()> {
-            INSERT OR REPLACE INTO cod_pages(item_id, workspace_id, page_id, url, title, kind)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO cod_pages(item_id, workspace_id, page_id, url, title, kind, written_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(item_id, workspace_id) DO UPDATE SET
+                page_id = excluded.page_id,
+                url = excluded.url,
+                title = excluded.title,
+                kind = excluded.kind,
+                written_at = excluded.written_at
+            WHERE excluded.written_at >= cod_pages.written_at
         }
     }
 
