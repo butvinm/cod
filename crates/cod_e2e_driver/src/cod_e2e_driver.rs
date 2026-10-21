@@ -23,6 +23,7 @@ mod cod_chat_state;
 mod cod_markdown_preview_state;
 mod cod_overview_state;
 mod cod_tabs_state;
+mod cod_welcome_state;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -907,6 +908,7 @@ fn read_state(
     state["chat_tabs"] = cod_chat_state::chat_tabs_state(workspace, cx);
     state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
     state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
+    state["welcome"] = cod_welcome_state::state(workspace, cx);
     Ok(state)
 }
 

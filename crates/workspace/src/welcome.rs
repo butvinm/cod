@@ -258,6 +258,17 @@ pub struct WelcomePage {
 }
 
 impl WelcomePage {
+    /// The greeting this page draws, read only (issue #77 AC6, see
+    /// `cod_e2e_driver::cod_welcome_state`): the driver has no other way to read it, and the
+    /// first-use report found it still says "Zed" even on a fresh Cod profile.
+    pub fn cod_welcome_label(&self) -> &'static str {
+        if self.fallback_to_recent_projects {
+            "Welcome back to Zed"
+        } else {
+            "Welcome to Zed"
+        }
+    }
+
     pub fn new(
         workspace: WeakEntity<Workspace>,
         fallback_to_recent_projects: bool,
@@ -460,11 +471,7 @@ impl Render for WelcomePage {
                 .into_any_element()
         };
 
-        let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Zed"
-        } else {
-            "Welcome to Zed"
-        };
+        let welcome_label = self.cod_welcome_label();
 
         h_flex()
             .key_context("Welcome")
