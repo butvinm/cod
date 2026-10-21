@@ -512,6 +512,10 @@ pub struct Markdown {
     active_search_highlight: Option<usize>,
     /// The link that has the keyboard focus (Cod #28), only used by elements with keyboard links.
     focused_link: Option<RenderedLink>,
+    /// `focused_link`'s position among the links of the last painted frame (RC review D26): kept
+    /// alongside the link itself because a block whose links share a destination with the link
+    /// at the other end (`[u, v, u]`) cannot be told apart from that end by URL alone.
+    focused_link_index: Option<usize>,
     /// The links of the last painted frame with their window bounds, for the end-to-end driver's
     /// click target (Cod #32). Kept independent of `keyboard_links`, which only some surfaces opt
     /// into (a chat reply, not the markdown preview).
@@ -726,6 +730,7 @@ impl Markdown {
             search_highlights: Rc::default(),
             active_search_highlight: None,
             focused_link: None,
+            focused_link_index: None,
             cod_link_bounds: Vec::new(),
         };
         this.parse(cx);
@@ -1167,6 +1172,14 @@ impl Markdown {
             .map(|link| link.destination_url.clone())
     }
 
+    /// The position of the link that has the keyboard focus among the links of the last painted
+    /// frame (`cod_link_bounds`), if any (RC review D26): callers that must tell whether the
+    /// focus is at the first or last link use this instead of comparing destinations, since a
+    /// block whose links are `[u, v, u]` has the same destination at both ends.
+    pub fn focused_link_index(&self) -> Option<usize> {
+        self.focused_link_index
+    }
+
     /// The rendered text of the link that has the keyboard focus, if any (Cod #28): what the
     /// link shows, not its raw markdown source (which for a real `[text](url)` link also holds
     /// the brackets, the destination and any inline formatting markers its text carries).
@@ -1188,6 +1201,7 @@ impl Markdown {
         let link = links[next].clone();
         self.autoscroll_request = Some(link.source_range.start);
         self.focused_link = Some(link);
+        self.focused_link_index = Some(next);
         true
     }
 

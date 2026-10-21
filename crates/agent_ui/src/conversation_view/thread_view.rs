@@ -7400,18 +7400,47 @@ impl ThreadView {
     /// right where it is instead of saying there is nowhere left to go, so plain Tab/Shift-Tab
     /// alone never leaves a block that has at least one link. The handler below uses this to
     /// step in before that happens.
+    ///
+    /// Compares the focused link's position (`Markdown::focused_link_index`), not its
+    /// destination (RC review D26 new defect #5): a block whose links are `[u, v, u]` has the
+    /// same destination at both ends, so comparing destinations mistook the first `u` for the
+    /// last one and left the block one Tab too early, before ever reaching `v`.
     fn cod_markdown_link_navigation_exhausted(
         markdown: &Entity<Markdown>,
         forward: bool,
         cx: &App,
     ) -> bool {
         let markdown = markdown.read(cx);
-        let bounds = markdown.cod_link_bounds();
-        let Some(edge) = (if forward { bounds.last() } else { bounds.first() }) else {
+        Self::cod_link_navigation_at_edge(
+            markdown.cod_link_bounds().len(),
+            markdown.focused_link_index(),
+            forward,
+        )
+    }
+
+    /// The boundary math `cod_markdown_link_navigation_exhausted` uses, pulled out so it can be
+    /// tested directly (RC review D26 new defect #5) without a painted `Markdown`: whether the
+    /// link at `focused_index` (by position, out of `link_count` links) is the last one moving
+    /// forward or the first one moving backward. No links, or no link focused, both count as
+    /// exhausted-moving-forward's opposite cases already handled by the caller: no links is
+    /// exhausted either way; no focused link is never exhausted (there is always somewhere to
+    /// go: the first or last link).
+    fn cod_link_navigation_at_edge(
+        link_count: usize,
+        focused_index: Option<usize>,
+        forward: bool,
+    ) -> bool {
+        if link_count == 0 {
             return true;
-        };
-        match markdown.focused_link_url() {
-            Some(focused_url) => edge.url == focused_url,
+        }
+        match focused_index {
+            Some(index) => {
+                if forward {
+                    index + 1 >= link_count
+                } else {
+                    index == 0
+                }
+            }
             None => false,
         }
     }
@@ -13416,6 +13445,69 @@ mod tests {
         // Unknown command, or not a slash command at all.
         assert_eq!(leading_native_command("/unknown foo", &commands), None);
         assert_eq!(leading_native_command("just a message", &commands), None);
+    }
+
+    #[test]
+    fn test_cod_link_navigation_at_edge_uses_position_not_destination() {
+        // RC review D26 new defect #5: a block whose links are destinations [u, v, u] (the
+        // first and last share a destination) used to compare the focused link's destination
+        // against the boundary link's destination. That check could not tell the first `u`
+        // (index 0) apart from the last `u` (index 2), so it treated index 0 as already
+        // exhausted moving forward and left the block one Tab too early, before Tab ever
+        // reached `v` (index 1) in between.
+        //
+        // The position-based replacement, tested here directly, only calls index 2 exhausted
+        // moving forward (and only index 0 exhausted moving backward), so `v` is always reached
+        // first.
+        let link_count = 3;
+
+        // Moving forward from the first link (index 0): not exhausted, `v` is still ahead, even
+        // though index 0's destination equals index 2's.
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(0),
+            true
+        ));
+        // Moving forward from the middle link (index 1, `v`): not exhausted either.
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(1),
+            true
+        ));
+        // Only the real last link (index 2) is exhausted moving forward.
+        assert!(ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(2),
+            true
+        ));
+
+        // Symmetric moving backward: only the real first link (index 0) is exhausted.
+        assert!(ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(0),
+            false
+        ));
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(1),
+            false
+        ));
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(2),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_cod_link_navigation_at_edge_handles_no_links_or_no_focus() {
+        // No links at all: nowhere to go, in either direction.
+        assert!(ThreadView::cod_link_navigation_at_edge(0, None, true));
+        assert!(ThreadView::cod_link_navigation_at_edge(0, None, false));
+        // Links exist but none is focused yet: never exhausted (there is always a first/last
+        // link to move to).
+        assert!(!ThreadView::cod_link_navigation_at_edge(3, None, true));
+        assert!(!ThreadView::cod_link_navigation_at_edge(3, None, false));
     }
 
     #[test]
