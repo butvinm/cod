@@ -1329,9 +1329,12 @@ impl SerializableItem for OffscreenView {
         // other `serialize()` call for the same item is spawned, so it orders writes by when
         // they were actually requested, not by whenever their background task happens to run.
         let written_at = serialize_clock();
+        log::warn!("web_view: DIAG serialize {page_id} kind={kind} written_at={written_at}");
         Some(cx.background_spawn(async move {
-            db.save_page(item_id, workspace_id, page_id, url, title, kind, written_at)
-                .await
+            let result = db.save_page(item_id, workspace_id, page_id.clone(), url, title, kind.clone(), written_at)
+                .await;
+            log::warn!("web_view: DIAG saved {page_id} kind={kind} written_at={written_at} ok={}", result.is_ok());
+            result
         }))
     }
 
