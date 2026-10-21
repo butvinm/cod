@@ -4516,8 +4516,11 @@ impl AgentPanel {
             window,
             cx,
         );
-        self.retained_threads
-            .insert(entry.thread_id, thread.conversation_view);
+        // RC review C5: inserting straight into `retained_threads` here used to bypass
+        // `insert_retained_thread`'s status subscription, so this chat's later status changes
+        // never reached the overview or the workspace dot until unrelated activity on the active
+        // chat republished everything.
+        self.insert_retained_thread(entry.thread_id, thread.conversation_view, cx);
         self.selected_agent = selected_agent;
     }
 
