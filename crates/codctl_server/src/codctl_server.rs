@@ -21,12 +21,9 @@ use git_ui_core::file_diff_view::FileDiffView;
 use gpui::{App, AsyncApp, Axis, Bounds, Entity, EntityId, Focusable as _, Pixels, WindowHandle};
 use serde_json::{Value, json};
 use workspace::{
-    CodMember, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, Pane, RemovalIntent,
-    SaveIntent, SplitDirection, Workspace, WorkspaceId,
+    CodMember, CodStatus, CodStatusStore, MultiWorkspace, OpenMode, OpenOptions, OpenVisible,
+    Pane, RemovalIntent, SaveIntent, SplitDirection, Workspace, WorkspaceId,
 };
-
-/// The rolled-up status of a workspace until workspace statuses exist (#25, #26).
-const IDLE: &str = "idle";
 
 /// Starts the server.
 #[cfg(unix)]
@@ -225,6 +222,17 @@ fn members(cx: &App) -> Vec<Member> {
     found
 }
 
+/// The workspace's real status (RC review A8): the most urgent status of any session or page it
+/// holds, idle, loaded or not, from the same store the title bar's status dot reads. Earlier
+/// `workspace list --json` reported the placeholder `idle` unconditionally, so a workspace an
+/// agent was working in, had failed in or was waiting on never showed it.
+fn workspace_status(id: Option<WorkspaceId>, cx: &App) -> CodStatus {
+    match (id, CodStatusStore::try_global(cx)) {
+        (Some(id), Some(store)) => store.read(cx).workspace_status(id),
+        _ => CodStatus::Idle,
+    }
+}
+
 /// What `workspace list` reports for each workspace.
 fn list(cx: &App) -> Vec<Value> {
     members(cx)
@@ -233,7 +241,7 @@ fn list(cx: &App) -> Vec<Value> {
             json!({
                 "id": member.id.map(i64::from),
                 "name": member.name,
-                "status": IDLE,
+                "status": workspace_status(member.id, cx).name(),
                 "folders": member.folders,
                 "active": member.active,
                 "loaded": member.live.is_some(),
