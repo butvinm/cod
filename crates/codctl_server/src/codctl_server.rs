@@ -1267,9 +1267,16 @@ mod socket {
     fn client_disconnected(watch: &UnixStream) -> Result<bool> {
         use std::os::fd::AsRawFd as _;
 
+        // `POLLRDHUP` exists only on Linux; elsewhere (macOS) a closed peer shows as `POLLHUP`,
+        // which `poll` reports without being asked for.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const PEER_CLOSED: libc::c_short = libc::POLLRDHUP;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        const PEER_CLOSED: libc::c_short = 0;
+
         let mut fds = [libc::pollfd {
             fd: watch.as_raw_fd(),
-            events: libc::POLLRDHUP,
+            events: PEER_CLOSED,
             revents: 0,
         }];
         // SAFETY: `fds` has exactly one valid `pollfd` for the call's duration; a zero timeout
@@ -1279,7 +1286,7 @@ mod socket {
             return Err(io::Error::last_os_error()).context("cannot poll the client connection");
         }
         let revents = fds[0].revents;
-        Ok(revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0)
+        Ok(revents & (PEER_CLOSED | libc::POLLHUP | libc::POLLERR) != 0)
     }
 
     /// Waits for the job's reply, giving up (RC review A6) once `watch` shows the client is

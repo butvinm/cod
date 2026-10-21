@@ -1027,17 +1027,28 @@ fn persisted_kind(kind: PageKind, agent_navigated_away: bool) -> PageKind {
     }
 }
 
-/// A process-wide counter, one higher every call (RC review B2, final batch): not a wall clock,
-/// since all a page row's write ever needs is "which of this process's own `serialize()` calls
-/// for it happened later," never a time another process could compare against. Workspace's own
-/// serialization can call `OffscreenView::serialize` for the same item more than once (its
-/// throttled background queue and its quit-time flush both can), each spawning its own
-/// independent write with no ordering between the two; reading this here, synchronously, before
-/// either write is spawned, is what lets `CodPagesDb::save_page` keep only the one whose call
-/// actually came last, regardless of which finishes last.
+/// A strictly increasing write stamp (RC review B2, final batch). Workspace's own serialization
+/// can call `OffscreenView::serialize` for the same item more than once (its throttled background
+/// queue and its quit-time flush both can), each spawning its own independent write with no
+/// ordering between the two; reading this here, synchronously, before either write is spawned, is
+/// what lets `CodPagesDb::save_page` keep only the one whose call actually came last, regardless
+/// of which finishes last. The stamp is wall-clock microseconds, raised to one more than the last
+/// stamp when the clock has not moved on, so a stamp of this run is also above every stamp a
+/// previous run saved: a per-run counter starting at zero would make every save after a restart
+/// lose against the rows the previous run left.
 fn serialize_clock() -> i64 {
     static CLOCK: AtomicI64 = AtomicI64::new(0);
-    CLOCK.fetch_add(1, Ordering::Relaxed) + 1
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX));
+    let mut last = CLOCK.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match CLOCK.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
 }
 
 /// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
@@ -1623,6 +1634,18 @@ mod tests {
 
     // RC review B2 (final batch): a restart must not re-grant bridge rights to whatever
     // external address an agent page last navigated to.
+
+    // A save stamp of this run must beat every stamp a previous run left in the database, or the
+    // conditional upsert in `CodPagesDb::save_page` silently keeps the old row after a restart.
+    #[test]
+    fn save_stamps_increase_and_start_above_any_earlier_run() {
+        // 2026-01-01 in microseconds: a previous run's stamps are wall-clock readings below now.
+        let earlier_run_stamp = 1_767_225_600_000_000;
+        let first = serialize_clock();
+        let second = serialize_clock();
+        assert!(first > earlier_run_stamp);
+        assert!(second > first);
+    }
 
     #[test]
     fn an_agent_page_navigated_away_is_persisted_as_an_ordinary_page() {

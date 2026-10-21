@@ -211,6 +211,11 @@ pub fn send_message(
     let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
         bail!("unknown session {session_id}");
     };
+    // A reload already under way takes no second initial content, so this text would be dropped
+    // while the command reported success: refuse it and let the caller send again.
+    if panel.read(cx).cod_session_reload_in_flight(session_id, cx) {
+        bail!("session {session_id} is still loading; send the message again when it is ready");
+    }
     let initial_content = AgentInitialContent::ContentBlock {
         blocks: contents,
         auto_submit: true,

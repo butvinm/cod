@@ -4695,6 +4695,23 @@ impl AgentPanel {
         self.cod_ensure_session_resident_with_content(session_id, None, window, cx)
     }
 
+    /// Whether this workspace's chat with this session id is back in `retained_threads` but not
+    /// loaded yet. `cod_restore_background_chat_with_content` starts nothing for such a chat, so
+    /// content handed to it then would be dropped: `codctl session send` refuses instead of
+    /// reporting a send that never happens.
+    pub(crate) fn cod_session_reload_in_flight(&self, session_id: &str, cx: &App) -> bool {
+        if !self.cod_owns_session(session_id, cx) {
+            return false;
+        }
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return false;
+        };
+        store
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(session_id.to_string()))
+            .is_some_and(|entry| self.retained_threads.contains_key(&entry.thread_id))
+    }
+
     /// `cod_ensure_session_resident`, optionally handing the reload content to send once it is
     /// ready (RC review new defect #2): see `cod_restore_background_chat_with_content`.
     pub(crate) fn cod_ensure_session_resident_with_content(
