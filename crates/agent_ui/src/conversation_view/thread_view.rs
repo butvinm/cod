@@ -7368,6 +7368,112 @@ impl ThreadView {
         cx.notify();
     }
 
+    /// Every agent reply's markdown blocks, in reading order (RC review B7/C4): unlike
+    /// `cod_last_reply_markdown`, which only enters the newest reply, this is every block of
+    /// every reply, so Tab and Shift-Tab can keep moving once they run out of links in one
+    /// block, instead of stopping there.
+    fn cod_all_reply_markdowns(&self, cx: &App) -> Vec<Entity<Markdown>> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .flat_map(|entry| match entry {
+                AgentThreadEntry::AssistantMessage(message) => message
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            block.markdowns().cloned().collect::<Vec<_>>()
+                        }
+                        AssistantMessageChunk::Thought { .. } => Vec::new(),
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Whether moving further in this direction within `markdown`'s own links would do nothing:
+    /// either it has no links at all, or the link that already has the keyboard focus is the
+    /// last one (moving forward) or the first one (moving backward) (RC review B7/C4).
+    /// `Markdown::move_link_focus` does not report this itself: at either end it keeps the focus
+    /// right where it is instead of saying there is nowhere left to go, so plain Tab/Shift-Tab
+    /// alone never leaves a block that has at least one link. The handler below uses this to
+    /// step in before that happens.
+    fn cod_markdown_link_navigation_exhausted(
+        markdown: &Entity<Markdown>,
+        forward: bool,
+        cx: &App,
+    ) -> bool {
+        let markdown = markdown.read(cx);
+        let bounds = markdown.cod_link_bounds();
+        let Some(edge) = (if forward { bounds.last() } else { bounds.first() }) else {
+            return true;
+        };
+        match markdown.focused_link_url() {
+            Some(focused_url) => edge.url == focused_url,
+            None => false,
+        }
+    }
+
+    /// Moves the keyboard focus to the next (or previous) reply block in reading order, so
+    /// Tab/Shift-Tab keep moving once the focused block has nowhere left to go in that direction
+    /// (RC review B7/C4), instead of stopping there for the rest of the transcript. Runs in the
+    /// capture phase, before `markdown::FocusNextLink`/`FocusPreviousLink`'s own bubble-phase
+    /// handler on the focused block would otherwise keep re-selecting that block's own last (or
+    /// first) link; stopping the action here (`cx.stop_propagation`) skips that bubble phase
+    /// entirely for this key press. A block reached this way starts with no link of its own
+    /// focused, so the next Tab/Shift-Tab lands on its first (or last) link the same way entering
+    /// a reply already does. Does nothing — letting the action proceed as before — without a
+    /// currently focused block, while that block still has somewhere to go on its own, or at
+    /// either end of the transcript.
+    fn cod_focus_adjacent_reply_markdown(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let markdowns = self.cod_all_reply_markdowns(cx);
+        let Some(current_index) = markdowns
+            .iter()
+            .position(|markdown| markdown.read(cx).focus_handle(cx).is_focused(window))
+        else {
+            return;
+        };
+        if !Self::cod_markdown_link_navigation_exhausted(&markdowns[current_index], forward, cx) {
+            return;
+        }
+        let next_index = if forward {
+            current_index.checked_add(1)
+        } else {
+            current_index.checked_sub(1)
+        };
+        let Some(markdown) = next_index.and_then(|index| markdowns.get(index)) else {
+            return;
+        };
+        window.focus(&markdown.read(cx).focus_handle(cx), cx);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn cod_capture_focus_next_link(
+        &mut self,
+        _: &markdown::FocusNextLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cod_focus_adjacent_reply_markdown(true, window, cx);
+    }
+
+    fn cod_capture_focus_previous_link(
+        &mut self,
+        _: &markdown::FocusPreviousLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cod_focus_adjacent_reply_markdown(false, window, cx);
+    }
+
     fn focus_message_editor(
         &mut self,
         _: &FocusMessageEditor,
@@ -12797,6 +12903,8 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
             .on_action(cx.listener(Self::focus_last_reply))
+            .capture_action(cx.listener(Self::cod_capture_focus_next_link))
+            .capture_action(cx.listener(Self::cod_capture_focus_previous_link))
             .on_action(cx.listener(Self::focus_message_editor))
             .on_action(cx.listener(Self::scroll_output_line_up))
             .on_action(cx.listener(Self::scroll_output_line_down))
