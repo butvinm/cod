@@ -692,9 +692,9 @@ class AgentPagesTest(CodTestCase):
         with self.step("follow the same-tab link to the outside page"):
             self.click_in_page(page_id, 20, 20)
             self.wait_for(
-                lambda state: (page_by_id(state, page_id) or {}).get("kind") == "external",
+                lambda state: (page_by_id(state, page_id) or {}).get("url") == forged.url(),
                 SHOW_TIMEOUT,
-                "the page to stop being agent-made once navigated away",
+                "the page to show the outside address",
             )
 
         with self.step("restart Cod"):
