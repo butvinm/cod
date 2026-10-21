@@ -375,6 +375,35 @@ class CodctlTest(CodStatusFixtures, CodTestCase):
             listed_ids = sorted(workspace["id"] for workspace in self.list_json())
             self.expect_equal("still exactly two workspaces total, no duplicate id", before_ids, listed_ids)
 
+    def test_a2_new_on_a_folder_whose_saved_tab_is_loading_returns_its_id(self) -> None:
+        """RC review A2 (remainder): `workspace new --folder X` while X's saved tab is still loading (started here by `workspace focus`, the same path as a tab click) must not restore that saved row into a second workspace entity with the same id. It must return the id of the tab that is loading."""
+        with self.step("save a session with billing-api active and billing-web added, then restart so billing-web is pending"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            self.start_cod(api, persistent=True)
+            self.wait_for_codctl()
+            api_id = self.list_json()[0]["id"]
+            web_id = self.new_workspace("--folder", str(web))
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+            self.restart_cod()
+            self.wait_for(lambda state: state["workspace_count"] == 2, RESTORE_TIMEOUT, "both workspaces to come back")
+            pending = next(workspace for workspace in self.list_json() if workspace["id"] == web_id)
+            self.expect_equal("billing-web is pending right after the restart", False, pending["loaded"])
+
+        with self.step("start loading billing-web without waiting for it, then run workspace new --folder billing-web"):
+            loading = self.codctl.start("workspace", "focus", str(web_id))
+            self.addCleanup(lambda: loading.poll() is None and loading.kill())
+            new_id = self.new_workspace("--folder", str(web))
+            self.expect_equal("workspace new returns the id of billing-web's saved tab", web_id, new_id)
+
+        with self.step("once billing-web has loaded, the window holds exactly two workspaces and list has no duplicate id"):
+            loading_out, loading_err = loading.communicate(timeout=COMMAND_TIMEOUT)
+            self.expect_equal(f"the focus on billing-web succeeded (stderr {loading_err!r})", 0, loading.returncode)
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 1})
+            self.expect_window_stays({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 1})
+            listed_ids = sorted(workspace["id"] for workspace in self.list_json())
+            self.expect_equal("still exactly two workspaces, no duplicate id", sorted([api_id, web_id]), listed_ids)
+
     # AC3
 
     def test_ac3_list_text_and_json(self) -> None:
