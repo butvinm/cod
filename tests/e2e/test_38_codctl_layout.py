@@ -189,6 +189,50 @@ class LayoutTest(CodTestCase):
         time.sleep(SETTLE_TIME)
         self.expect_equal("panes", expected, self.pane_view(self.state()))
 
+    def test_a5_resize_picks_the_actual_containing_split_not_an_unrelated_pane(self) -> None:
+        """RC review A5: split A right to make B (full height), then split A down (A keeps the
+        top-left quarter, C gets the bottom-left quarter). Resizing B, a full-height pane, must
+        use the outer, horizontal split it is actually in, not get confused by A's half-height
+        bounds into picking the inner, vertical split and silently doing nothing."""
+        with self.step("start Cod on billing-api, open a file, and split it right then down"):
+            repo = self.start_on_billing_api()
+            self.expect_result(self.codctl("open", "src/invoice.rs", cwd=repo), 0, stdout="", stderr="")
+            self.wait_for_values("panes", {"tabs": [["invoice.rs"]], "split": None}, self.pane_view, SHOW_TIMEOUT)
+            first = self.panes_json()[0]["id"]
+
+            split_right = self.codctl("pane", "split", str(first), "--right")
+            self.expect_result(split_right, 0, stderr="")
+            b_id = int(split_right.stdout)
+            self.wait_for_values("panes", {"tabs": [["invoice.rs"], []], "split": "vertical"}, self.pane_view, SHOW_TIMEOUT)
+
+            split_down = self.codctl("pane", "split", str(first), "--down")
+            self.expect_result(split_down, 0, stderr="")
+            c_id = int(split_down.stdout)
+            self.wait_for(lambda state: len(self.panes_json()) == 3, SHOW_TIMEOUT, "three panes after the second split")
+
+        with self.step("B is full height before any resize, A and C each about half of it"):
+            before = {pane["id"]: pane["bounds"] for pane in self.panes_json()}
+            full_height = before[b_id]["height"]
+            self.expect_equal("A is about half height", True, abs(before[first]["height"] - full_height / 2) < 5)
+            self.expect_equal("C is about half height", True, abs(before[c_id]["height"] - full_height / 2) < 5)
+
+        with self.step(f"run codctl pane resize {b_id} --size 70% and check B's width actually changes"):
+            result = self.codctl("pane", "resize", str(b_id), "--size", "70%")
+            self.expect_result(result, 0, stdout="", stderr="")
+
+            def share_of_b(_: dict[str, Any]) -> float:
+                widths = {pane["id"]: pane["bounds"]["width"] for pane in self.panes_json()}
+                # A and C share the left column and so share its width; the split's total width
+                # is A's (or C's) width plus B's, not the sum of every pane's width.
+                total = widths[first] + widths[b_id]
+                return widths[b_id] / total
+
+            self.wait_for(
+                lambda state: abs(share_of_b(state) - 0.7) < 0.05,
+                SHOW_TIMEOUT,
+                f"pane {b_id} to take 70% of the split's width",
+            )
+
     # AC2
 
     def test_ac2_open_file_at_line_and_column(self) -> None:

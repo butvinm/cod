@@ -755,11 +755,41 @@ async fn resize_pane(
     Ok(json!({ "id": pane_id(&pane) }))
 }
 
+/// Whether `other` shares an edge with `bounds` along `axis` (RC review A5): their extents on
+/// the other axis overlap, and one's near edge sits at the other's far edge. This is what
+/// "`other` is in the same split as `pane`, along `axis`" actually means geometrically, unlike
+/// picking an arbitrary other pane in the whole workspace and comparing it for equal position
+/// and size on one axis, which a workspace with more than one split can satisfy by coincidence
+/// for a pane that is not really pane's sibling at all.
+fn touches(bounds: &Bounds<Pixels>, other: &Bounds<Pixels>, axis: Axis) -> bool {
+    let close = |a: Pixels, b: Pixels| (a - b).abs() < gpui::px(1.);
+    match axis {
+        Axis::Horizontal => {
+            let edge = close(bounds.origin.x + bounds.size.width, other.origin.x)
+                || close(other.origin.x + other.size.width, bounds.origin.x);
+            let overlap_y = bounds.origin.y < other.origin.y + other.size.height
+                && other.origin.y < bounds.origin.y + bounds.size.height;
+            edge && overlap_y
+        }
+        Axis::Vertical => {
+            let edge = close(bounds.origin.y + bounds.size.height, other.origin.y)
+                || close(other.origin.y + other.size.height, bounds.origin.y);
+            let overlap_x = bounds.origin.x < other.origin.x + other.size.width
+                && other.origin.x < bounds.origin.x + bounds.size.width;
+            edge && overlap_x
+        }
+    }
+}
+
 /// The axis and pixel delta that would set `pane`'s share of its split to `size` percent, from
-/// the current bounds of `pane` and of the other panes of the workspace. Exact for a simple
-/// split of two panes (what `codctl pane split` makes); with more panes in the same split the
-/// total is still the sum of every other pane's bounds, which only approximates that group's
-/// true span when panes of more than one split are mixed together.
+/// the current bounds of `pane` and the bounds of the panes that actually border it on each
+/// axis (RC review A5), not an arbitrary other pane of the workspace: a workspace with more than
+/// one split can have a pane whose position or size happens to match `pane`'s on one axis
+/// without truly being part of the same split. The containing split's own total span along the
+/// chosen axis is the union of `pane`'s bounds with every pane that borders it there, which is
+/// exact for a simple split and still correct when that split holds more than two panes, some
+/// themselves split again: the union of touching leaves spans exactly the same extent as their
+/// containing split, however deep its own nesting goes.
 fn resize_amount(
     workspace: &Entity<Workspace>,
     pane: &Entity<Pane>,
@@ -774,16 +804,24 @@ fn resize_amount(
         .filter(|other| *other != pane)
         .filter_map(|other| read.bounding_box_for_pane(other))
         .collect();
-    let sibling = others.first()?;
-    let close = |a: Pixels, b: Pixels| (a - b).abs() < gpui::px(1.);
-    let axis = if close(sibling.origin.y, bounds.origin.y) && close(sibling.size.height, bounds.size.height) {
-        Axis::Horizontal
-    } else {
-        Axis::Vertical
+    let bordering = |axis: Axis| -> Vec<&Bounds<Pixels>> {
+        others.iter().filter(|other| touches(&bounds, other, axis)).collect()
+    };
+    let (axis, siblings) = match bordering(Axis::Horizontal) {
+        siblings if !siblings.is_empty() => (Axis::Horizontal, siblings),
+        _ => {
+            let siblings = bordering(Axis::Vertical);
+            if siblings.is_empty() {
+                // `pane` borders nothing: the only pane in its window, nothing to resize against.
+                return None;
+            }
+            (Axis::Vertical, siblings)
+        }
     };
     let span = |bounds: &Bounds<Pixels>| if axis == Axis::Horizontal { bounds.size.width } else { bounds.size.height };
     let current = span(&bounds);
-    let total = others.iter().fold(current, |total, other| total + span(other));
+    let whole_split = siblings.iter().fold(bounds, |union, sibling| union.union(sibling));
+    let total = span(&whole_split);
     let target = total * (f32::from(size) / 100.);
     Some((axis, target - current))
 }
@@ -1304,6 +1342,49 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.is_some());
         assert_ne!(a, folder_key(&[PathBuf::from("/a")]));
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: gpui::point(gpui::px(x), gpui::px(y)),
+            size: gpui::size(gpui::px(width), gpui::px(height)),
+        }
+    }
+
+    // RC review A5: split A right to make B, then split A down (A keeps the top-left quarter,
+    // a new pane C gets the bottom-left quarter, B keeps the whole right half). Resizing B must
+    // pick the outer, horizontal split it is actually in, not the inner, vertical one that A and
+    // C happen to be split by, just because A's bounds coincidentally line up with B's on one
+    // axis.
+
+    #[test]
+    fn touches_finds_the_real_bordering_panes_not_an_unrelated_one_that_happens_to_align() {
+        let b = rect(100., 0., 100., 200.); // right half, full height
+        let a_top = rect(0., 0., 100., 100.); // top-left quarter
+        let a_bottom = rect(0., 100., 100., 100.); // bottom-left quarter
+
+        // B borders both left-side panes horizontally (they share its left edge), not vertically.
+        assert!(touches(&b, &a_top, Axis::Horizontal));
+        assert!(touches(&b, &a_bottom, Axis::Horizontal));
+        assert!(!touches(&b, &a_top, Axis::Vertical));
+        assert!(!touches(&b, &a_bottom, Axis::Vertical));
+
+        // A_top borders A_bottom vertically (stacked in the inner split), not B: A_top's right
+        // edge touches B's left edge, which is a horizontal border, not a vertical one, even
+        // though A_top and B happen to start at the same y and could be mistaken for a row.
+        assert!(touches(&a_top, &a_bottom, Axis::Vertical));
+        assert!(!touches(&a_top, &a_bottom, Axis::Horizontal));
+    }
+
+    #[test]
+    fn the_union_of_bordering_panes_spans_the_whole_split_even_when_nested() {
+        let b = rect(100., 0., 100., 200.);
+        let a_top = rect(0., 0., 100., 100.);
+        let a_bottom = rect(0., 100., 100., 100.);
+        let whole_split = [&a_top, &a_bottom].iter().fold(b, |union, sibling| union.union(sibling));
+        // The whole window: both halves together, not a's half-height counted on its own.
+        assert_eq!(whole_split.size.width, gpui::px(200.));
+        assert_eq!(whole_split.size.height, gpui::px(200.));
     }
 
     #[test]
