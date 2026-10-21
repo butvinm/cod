@@ -456,6 +456,16 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
             self.keys("enter")
             self.wait_for(lambda state: state["overview"] is None, SHOW_TIMEOUT, "the overview to close")
             self.click_tab(tabs_state, DOC)
+            # The click's own focus settles (DOC-208 was already active) well before PAY-1234's
+            # background load can finish: wait for that settling here, so the watch below only
+            # ever catches PAY-1234's completion stealing the focus, not the click's own transient.
+            self.wait_for(
+                lambda state: state["active_workspace"] == DOC
+                and (state["focus"] or {}).get("kind") == "item"
+                and (state["focus"] or {}).get("tab") == "README.md",
+                SHOW_TIMEOUT,
+                "DOC-208's own focus to settle right after the click",
+            )
 
         with self.step("DOC-208 stays active with README.md still focused while PAY-1234 loads in the background"):
             self.stays(
