@@ -242,8 +242,9 @@ pub fn session_snapshot(
     cx: &mut App,
 ) -> Option<(CodChatStatus, String)> {
     ensure_resident(workspace, session_id, window, cx);
-    if let Some(view) = find_chat(workspace, session_id, cx) {
-        let thread_entity = view.read(cx).root_thread(cx)?;
+    if let Some(view) = find_chat(workspace, session_id, cx)
+        && let Some(thread_entity) = view.read(cx).root_thread(cx)
+    {
         let thread = thread_entity.read(cx);
         let status = CodChatStatus::of_thread(thread);
         let text = if status == CodChatStatus::NeedsInput {
@@ -253,13 +254,18 @@ pub fn session_snapshot(
         };
         return Some((status, text));
     }
-    // The session is owned by the workspace but could not be brought back resident (for example,
-    // its metadata is gone from the `ThreadMetadataStore`). Report it idle rather than unknown.
+    // The session is owned by the workspace but its chat is not fully resident yet: either
+    // `ensure_resident` just started reloading it (connecting to its agent and loading its
+    // session history both resolve asynchronously, never within this same call) or it has no
+    // chat entity at all. Report `Working`, not a terminal `Idle`: `codctl session wait` polls
+    // this repeatedly and must keep going instead of taking this one placeholder snapshot as the
+    // final answer; `codctl session status` shows the chat as busy becoming available rather
+    // than falsely idle.
     let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
     panel
         .read(cx)
         .cod_owns_session(session_id, cx)
-        .then(|| (CodChatStatus::Idle, String::new()))
+        .then(|| (CodChatStatus::Working, String::new()))
 }
 
 /// Whether the workspace has a chat with this session id, for `codctl session status` (#39 AC5,
