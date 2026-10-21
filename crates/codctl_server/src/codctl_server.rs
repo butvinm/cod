@@ -301,18 +301,21 @@ fn same_folder_set(wanted: &[PathBuf], open: &[String]) -> bool {
     wanted.len() == open.len() && wanted.iter().all(|folder| open.contains(folder.as_str()))
 }
 
-/// The live member already open on exactly these folders, if any (#A2).
-fn find_live_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> {
-    members(cx)
+/// The member already open on exactly these folders, if any (#A2): a live one first, else a pending one, a saved tab that is not loaded yet or still loading (RC review A2 remainder). `Workspace::new_local` would restore a pending tab's saved row too, into a second entity with the same id as the tab's own restoration.
+fn find_open_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> {
+    let matching: Vec<Member> = members(cx)
         .into_iter()
-        .find(|member| member.live.is_some() && same_folder_set(folders, &member.folders))
+        .filter(|member| same_folder_set(folders, &member.folders))
+        .collect();
+    let live_index = matching.iter().position(|member| member.live.is_some());
+    matching.into_iter().nth(live_index.unwrap_or(0))
 }
 
 /// Folder sets with a `workspace new` creation in flight (RC review A2), each with every
 /// follower waiting to hear the leader's result instead of racing it. A request runs are all
 /// dispatched to the foreground as their own task (see `serve`), so two concurrent `workspace new
-/// --folder X` calls for the same, not-yet-loaded folder set can both pass
-/// `find_live_with_same_folders` (it only ever finds a *live* workspace) and both reach
+/// --folder X` calls for the same folder set that no tab has open can both pass
+/// `find_open_with_same_folders` (it finds nothing yet) and both reach
 /// `Workspace::new_local`, which restores the same saved database row into two independent
 /// workspace entities that end up sharing one id and persistence. Reserving the folder set here,
 /// before that call starts, makes the second call wait for the first's workspace instead.
@@ -423,12 +426,16 @@ async fn new_workspace_leader(
     focus: bool,
     cx: &mut AsyncApp,
 ) -> Result<Value> {
-    if let Some(existing) = cx.update(|cx| find_live_with_same_folders(canonical, cx)) {
+    if let Some(existing) = cx.update(|cx| find_open_with_same_folders(canonical, cx)) {
         // Zed's own answer to opening a folder that is already open is to focus that window
         // instead of making a second one for it; do the same instead of duplicating the id.
         let id = id_of(&existing)?;
-        let workspace = existing.live.context("the matching workspace is not live")?;
         if focus {
+            // A pending tab is shown the way a tab click shows it, which loads it once.
+            let target = match existing.live {
+                Some(workspace) => CodMember::Live(workspace),
+                None => CodMember::Pending(id),
+            };
             // RC review A4 (final batch): routed through the same activation-intent bump
             // `focus_workspace` uses, instead of calling `activate` directly. A direct `activate`
             // here left this call untracked by `CodActivationIntents`, so a pending member
@@ -437,7 +444,7 @@ async fn new_workspace_leader(
             existing
                 .window
                 .update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.cod_show_member_awaiting(CodMember::Live(workspace), window, cx)
+                    multi_workspace.cod_show_member_awaiting(target, window, cx)
                 })?
                 .await?;
         }
