@@ -662,6 +662,41 @@ class FirstUseWelcomeTest(CodTestCase):
             if "Zed" in welcome:
                 raise AssertionError(f'expected the welcome greeting to never say "Zed", actual {welcome!r}')
 
+    # Issue #77 V1: a fresh profile must show one window throughout, not two.
+
+    def test_ac7_fresh_profile_stays_in_one_window(self) -> None:
+        """"zed: show welcome" (run right after closing onboarding, the normal first-use path)
+        opened a second, mostly-empty window: with_active_or_new_workspace's cx.active_window()
+        did not see the one already-open MultiWorkspace window (the platform had not reported it
+        "active" yet) and fell back to opening a new one instead of reusing it."""
+        with self.step("start Cod with a fresh profile and no folder"):
+            self.start_cod(None)
+            state = self.wait_for(
+                lambda state: state["welcome"] is not None or state["active_tab"] == "Onboarding",
+                SHOW_TIMEOUT,
+                "the welcome page or the onboarding page",
+            )
+            self.expect_equal("one window at the start", 1, len(self.compositor_windows()))
+
+        if state["welcome"] is None:
+            with self.step("close onboarding: still one window"):
+                self.keys("ctrl-w")
+                self.expect_equal("one window after closing onboarding", 1, len(self.compositor_windows()))
+
+            with self.step('"zed: show welcome": still one window'):
+                self.run_command("zed: show welcome")
+                self.wait_for(lambda state: state["welcome"] is not None, SHOW_TIMEOUT, "the welcome page")
+                windows = self.compositor_windows()
+                if len(windows) != 1:
+                    raise AssertionError(
+                        f"expected one Cod window after showing welcome, actual {len(windows)}: {[w['title'] for w in windows]}"
+                    )
+
+        with self.step('"+": still one window'):
+            self.click_add_button(self.state())
+            self.wait_for(lambda state: state["workspace_count"] == 2, SHOW_TIMEOUT, "the second workspace")
+            self.expect_equal("one window after +", 1, len(self.compositor_windows()))
+
 
 if __name__ == "__main__":
     unittest.main()

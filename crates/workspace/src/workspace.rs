@@ -13280,10 +13280,25 @@ pub fn with_active_or_new_workspace(
     cx: &mut App,
     f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + 'static,
 ) {
-    match cx
+    // Cod #77 V1: `cx.active_window()` is the window with keyboard focus, which the platform
+    // does not always report right away (for example right after a command palette entry
+    // closes it and before focus returns to the window behind it; a headless test compositor
+    // with no real keyboard never reports one at all). Falling straight to `open_new` here
+    // opened a second, mostly-empty window the moment a fresh profile's first command (Show
+    // Welcome, closing onboarding) ran before any window had become "active": the newest open
+    // `MultiWorkspace` window is used instead, the same fallback the end-to-end driver already
+    // uses to find the window a command belongs to (crates/cod_e2e_driver/src/
+    // cod_e2e_driver.rs::workspace_window).
+    let multi_workspace = cx
         .active_window()
         .and_then(|w| w.downcast::<MultiWorkspace>())
-    {
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .rev()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        });
+    match multi_workspace {
         Some(multi_workspace) => {
             cx.defer(move |cx| {
                 multi_workspace
