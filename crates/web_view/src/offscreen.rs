@@ -3,7 +3,7 @@
 //! The browser (CEF, in the `cod-browser` helper process, see `browser_client`) renders into memory. Every frame becomes a fresh `RenderImage` that GPUI paints inside the pane like any other image, so the page is part of Cod's own window and works on native Wayland.
 //! Mouse and keyboard events that GPUI delivers to the pane are forwarded to the browser.
 
-use std::{cell::Cell, rc::Rc, sync::Arc};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
 
 use anyhow::Context as _;
 use futures::{StreamExt as _, channel::mpsc};
@@ -849,6 +849,18 @@ fn run_bridge_action(
     }
 }
 
+/// Whether `candidate`'s canonical path sits inside `root`'s canonical path (RC review B6):
+/// resolves symlinks on both sides first, so a symlink entry inside the workspace whose target
+/// escapes it is refused like any other path outside the workspace's folders. Blocking,
+/// filesystem-bound: callers run it on the background executor, never on GPUI's foreground
+/// thread (RC review, final batch).
+fn path_is_contained(candidate: &Path, root: &Path) -> bool {
+    std::fs::canonicalize(candidate)
+        .ok()
+        .zip(std::fs::canonicalize(root).ok())
+        .is_some_and(|(candidate, root)| candidate.starts_with(&root))
+}
+
 /// `data-cod="open-file"` (#43 AC3): opens the path at its 1-based line and column in the editor, only when it resolves inside one of the workspace's own folders (security requirement #7). A path outside them, or a missing workspace, is refused and logged.
 fn open_file_from_page(
     page_id: &PageId,
@@ -870,28 +882,32 @@ fn open_file_from_page(
     // `find_project_path` only checks lexical containment: a symlink entry inside the workspace
     // whose target resolves outside it would otherwise still pass (RC review B6). Canonicalize
     // the actual target and re-check it against the worktree's own canonical root before opening
-    // anything; refuse and log like every other containment failure here.
+    // anything; refuse and log like every other containment failure here. The canonicalize calls
+    // run on the background executor, never here on GPUI's foreground thread (RC review, final
+    // batch): a stalled network mount or automount under the candidate path would otherwise
+    // freeze the whole app for as long as the filesystem call takes, not just this one bridge
+    // call.
     let Some(worktree) = project.read(cx).worktree_for_id(project_path.worktree_id, cx) else {
         log::warn!("web_view: {page_id} refused to open {raw:?}: unknown worktree");
         return;
     };
     let root = worktree.read(cx).abs_path();
     let candidate = root.join(project_path.path.as_std_path());
-    let contained = std::fs::canonicalize(&candidate)
-        .ok()
-        .zip(std::fs::canonicalize(&*root).ok())
-        .is_some_and(|(candidate, root)| candidate.starts_with(&root));
-    if !contained {
-        log::warn!(
-            "web_view: {page_id} refused to open {raw:?}: resolves outside the workspace's folders"
-        );
-        return;
-    }
     // The file opens the way Zed opens a file: in the active pane.
     let page_id = page_id.clone();
     let path_text = path_text.to_owned();
     window
         .spawn(cx, async move |cx| {
+            let contained = cx
+                .background_executor()
+                .spawn(async move { path_is_contained(&candidate, &root) })
+                .await;
+            if !contained {
+                log::warn!(
+                    "web_view: {page_id} refused to open {raw:?}: resolves outside the workspace's folders"
+                );
+                return anyhow::Ok(());
+            }
             let item = workspace
                 .update_in(cx, |workspace, window, cx| {
                     workspace.open_path(project_path, None, true, window, cx)
@@ -986,6 +1002,21 @@ fn persisted_url(
         }
     }
     url.to_owned()
+}
+
+/// What a page tab's row in the pages database should carry for `kind` (RC review B2, final
+/// batch): persisting `PageKind::Agent` once the page has navigated away from its own agent
+/// document would restore it with bridge rights for whatever external address it last showed,
+/// because `OffscreenView::build` grants a fresh page's `agent_document_url` from its restored
+/// `url` whenever `kind` is `Agent`. Once navigated away, persist the page as an ordinary one: an
+/// agent page's bridge is refused for good in this session already (the `agent_navigated_away`
+/// latch), and restoring it as `External` keeps that true across a restart too.
+fn persisted_kind(kind: PageKind, agent_navigated_away: bool) -> PageKind {
+    if kind == PageKind::Agent && agent_navigated_away {
+        PageKind::External
+    } else {
+        kind
+    }
 }
 
 /// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
@@ -1270,7 +1301,9 @@ impl SerializableItem for OffscreenView {
             self.url.as_ref(),
         );
         let title = self.title.as_ref().map(|title| title.to_string());
-        let kind = self.kind.as_str().to_string();
+        let kind = persisted_kind(self.kind, self.agent_navigated_away)
+            .as_str()
+            .to_string();
         Some(cx.background_spawn(async move {
             db.save_page(item_id, workspace_id, page_id, url, title, kind)
                 .await
@@ -1535,10 +1568,51 @@ mod tests {
         assert_eq!(persisted_url(PageKind::Agent, Some(original), true, live), live);
     }
 
+    // RC review B6 / final batch: the containment check itself, independent of where it runs.
+
+    #[test]
+    fn a_path_inside_the_root_is_contained() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("inside.txt");
+        std::fs::write(&file, "hi").unwrap();
+        assert!(path_is_contained(&file, root.path()));
+    }
+
+    #[test]
+    fn a_symlink_escaping_the_root_is_not_contained() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "shh").unwrap();
+        let link = root.path().join("escape.txt");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!path_is_contained(&link, root.path()));
+    }
+
     #[test]
     fn a_non_agent_page_always_persists_its_live_address() {
         let live = "https://example.org/wiki/Home";
         assert_eq!(persisted_url(PageKind::External, None, false, live), live);
+    }
+
+    // RC review B2 (final batch): a restart must not re-grant bridge rights to whatever
+    // external address an agent page last navigated to.
+
+    #[test]
+    fn an_agent_page_navigated_away_is_persisted_as_an_ordinary_page() {
+        assert_eq!(persisted_kind(PageKind::Agent, true), PageKind::External);
+    }
+
+    #[test]
+    fn an_agent_page_still_on_its_own_document_is_persisted_as_agent() {
+        assert_eq!(persisted_kind(PageKind::Agent, false), PageKind::Agent);
+    }
+
+    #[test]
+    fn a_non_agent_page_stays_external_regardless_of_the_navigated_flag() {
+        assert_eq!(persisted_kind(PageKind::External, true), PageKind::External);
+        assert_eq!(persisted_kind(PageKind::External, false), PageKind::External);
     }
 
     // RC review B2 for `--js` pages: a bridge call's console line is only trusted when its
