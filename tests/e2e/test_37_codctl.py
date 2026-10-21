@@ -527,6 +527,46 @@ class CodctlTest(CodStatusFixtures, CodTestCase):
                 loading.returncode,
             )
 
+    def test_a4_new_folder_focus_does_not_lose_to_a_still_loading_pending_tabs_completion(self) -> None:
+        """RC review A4 (final batch): `workspace new --folder <existing> --focus` must bump the
+        window's activation intent exactly as `workspace focus` and a tab click do, not call
+        `activate` directly. Make billing-web live, start loading pending docs-site in the
+        background, then `workspace new --folder <billing-web> --focus` while docs-site is still
+        loading; its completion must not switch away from billing-web afterwards."""
+        with self.step("save a session with billing-api active, billing-web and docs-site added, then restart so both are pending"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            docs = self.make_work_repo("docs-site", DOCS_SITE)
+            self.start_cod(api, persistent=True)
+            self.wait_for_codctl()
+            web_id = self.new_workspace("--folder", str(web))
+            docs_id = self.new_workspace("--folder", str(docs))
+            self.wait_for_window({"names": [None, None, None], "folders": [[real(api)], [real(web)], [real(docs)]], "active": 0})
+            self.restart_cod()
+            self.wait_for(lambda state: state["workspace_count"] == 3, RESTORE_TIMEOUT, "all three workspaces to come back")
+
+        with self.step("load billing-web fully, leaving docs-site pending"):
+            self.expect_result(self.codctl.run("workspace", "focus", str(web_id)), 0, stdout="", stderr="")
+            self.wait_for_window({"names": [None, None, None], "folders": [[real(api)], [real(web)], [real(docs)]], "active": 1})
+            pending = next(workspace for workspace in self.list_json() if workspace["id"] == docs_id)
+            self.expect_equal("docs-site is still pending", False, pending["loaded"])
+
+        with self.step("start loading docs-site without waiting, then refocus billing-web with workspace new --folder --focus"):
+            loading = self.codctl.start("workspace", "focus", str(docs_id))
+            self.addCleanup(lambda: loading.poll() is None and loading.kill())
+            refocus_result = self.codctl.run("workspace", "new", "--folder", str(web), "--focus")
+            self.expect_result(refocus_result, 0, stdout=f"{web_id}\n", stderr="")
+            self.wait_for_window({"names": [None, None, None], "folders": [[real(api)], [real(web)], [real(docs)]], "active": 1})
+
+        with self.step("billing-web stays shown even once docs-site finishes loading in the background"):
+            self.expect_window_stays({"names": [None, None, None], "folders": [[real(api)], [real(web)], [real(docs)]], "active": 1})
+            loading_out, loading_err = loading.communicate(timeout=COMMAND_TIMEOUT)
+            self.expect_equal(
+                f"the background focus on docs-site itself still succeeded (stderr {loading_err!r})",
+                0,
+                loading.returncode,
+            )
+
     def test_ac4_rename(self) -> None:
         with self.step("create the fixture repos billing-api and billing-web"):
             api = self.make_work_repo("billing-api", BILLING_API)
