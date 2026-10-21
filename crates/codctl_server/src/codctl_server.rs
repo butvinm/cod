@@ -419,9 +419,17 @@ async fn new_workspace_leader(
         let id = id_of(&existing)?;
         let workspace = existing.live.context("the matching workspace is not live")?;
         if focus {
-            existing.window.update(cx, |multi_workspace, window, cx| {
-                multi_workspace.activate(workspace, None, window, cx)
-            })?;
+            // RC review A4 (final batch): routed through the same activation-intent bump
+            // `focus_workspace` uses, instead of calling `activate` directly. A direct `activate`
+            // here left this call untracked by `CodActivationIntents`, so a pending member
+            // finishing its load elsewhere, racing this call, could still switch the window away
+            // from the folder this call just asked to focus.
+            existing
+                .window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.cod_show_member_awaiting(CodMember::Live(workspace), window, cx)
+                })?
+                .await?;
         }
         return Ok(json!({ "id": i64::from(id), "already_open": true }));
     }
@@ -792,15 +800,42 @@ fn touches(bounds: &Bounds<Pixels>, other: &Bounds<Pixels>, axis: Axis) -> bool 
     }
 }
 
+/// The full bounds of the split containing `bounds`, from `bounds` and every other pane in the
+/// workspace, following the touching chain transitively (RC review A5, final batch): a pane's
+/// *direct* neighbors are not enough once a split holds more than two panes, because the pane at
+/// one end of, say, a three-way row does not itself touch the pane at the other end, only the
+/// one in the middle. Starting from `bounds` and repeatedly folding in any remaining pane that
+/// touches the union built so far converges on the same full span regardless of how many panes
+/// the split holds or how deep any of them is split again on the other axis.
+fn split_span(bounds: Bounds<Pixels>, others: &[Bounds<Pixels>], axis: Axis) -> Bounds<Pixels> {
+    let mut union = bounds;
+    let mut remaining: Vec<&Bounds<Pixels>> = others.iter().collect();
+    loop {
+        let mut grew = false;
+        remaining.retain(|candidate| {
+            if touches(&union, candidate, axis) {
+                union = union.union(candidate);
+                grew = true;
+                false
+            } else {
+                true
+            }
+        });
+        if !grew {
+            break;
+        }
+    }
+    union
+}
+
 /// The axis and pixel delta that would set `pane`'s share of its split to `size` percent, from
 /// the current bounds of `pane` and the bounds of the panes that actually border it on each
 /// axis (RC review A5), not an arbitrary other pane of the workspace: a workspace with more than
 /// one split can have a pane whose position or size happens to match `pane`'s on one axis
 /// without truly being part of the same split. The containing split's own total span along the
-/// chosen axis is the union of `pane`'s bounds with every pane that borders it there, which is
-/// exact for a simple split and still correct when that split holds more than two panes, some
-/// themselves split again: the union of touching leaves spans exactly the same extent as their
-/// containing split, however deep its own nesting goes.
+/// chosen axis comes from `split_span`, which follows the touching chain transitively so a
+/// split holding more than two panes still gets its whole span, not just `pane` unioned with its
+/// immediate neighbors.
 fn resize_amount(
     workspace: &Entity<Workspace>,
     pane: &Entity<Pane>,
@@ -815,23 +850,17 @@ fn resize_amount(
         .filter(|other| *other != pane)
         .filter_map(|other| read.bounding_box_for_pane(other))
         .collect();
-    let bordering = |axis: Axis| -> Vec<&Bounds<Pixels>> {
-        others.iter().filter(|other| touches(&bounds, other, axis)).collect()
-    };
-    let (axis, siblings) = match bordering(Axis::Horizontal) {
-        siblings if !siblings.is_empty() => (Axis::Horizontal, siblings),
-        _ => {
-            let siblings = bordering(Axis::Vertical);
-            if siblings.is_empty() {
-                // `pane` borders nothing: the only pane in its window, nothing to resize against.
-                return None;
-            }
-            (Axis::Vertical, siblings)
-        }
+    let axis = if others.iter().any(|other| touches(&bounds, other, Axis::Horizontal)) {
+        Axis::Horizontal
+    } else if others.iter().any(|other| touches(&bounds, other, Axis::Vertical)) {
+        Axis::Vertical
+    } else {
+        // `pane` borders nothing: the only pane in its window, nothing to resize against.
+        return None;
     };
     let span = |bounds: &Bounds<Pixels>| if axis == Axis::Horizontal { bounds.size.width } else { bounds.size.height };
     let current = span(&bounds);
-    let whole_split = siblings.iter().fold(bounds, |union, sibling| union.union(sibling));
+    let whole_split = split_span(bounds, &others, axis);
     let total = span(&whole_split);
     let target = total * (f32::from(size) / 100.);
     Some((axis, target - current))
@@ -1216,36 +1245,31 @@ mod socket {
     }
 
     /// Whether the peer has closed its end of `watch` (RC review A6), checked without
-    /// disturbing any other descriptor of the same connection: `watch` is its own clone, the
-    /// nonblocking flag it sets is restored before this returns, and the single thread that owns
-    /// every descriptor of this connection never has another one in a blocking read at the same
-    /// time (it is either blocked in `reader.lines()` or in here, never both).
+    /// disturbing any other descriptor of the same connection: `watch` is its own clone and this
+    /// never reads or writes anything on it.
+    ///
+    /// This used to peek one byte with `MSG_PEEK` and call a disconnect only a `0`-byte read: a
+    /// client that disconnected after pipelining more bytes than `reader.lines()` had consumed
+    /// yet left those bytes sitting in the socket's buffer, so the peek kept returning them
+    /// (`n > 0`) and never saw the disconnect at all (RC review, final batch). `poll` with
+    /// `POLLRDHUP` reports the peer's half-close directly, independent of whether its buffer
+    /// still holds unread bytes, so this checks that instead of trying to infer it from a read.
     fn client_disconnected(watch: &UnixStream) -> Result<bool> {
         use std::os::fd::AsRawFd as _;
 
-        watch.set_nonblocking(true).context("cannot poll the client connection")?;
-        let mut probe = [0u8; 1];
-        // A non-destructive read (MSG_PEEK): the std `peek` method is not stable on this
-        // toolchain, and a plain `read` would consume a byte `reader.lines()` still needs.
-        // SAFETY: `probe` is a valid one-byte buffer for the call's duration; `recv` writes at
-        // most that many bytes and MSG_PEEK never removes anything from the socket's buffer.
-        let read = unsafe {
-            libc::recv(watch.as_raw_fd(), probe.as_mut_ptr().cast(), probe.len(), libc::MSG_PEEK)
-        };
-        let result = match read {
-            0 => Ok(true),
-            n if n > 0 => Ok(false),
-            _ => {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    Ok(false)
-                } else {
-                    Err(error).context("cannot poll the client connection")
-                }
-            }
-        };
-        watch.set_nonblocking(false).context("cannot restore the client connection")?;
-        result
+        let mut fds = [libc::pollfd {
+            fd: watch.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        }];
+        // SAFETY: `fds` has exactly one valid `pollfd` for the call's duration; a zero timeout
+        // makes this an immediate, non-blocking check, never actually waiting.
+        let polled = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
+        if polled < 0 {
+            return Err(io::Error::last_os_error()).context("cannot poll the client connection");
+        }
+        let revents = fds[0].revents;
+        Ok(revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0)
     }
 
     /// Waits for the job's reply, giving up (RC review A6) once `watch` shows the client is
@@ -1262,9 +1286,20 @@ mod socket {
                 Ok(result) => return Ok(result),
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the codctl server stopped"),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if client_disconnected(watch)? {
-                        cancel.store(true, Ordering::Release);
-                        bail!("the client disconnected before the reply was ready");
+                    // RC review A6 (final batch): a poll error leaves this unable to tell
+                    // whether the client is still there either, so it stops waiting and tells
+                    // the foreground task to stop too, the same as an actual disconnect, rather
+                    // than returning an error here while leaving that task polling forever.
+                    match client_disconnected(watch) {
+                        Ok(true) => {
+                            cancel.store(true, Ordering::Release);
+                            bail!("the client disconnected before the reply was ready");
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            cancel.store(true, Ordering::Release);
+                            return Err(error);
+                        }
                     }
                 }
             }
@@ -1336,6 +1371,21 @@ mod socket {
         #[test]
         fn client_disconnected_is_true_once_the_peer_drops_its_end() {
             let (watch, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            assert!(client_disconnected(&watch).unwrap());
+        }
+
+        #[test]
+        fn client_disconnected_is_true_even_with_unread_pipelined_bytes_still_buffered() {
+            // RC review A6, final batch: a client that pipelines a request and then
+            // disconnects before this side's `reader.lines()` has consumed it all leaves those
+            // bytes sitting in the socket's receive buffer. A plain `MSG_PEEK` read of them kept
+            // reporting "still connected" (n > 0) forever; `POLLRDHUP` must see the peer's
+            // half-close regardless of what is still buffered to read.
+            use std::io::Write as _;
+
+            let (watch, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(b"more than this side will ever read\n").unwrap();
             drop(peer);
             assert!(client_disconnected(&watch).unwrap());
         }
@@ -1497,6 +1547,34 @@ mod tests {
         // The whole window: both halves together, not a's half-height counted on its own.
         assert_eq!(whole_split.size.width, gpui::px(200.));
         assert_eq!(whole_split.size.height, gpui::px(200.));
+    }
+
+    #[test]
+    fn split_span_spans_the_whole_row_for_three_equal_panes_not_just_two_of_them() {
+        // RC review A5, final batch: left does not directly touch right, only middle does.
+        // The containing split's full span must still come out as all three thirds together.
+        let left = rect(0., 0., 100., 100.);
+        let middle = rect(100., 0., 100., 100.);
+        let right = rect(200., 0., 100., 100.);
+        let others = [middle, right];
+        let whole_split = split_span(left, &others, Axis::Horizontal);
+        assert_eq!(whole_split.size.width, gpui::px(300.));
+        assert_eq!(whole_split.origin.x, gpui::px(0.));
+    }
+
+    #[test]
+    fn resizing_the_left_pane_of_three_equal_panes_targets_a_percent_of_the_whole_row() {
+        // RC review A5, final batch: resizing the left pane to 70% must compute 70% of the
+        // real three-pane row (300px), not 70% of left+middle only (200px), which used to give
+        // 46.7% of the real split instead of the requested 70%.
+        let left = rect(0., 0., 100., 100.);
+        let middle = rect(100., 0., 100., 100.);
+        let right = rect(200., 0., 100., 100.);
+        let whole_split = split_span(left, &[middle, right], Axis::Horizontal);
+        let target = whole_split.size.width * (70. / 100.);
+        assert_eq!(target, gpui::px(210.));
+        let delta = target - left.size.width;
+        assert_eq!(delta, gpui::px(110.));
     }
 
     #[test]
