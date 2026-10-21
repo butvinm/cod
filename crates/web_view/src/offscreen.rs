@@ -520,6 +520,24 @@ impl OffscreenView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if call.name == protocol::BRIDGE_OVERSIZED_ACTION {
+            // RC review B5: the engine already gave this bridge call far more room than an
+            // ordinary diagnostic (`protocol::MAX_BRIDGE_BYTES`); still over that, it sent this
+            // sentinel instead of truncated, invalid JSON. Close the page so `codctl open --html
+            // --wait` gets the already-defined "closed without submitting" outcome, instead of
+            // waiting forever on a value it will never receive.
+            log::warn!(
+                "web_view: {} submitted a value too large for the bridge to carry; closing the page instead of leaving codctl waiting",
+                self.page_id
+            );
+            let page_id = self.page_id.clone();
+            window.defer(cx, move |window, cx| {
+                if !pages::close(&page_id, window, cx) {
+                    crate::agent_bridge::closed(&page_id, cx);
+                }
+            });
+            return;
+        }
         if !crate::agent_bridge::is_allowed(&call.name) {
             log::warn!(
                 "web_view: {} refused the action {:?}: not in the bridge allowlist",
@@ -916,6 +934,28 @@ fn focus_session_from_page(
     }
 }
 
+/// What a page tab's row in the pages database should carry for `url` (RC review B3): for an
+/// agent page still showing the document it was built from, the complete, original `data:` URL
+/// (`agent_document_url`), never the main frame's reported address, which the engine truncates to
+/// `protocol::MAX_URL_BYTES` (RC review #1) for every page over about 6 KiB. A restart that
+/// restores a truncated address gets invalid base64 and a broken or missing document; restoring
+/// the original URL loads exactly what was shown before. Once the page has navigated away from
+/// its own agent document (RC review B2's latch), the live address is what the tab actually shows
+/// and is persisted as before, truncation and all, like any other page.
+fn persisted_url(
+    kind: PageKind,
+    agent_document_url: Option<&str>,
+    agent_navigated_away: bool,
+    url: &str,
+) -> String {
+    if kind == PageKind::Agent && !agent_navigated_away {
+        if let Some(agent_url) = agent_document_url {
+            return agent_url.to_owned();
+        }
+    }
+    url.to_owned()
+}
+
 /// The page's context line for the overview (#26): its host and path, for example `tracker.example.com/PAY-1234`. Falls back to the raw URL when it does not parse.
 fn page_context(url: &str) -> String {
     match url::Url::parse(url) {
@@ -1191,7 +1231,12 @@ impl SerializableItem for OffscreenView {
         let workspace_id = workspace.database_id()?;
         let db = CodPagesDb::global(cx);
         let page_id = self.page_id.to_string();
-        let url = self.url.to_string();
+        let url = persisted_url(
+            self.kind,
+            self.agent_document_url.as_deref(),
+            self.agent_navigated_away,
+            self.url.as_ref(),
+        );
         let title = self.title.as_ref().map(|title| title.to_string());
         let kind = self.kind.as_str().to_string();
         Some(cx.background_spawn(async move {
@@ -1435,6 +1480,33 @@ mod tests {
             key: key.into(),
             key_char: None,
         }
+    }
+
+    // RC review B3: an agent page over about 6 KiB must persist its complete, original document,
+    // never the main frame's reported address, which the engine truncates.
+
+    #[test]
+    fn an_agent_page_still_showing_its_own_document_persists_the_original_url_not_the_truncated_address() {
+        let original = format!("data:text/html;base64,{}", "A".repeat(20_000));
+        let truncated = protocol::limited(&original, protocol::MAX_URL_BYTES);
+        assert_ne!(truncated.len(), original.len(), "the fixture must actually get truncated");
+        assert_eq!(
+            persisted_url(PageKind::Agent, Some(&original), false, &truncated),
+            original
+        );
+    }
+
+    #[test]
+    fn an_agent_page_navigated_away_persists_its_live_address_like_any_other_page() {
+        let original = "data:text/html;base64,AAAA";
+        let live = "https://example.org/elsewhere";
+        assert_eq!(persisted_url(PageKind::Agent, Some(original), true, live), live);
+    }
+
+    #[test]
+    fn a_non_agent_page_always_persists_its_live_address() {
+        let live = "https://example.org/wiki/Home";
+        assert_eq!(persisted_url(PageKind::External, None, false, live), live);
     }
 
     #[test]
