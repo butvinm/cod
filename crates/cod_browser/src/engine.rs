@@ -27,6 +27,14 @@ static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 
 use protocol::{MAX_URL_BYTES, limited};
 
+/// Whether a console line is forwarded even once the pending-console backlog is already at
+/// `MAX_PENDING_CONSOLE` (RC review B5, final batch): a bridge call (`BRIDGE_PREFIX`) always is;
+/// an ordinary diagnostic only while the backlog still has room. See `on_console_message` for
+/// why a bridge call must never be the one this backpressure drops.
+fn forward_despite_backlog(text: &str, pending: usize) -> bool {
+    text.starts_with(protocol::BRIDGE_PREFIX) || pending < MAX_PENDING_CONSOLE
+}
+
 enum Outgoing {
     Message(FromBrowser),
     /// A newer frame of this page is waiting in its slot.
@@ -268,11 +276,22 @@ wrap_display_handler! {
             let state = &self.handler.state;
             // Diagnostics are best effort: a page that logs in a loop must not grow the queue or crowd out frames.
             let Some(message) = message else { return 0 };
-            if PENDING_CONSOLE.fetch_add(1, Ordering::AcqRel) < MAX_PENDING_CONSOLE {
+            let text = message.to_string();
+            // RC review B5 (final batch): a bridge call (`BRIDGE_PREFIX`) must always cross,
+            // however full this queue already is with ordinary console spam, or a submit that
+            // lands in the same burst can be dropped here and leave `codctl open --html --wait`
+            // hanging forever for a reply nobody sent. Only ordinary diagnostics stay best
+            // effort and may be dropped to keep the queue from growing without bound and
+            // crowding out frames; the residual risk is a page able to run its own `console.log`
+            // (only `--js` pages, and only from a frame this exemption does not itself
+            // distinguish from the main document) flooding with forged `BRIDGE_PREFIX` lines,
+            // which Cod's side still refuses once it checks the actual sender and action.
+            let pending = PENDING_CONSOLE.fetch_add(1, Ordering::AcqRel);
+            if forward_despite_backlog(&text, pending) {
                 // A bridge call (RC review B5) keeps a far larger limit than ordinary console
                 // output, and one that still does not fit becomes a clear sentinel instead of
                 // truncated, invalid JSON that `codctl open --html --wait` would never answer.
-                let message = protocol::console_payload(&message.to_string(), MAX_CONSOLE_BYTES);
+                let message = protocol::console_payload(&text, MAX_CONSOLE_BYTES);
                 // The document CEF attributes this line to (RC review B2 for `--js` pages): a
                 // subframe's own address, distinct from the main document's, so Cod's side can
                 // refuse a bridge call that did not come from the page it actually built.
@@ -734,5 +753,28 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
                 _ => handle.0.reload(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RC review B5, final batch: a bridge call sharing this backpressure with ordinary page
+    // console spam must never be the one it drops, or a submit landing in the same burst as a
+    // flood of console output leaves `codctl open --html --wait` hanging for a reply nobody
+    // sent.
+
+    #[test]
+    fn a_bridge_call_is_forwarded_even_once_the_backlog_is_completely_full() {
+        let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
+        assert!(forward_despite_backlog(&line, MAX_PENDING_CONSOLE));
+        assert!(forward_despite_backlog(&line, MAX_PENDING_CONSOLE * 4));
+    }
+
+    #[test]
+    fn an_ordinary_console_line_is_dropped_once_the_backlog_is_full() {
+        assert!(forward_despite_backlog("just a log line", MAX_PENDING_CONSOLE - 1));
+        assert!(!forward_despite_backlog("just a log line", MAX_PENDING_CONSOLE));
     }
 }

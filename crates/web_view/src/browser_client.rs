@@ -49,6 +49,13 @@ pub(crate) enum PageEvent {
 /// Console messages kept per page between two looks by the UI; later ones are counted and dropped.
 const MAX_PENDING_CONSOLE: usize = 64;
 
+/// Whether a console line is kept even once `current_len` has already reached
+/// `MAX_PENDING_CONSOLE` (RC review B5, final batch): a bridge call (`BRIDGE_PREFIX`) always is;
+/// an ordinary diagnostic only while the backlog still has room.
+fn keep_despite_backlog(message: &str, current_len: usize) -> bool {
+    message.starts_with(protocol::BRIDGE_PREFIX) || current_len < MAX_PENDING_CONSOLE
+}
+
 /// What the page reported since the UI last looked. Title, address and loading state keep only the latest value, console output is capped, so a busy UI never accumulates an unbounded backlog.
 #[derive(Default)]
 pub(crate) struct Diagnostics {
@@ -377,8 +384,14 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
             }
             FromBrowser::Console { page, message, source } => {
                 if let Some(slot) = slot(page) {
+                    // RC review B5 (final batch): a bridge call (`cod:bridge:...`) must still
+                    // reach `OffscreenView::handle_event` even once an unrelated flood of
+                    // ordinary page console output has filled this queue, or a busy UI reading
+                    // it late could drop the one line `codctl open --html --wait` is waiting
+                    // for. Only ordinary diagnostics are best effort and capped; a bridge call
+                    // always gets pushed.
                     slot.record(|diagnostics| {
-                        if diagnostics.console.len() < MAX_PENDING_CONSOLE {
+                        if keep_despite_backlog(&message, diagnostics.console.len()) {
                             diagnostics.console.push(ConsoleLine { message, source });
                         } else {
                             diagnostics.dropped_console += 1;
@@ -660,5 +673,27 @@ impl Page {
     /// Asks the helper to close the view. `PageEvent::Closed` follows when it is gone.
     pub fn close(&self) {
         self.client.send(&ToBrowser::Close { page: self.id });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // RC review B5, final batch: a bridge call sharing this backlog with ordinary page
+    // console spam must never be the one it drops here either, or the engine's own exemption
+    // for the same reason is undone again on Cod's side of the wire.
+
+    #[test]
+    fn a_bridge_call_is_kept_even_once_the_backlog_is_completely_full() {
+        let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
+        assert!(keep_despite_backlog(&line, MAX_PENDING_CONSOLE));
+        assert!(keep_despite_backlog(&line, MAX_PENDING_CONSOLE * 4));
+    }
+
+    #[test]
+    fn an_ordinary_console_line_is_dropped_once_the_backlog_is_full() {
+        assert!(keep_despite_backlog("just a log line", MAX_PENDING_CONSOLE - 1));
+        assert!(!keep_despite_backlog("just a log line", MAX_PENDING_CONSOLE));
     }
 }
