@@ -205,13 +205,17 @@ pub fn render_cod_workspace_tabs(
         // against the room it got, to report whether the name was cut.
         let rest_text: SharedString = rest.to_string().into();
         let measured_layout = layout.clone();
-        // #77 F1: no `min_w_0` here. Only the label div below needs it (to let its own text
-        // shrink and ellipsize); giving it to every ancestor too told the layout this whole
-        // group could shrink arbitrarily, and it measured its natural (max-content) width as
-        // far smaller than "New workspace" actually needs, even with the title bar mostly
-        // empty. `tab` below keeps its own `min_w_0` (with `max_w`): that is the level meant to
-        // shrink, only once the row truly runs out of room.
+        // #77 F1: `content` keeps its own `min_w_0`: once `tab` below is capped at
+        // COD_TAB_MAX_WIDTH, `content` (and inside it, the label) must still be able to shrink
+        // to that width, or the label reports its full, unclipped natural width as the "room" it
+        // got and `cut` below never becomes true for a name that really is too long. What must
+        // NOT have `min_w_0` is the tabs *row* and the left group that holds it
+        // (`title_bar.rs`): those feed the title bar's outer three-group layout, and having
+        // `min_w_0` there made that outer layout measure their natural (max-content) width as
+        // far smaller than the tab labels actually need, cutting even short names like "New
+        // workspace" with most of the title bar still empty.
         let content = h_flex()
+            .min_w_0()
             .gap_1()
             .children(status_dot(status, index, &layout))
             .when_some(id, |content, id| {
@@ -263,17 +267,25 @@ pub fn render_cod_workspace_tabs(
             CodMember::Live(workspace) => {
                 let workspace = workspace.clone();
                 let weak = weak.clone();
+                let button = IconButton::new(("cod-workspace-tab-close", index), IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip(Tooltip::text("Close Workspace"))
+                    .when(!is_active, |button| button.visible_on_hover(""))
+                    .on_click(move |_, window, cx| {
+                        weak.update(cx, |multi_workspace, cx| {
+                            multi_workspace.cod_close_live_workspace(workspace.clone(), window, cx)
+                        })
+                        .ok();
+                    });
+                // `IconButton`'s own click only stops propagation from inside its synthesized
+                // "click" (after a matching down and up), which runs after the tab's own
+                // `on_mouse_down`/`on_mouse_up` already saw the raw events and selected the tab
+                // underneath it; stopping the mouse down here (the same pattern title_bar.rs
+                // already uses for its own button groups) keeps it from doing that.
                 Some(
-                    IconButton::new(("cod-workspace-tab-close", index), IconName::Close)
-                        .icon_size(IconSize::XSmall)
-                        .tooltip(Tooltip::text("Close Workspace"))
-                        .when(!is_active, |button| button.visible_on_hover(""))
-                        .on_click(move |_, window, cx| {
-                            weak.update(cx, |multi_workspace, cx| {
-                                multi_workspace.cod_close_live_workspace(workspace.clone(), window, cx)
-                            })
-                            .ok();
-                        }),
+                    div()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(button),
                 )
             }
             CodMember::Pending(_) => None,
