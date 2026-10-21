@@ -273,6 +273,41 @@ class CodctlTest(CodTestCase):
             listed_ids = [workspace["id"] for workspace in self.list_json()]
             self.expect_equal("still exactly two workspaces, no duplicate id", sorted([first, api_id]), sorted(listed_ids))
 
+    def test_a2_concurrent_new_on_a_pending_saved_folder_returns_one_id(self) -> None:
+        """RC review A2 (race): two concurrent `workspace new --folder X` calls for a folder set
+        that is saved but not loaded yet must not both pass the live-workspace check and restore
+        the same database row into two independent workspace entities."""
+        with self.step("create the fixture repos billing-api and billing-web, and save a session with both"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            self.start_cod(api, persistent=True)
+            self.wait_for_codctl()
+            web_id = self.new_workspace("--folder", str(web))
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+
+        with self.step("restart Cod so billing-web is saved but not loaded yet"):
+            self.restart_cod()
+            self.wait_for(lambda state: state["workspace_count"] == 2, RESTORE_TIMEOUT, "both workspaces to come back")
+            before_ids = sorted(workspace["id"] for workspace in self.list_json())
+            pending = next(workspace for workspace in self.list_json() if workspace["id"] == web_id)
+            self.expect_equal("billing-web is pending, not loaded, right after the restart", False, pending["loaded"])
+
+        with self.step("fire two concurrent workspace new --folder billing-web calls"):
+            first = self.codctl.start("workspace", "new", "--folder", str(web))
+            second = self.codctl.start("workspace", "new", "--folder", str(web))
+            first_out, first_err = first.communicate(timeout=COMMAND_TIMEOUT)
+            second_out, second_err = second.communicate(timeout=COMMAND_TIMEOUT)
+            self.expect_equal(f"first call exit code (stderr {first_err!r})", 0, first.returncode)
+            self.expect_equal(f"second call exit code (stderr {second_err!r})", 0, second.returncode)
+            first_id = int(first_out.strip())
+            second_id = int(second_out.strip())
+            self.expect_equal("first concurrent call returns billing-web's existing id", web_id, first_id)
+            self.expect_equal("second concurrent call returns the same id as the first, not a new one", first_id, second_id)
+
+        with self.step("still exactly two workspaces, no duplicate id, after both calls"):
+            listed_ids = sorted(workspace["id"] for workspace in self.list_json())
+            self.expect_equal("still exactly two workspaces total, no duplicate id", before_ids, listed_ids)
+
     # AC3
 
     def test_ac3_list_text_and_json(self) -> None:

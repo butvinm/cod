@@ -18,7 +18,9 @@ use codctl::Request;
 use editor::Editor;
 use git_ui::commit_view::CommitView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Axis, Bounds, Entity, EntityId, Focusable as _, Pixels, WindowHandle};
+use gpui::{
+    App, AsyncApp, Axis, Bounds, Entity, EntityId, Focusable as _, Global, Pixels, WindowHandle,
+};
 use serde_json::{Value, json};
 use workspace::{
     CodMember, CodStatus, CodStatusStore, MultiWorkspace, OpenMode, OpenOptions, OpenVisible,
@@ -295,6 +297,69 @@ fn find_live_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> 
         .find(|member| member.live.is_some() && same_folder_set(folders, &member.folders))
 }
 
+/// Folder sets with a `workspace new` creation in flight (RC review A2), each with every
+/// follower waiting to hear the leader's result instead of racing it. A request runs are all
+/// dispatched to the foreground as their own task (see `serve`), so two concurrent `workspace new
+/// --folder X` calls for the same, not-yet-loaded folder set can both pass
+/// `find_live_with_same_folders` (it only ever finds a *live* workspace) and both reach
+/// `Workspace::new_local`, which restores the same saved database row into two independent
+/// workspace entities that end up sharing one id and persistence. Reserving the folder set here,
+/// before that call starts, makes the second call wait for the first's workspace instead.
+#[derive(Default)]
+struct PendingCreations(std::collections::HashMap<std::collections::BTreeSet<String>, Vec<FollowerSender>>);
+
+type FollowerSender = futures::channel::oneshot::Sender<Result<Value, String>>;
+
+impl Global for PendingCreations {}
+
+/// The non-empty folder set `workspace new` was asked for, as the key `PendingCreations` and
+/// `same_folder_set` both use: never reserved for an empty request (`--focus` alone), which must
+/// always make its own, independent workspace, same as `same_folder_set` never matches it to an
+/// existing one.
+fn folder_key(folders: &[PathBuf]) -> Option<std::collections::BTreeSet<String>> {
+    if folders.is_empty() {
+        return None;
+    }
+    Some(folders.iter().map(|path| path.to_string_lossy().into_owned()).collect())
+}
+
+/// Reserves `key` for this call (the leader), or registers to hear the leader's result (a
+/// follower), without ever running two `Workspace::new_local` calls for the same folder set at
+/// once (RC review A2).
+enum Reservation {
+    Lead,
+    Follow(futures::channel::oneshot::Receiver<Result<Value, String>>),
+}
+
+fn reserve_or_follow(key: &std::collections::BTreeSet<String>, cx: &mut App) -> Reservation {
+    let pending = cx.default_global::<PendingCreations>();
+    match pending.0.get_mut(key) {
+        Some(followers) => {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            followers.push(sender);
+            Reservation::Follow(receiver)
+        }
+        None => {
+            pending.0.insert(key.clone(), Vec::new());
+            Reservation::Lead
+        }
+    }
+}
+
+/// Releases `key` and answers every follower that queued up while this call (the leader) ran
+/// (RC review A2): the same result, success or failure, that the leader itself got.
+fn release_and_notify(key: &std::collections::BTreeSet<String>, result: &Result<Value>, cx: &mut App) {
+    let followers = cx
+        .default_global::<PendingCreations>()
+        .0
+        .remove(key)
+        .unwrap_or_default();
+    let for_followers = result.as_ref().map(Value::clone).map_err(|error| format!("{error:#}"));
+    for sender in followers {
+        sender.send(for_followers.clone()).ok();
+    }
+}
+
 async fn new_workspace(
     name: Option<String>,
     folders: Vec<PathBuf>,
@@ -309,7 +374,35 @@ async fn new_workspace(
         .iter()
         .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect();
-    if let Some(existing) = cx.update(|cx| find_live_with_same_folders(&canonical, cx)) {
+    let key = folder_key(&canonical);
+    if let Some(key) = &key {
+        match cx.update(|cx| reserve_or_follow(key, cx))? {
+            Reservation::Lead => {}
+            Reservation::Follow(receiver) => {
+                return receiver
+                    .await
+                    .context("the workspace creation this call was waiting for never answered")?
+                    .map_err(|error| anyhow!(error));
+            }
+        }
+    }
+    let result = new_workspace_leader(name, folders, &canonical, focus, cx).await;
+    if let Some(key) = &key {
+        cx.update(|cx| release_and_notify(key, &result, cx)).ok();
+    }
+    result
+}
+
+/// The actual creation, run by whichever call reserved the folder set (or by any call for an
+/// empty one, which is never reserved). See `new_workspace` for the concurrency guard around it.
+async fn new_workspace_leader(
+    name: Option<String>,
+    folders: Vec<PathBuf>,
+    canonical: &[PathBuf],
+    focus: bool,
+    cx: &mut AsyncApp,
+) -> Result<Value> {
+    if let Some(existing) = cx.update(|cx| find_live_with_same_folders(canonical, cx)) {
         // Zed's own answer to opening a folder that is already open is to focus that window
         // instead of making a second one for it; do the same instead of duplicating the id.
         let id = id_of(&existing)?;
@@ -1198,6 +1291,20 @@ mod tests {
         };
         assert_eq!(check_folders(&present), Ok(()));
         assert_eq!(check_folders(&Request::WorkspaceList), Ok(()));
+    }
+
+    #[test]
+    fn folder_key_is_none_for_an_empty_request_and_order_independent_otherwise() {
+        // RC review A2: the key two concurrent `workspace new --folder` calls for the same
+        // folder set share, so the second one waits for the first instead of racing it; a call
+        // with no folders must never be reserved, so two of those still each make their own
+        // workspace.
+        assert_eq!(folder_key(&[]), None);
+        let a = folder_key(&[PathBuf::from("/a"), PathBuf::from("/b")]);
+        let b = folder_key(&[PathBuf::from("/b"), PathBuf::from("/a")]);
+        assert_eq!(a, b);
+        assert!(a.is_some());
+        assert_ne!(a, folder_key(&[PathBuf::from("/a")]));
     }
 
     #[test]
