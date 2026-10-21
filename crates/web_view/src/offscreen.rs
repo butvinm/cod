@@ -1317,12 +1317,16 @@ impl SerializableItem for OffscreenView {
             cx.update(|window, cx| {
                 let kind = PageKind::parse(&saved.kind);
                 // An agent page saved before bridge tokens existed comes back in the current form,
-                // or its bridge would refuse every call.
+                // or its bridge would refuse every call; unless the upgrade no longer fits in the
+                // helper's Create message, where the page keeps loading as saved.
                 let url = match kind {
                     PageKind::Agent => crate::agent_bridge::upgrade_legacy_document(
                         &saved.url,
                         &crate::agent_bridge::current_theme_vars(cx),
                     )
+                    .filter(|upgraded| {
+                        crate::browser_client::protocol::create_message_fits(upgraded.len())
+                    })
                     .unwrap_or(saved.url),
                     _ => saved.url,
                 };
