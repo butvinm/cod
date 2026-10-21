@@ -280,7 +280,17 @@ pub fn render_cod_workspace_tabs(
         };
         let has_close = close_button.is_some();
         let close_layout = layout.clone();
+        // `on_children_prepainted` is only on the plain `Div` gpui gives back from `h_flex()`,
+        // not on the `Stateful<Div>` that `.id(...)` turns it into below (needed for `tooltip`,
+        // `on_mouse_down` and `on_mouse_up`), so it is attached first.
         let tab = h_flex()
+            .when(has_close, |tab| {
+                tab.on_children_prepainted(move |bounds, _window, _cx| {
+                    if let Some(tab_info) = close_layout.borrow_mut().tabs.get_mut(index) {
+                        tab_info.close_bounds = bounds.last().copied();
+                    }
+                })
+            })
             .id(("cod-workspace-tab", index))
             .group("")
             .h_full()
@@ -294,13 +304,6 @@ pub fn render_cod_workspace_tabs(
             .cursor_pointer()
             .child(content)
             .children(close_button)
-            .when(has_close, |tab| {
-                tab.on_children_prepainted(move |bounds, _window, _cx| {
-                    if let Some(tab_info) = close_layout.borrow_mut().tabs.get_mut(index) {
-                        tab_info.close_bounds = bounds.last().copied();
-                    }
-                })
-            })
             .tooltip(Tooltip::text(name.clone()))
             // A click shows the workspace, as a click on a Zed tab does: the press and then the
             // release over the same workspace's tab (#25 AC5). The press is kept by the window's
