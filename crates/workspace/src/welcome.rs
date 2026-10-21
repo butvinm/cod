@@ -33,7 +33,7 @@ pub struct OpenRecentProject {
 actions!(
     zed,
     [
-        /// Show the Zed welcome screen
+        /// Show the Cod welcome screen
         ShowWelcome
     ]
 );
@@ -263,9 +263,9 @@ impl WelcomePage {
     /// first-use report found it still says "Zed" even on a fresh Cod profile.
     pub fn cod_welcome_label(&self) -> &'static str {
         if self.fallback_to_recent_projects {
-            "Welcome back to Zed"
+            "Welcome back to Cod"
         } else {
-            "Welcome to Zed"
+            "Welcome to Cod"
         }
     }
 
@@ -504,7 +504,8 @@ impl Render for WelcomePage {
                             )
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    // #77 F5: Cod's own subtitle, not Zed's "The editor for what's next".
+                                    Label::new("Workspaces for agent-driven development")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),

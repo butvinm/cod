@@ -909,6 +909,7 @@ fn read_state(
     state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
     state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
     state["welcome"] = cod_welcome_state::state(workspace, cx);
+    state["onboarding_header"] = cod_welcome_state::onboarding_header(workspace, cx);
     Ok(state)
 }
 
