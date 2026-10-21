@@ -12324,33 +12324,6 @@ mod tests {
             owns,
             "codctl commands should not report an evicted chat's still-valid session id unknown"
         );
-
-        // `end_turn` gave this chat a real reply before it was evicted, so its status is `Done`,
-        // not `Idle`: `cleanup_retained_threads` evicts any idle-for-retention chat, including a
-        // finished one, not only a chat that never had a reply. `session_snapshot` must reload it
-        // to report that real status and transcript instead of a placeholder `(Idle, "")` (the
-        // bug `codctl session wait` and `codctl session status` hit on an evicted session).
-        let snapshot = cx.update(|window, cx| {
-            crate::cod_sessions::session_snapshot(&workspace, &evicted_session_id, window, cx)
-        });
-        let (status, text) = snapshot.expect("an evicted but owned session should still snapshot");
-        assert_eq!(
-            status,
-            crate::cod_chat_status::CodChatStatus::Done,
-            "an evicted chat that finished its turn with a reply should snapshot as done, not idle"
-        );
-        assert!(
-            text.contains("done"),
-            "the snapshot should carry the evicted chat's real last reply, not an empty \
-             transcript: got {text:?}"
-        );
-        panel.read_with(cx, |panel, _cx| {
-            assert_eq!(
-                panel.retained_threads.len(),
-                6,
-                "snapshotting an evicted session should reload it back into retained_threads"
-            );
-        });
     }
 
     #[gpui::test]

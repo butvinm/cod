@@ -405,6 +405,64 @@ class CodctlSessionsTest(CodTestCase):
             self.expect_equal("exit code", 3, result.returncode)
             self.expect_equal("stdout", "", result.stdout)
 
+    def test_ac4_wait_and_status_reload_a_session_the_idle_eviction_cache_dropped(self) -> None:
+        """RC review C8 continuation: the agent panel keeps at most `max_idle_retained_threads`
+        idle chats resident (default 5) and drops the rest from memory, though every chat it ever
+        started stays a member of the workspace (`codctl session list` still shows it). `wait` and
+        `status` used to read such a dropped session straight from that eviction cache, so they
+        reported it `idle` with an empty transcript even though its turn had actually finished
+        with a real reply. Setting `max_idle_retained_threads` to 0 drops a session the moment a
+        second one opens, the fastest way to force this without juggling five others."""
+        with self.step("create the fixture repo, a claude script with two plain turns, and no idle retention"):
+            script = self.write_script(
+                "claude.json",
+                {
+                    "session_ids": ["claude-session-1", "claude-session-2"],
+                    "turns": [
+                        {"steps": [{"chunk": "Reply one"}, {"end": "end_turn"}]},
+                        {"steps": [{"chunk": "Reply two"}, {"end": "end_turn"}]},
+                    ],
+                },
+            )
+            repo = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(
+                repo,
+                extra_settings={
+                    "agent_servers": {"claude": fake_agent_settings(script, log=self.workdir / "claude.log")},
+                    "agent": {"max_idle_retained_threads": 0},
+                },
+            )
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, SHOW_TIMEOUT, "the agent panel to load")
+
+        with self.step("finish a first session's turn, then drop it from memory by opening a second"):
+            first_id = self.new_session("claude")
+            self.codctl.run("session", "send", first_id, "Fix the rounding")
+            result = self.codctl.run("session", "wait", first_id, "--until", "idle", "--timeout", "20")
+            self.expect_result(result, 0, stderr="")
+            self.expect_equal("the first reply, while still resident", True, "Reply one" in result.stdout)
+            # A second session evicts the first from `retained_threads` at once
+            # (`max_idle_retained_threads: 0`), though the workspace still owns it.
+            self.new_session("claude")
+
+        with self.step("wait --until idle on the evicted session still prints its real last reply"):
+            result = self.codctl.run("session", "wait", first_id, "--until", "idle", "--timeout", "20", "--json")
+            self.expect_result(result, 0, stderr="")
+            payload = json.loads(result.stdout)
+            self.expect_equal("state", "done", payload.get("state"))
+            self.expect_equal("text", True, "Reply one" in (payload.get("text") or ""))
+
+        with self.step("status without --line on the evicted session reports done, not a placeholder idle"):
+            result = self.codctl.run("session", "status", first_id)
+            self.expect_result(result, 0, stderr="")
+            state_word, line = result.stdout.rstrip("\n").split("\t", 1)
+            self.expect_equal("state", "done", state_word)
+            self.expect_equal("line", "done", line)
+
     # AC5
 
     def test_ac5_status_line(self) -> None:
