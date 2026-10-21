@@ -288,7 +288,10 @@ pub fn render_cod_workspace_tabs(
                 // underneath it; stopping the mouse down here (the same pattern title_bar.rs
                 // already uses for its own button groups) keeps it from doing that.
                 Some(
-                    div()
+                    h_flex()
+                        .h_full()
+                        .items_center()
+                        .justify_center()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(button),
                 )
