@@ -55,8 +55,14 @@ pub(crate) struct Diagnostics {
     pub title: Option<String>,
     pub address: Option<String>,
     pub loading: Option<bool>,
-    pub console: Vec<String>,
+    pub console: Vec<ConsoleLine>,
     pub dropped_console: usize,
+}
+
+/// One console line and the document CEF attributes it to (RC review B2 for `--js` pages).
+pub(crate) struct ConsoleLine {
+    pub message: String,
+    pub source: String,
 }
 
 struct Slot {
@@ -369,11 +375,11 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
                         .ok();
                 }
             }
-            FromBrowser::Console { page, message } => {
+            FromBrowser::Console { page, message, source } => {
                 if let Some(slot) = slot(page) {
                     slot.record(|diagnostics| {
                         if diagnostics.console.len() < MAX_PENDING_CONSOLE {
-                            diagnostics.console.push(message);
+                            diagnostics.console.push(ConsoleLine { message, source });
                         } else {
                             diagnostics.dropped_console += 1;
                         }

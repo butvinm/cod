@@ -185,7 +185,12 @@ pub enum FromBrowser {
     Title { page: u32, title: String },
     Address { page: u32, url: String },
     Loading { page: u32, loading: bool },
-    Console { page: u32, message: String },
+    /// `source` is the URL CEF attributes the line to (RC review B2 for `--js` pages): the main
+    /// document's own address for a script that runs in it, a different address (or data: URL)
+    /// for one that runs in a subframe. Cod's side uses it to tell its own bootstrap script's
+    /// bridge calls, which only ever run in the main document, from a subframe forging the same
+    /// `cod:bridge:` line.
+    Console { page: u32, message: String, source: String },
     Closed { page: u32 },
     /// BGRA pixels, `width * height * 4` bytes.
     Frame {
@@ -503,7 +508,9 @@ impl FromBrowser {
             Self::Title { page, title } => Body::new(4).u32(*page).string(title),
             Self::Address { page, url } => Body::new(5).u32(*page).string(url),
             Self::Loading { page, loading } => Body::new(6).u32(*page).bool(*loading),
-            Self::Console { page, message } => Body::new(7).u32(*page).string(message),
+            Self::Console { page, message, source } => {
+                Body::new(7).u32(*page).string(message).string(source)
+            }
             Self::Closed { page } => Body::new(8).u32(*page),
             Self::LoadFailed { page, url, error } => {
                 Body::new(10).u32(*page).string(url).string(error)
@@ -572,6 +579,7 @@ impl FromBrowser {
             7 => Self::Console {
                 page: fields.u32()?,
                 message: fields.string()?,
+                source: fields.string()?,
             },
             8 => Self::Closed { page: fields.u32()? },
             10 => Self::LoadFailed {

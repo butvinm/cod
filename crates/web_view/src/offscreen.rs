@@ -553,6 +553,23 @@ impl OffscreenView {
         });
     }
 
+    /// Whether a console line's reported source names the agent document this page was built
+    /// from, so a bridge call from it should be trusted (RC review B2 for `--js` pages).
+    ///
+    /// Without `--js`, `frame-src 'none'` already keeps the page from embedding any subframe at
+    /// all (RC review B2); with it, nothing stops an `<iframe>`, and the engine's `source` is
+    /// the one thing that tells its own console output apart from the main document's. An empty
+    /// source is treated as the main frame rather than refused: CEF reports it empty for some
+    /// console lines, observed for the bootstrap script's own calls in this document, and
+    /// refusing those would break every agent page's bridge, not just a forged one. A subframe's
+    /// `source` is its own, different address and is refused; a source CEF never gives at all
+    /// for a subframe's output (observed not to happen in `--js` end-to-end testing, but not
+    /// guaranteed by the CEF API) would not be told apart from the main frame's own empty one,
+    /// which is the known limit of this check.
+    fn bridge_source_is_main_frame(&self, source: &str) -> bool {
+        source_is_main_frame(self.agent_document_url.as_deref(), source)
+    }
+
     fn hide(&mut self, reason: &str) {
         if !self.hidden.replace(true) {
             log::info!("web_view: {} hidden: {reason}", self.page_id);
@@ -625,19 +642,22 @@ impl OffscreenView {
                         diagnostics.dropped_console
                     );
                 }
-                for message in diagnostics.console {
+                for line in diagnostics.console {
                     // Agent pages only, and only while still showing their own agent document
-                    // (RC review B2): a bridge call from Cod's own bootstrap script is acted on
+                    // (RC review B2) and from that document's own frame, not a subframe (RC
+                    // review B2 for `--js` pages, where no CSP blocks `<iframe>` the way it does
+                    // without `--js`): a bridge call from Cod's own bootstrap script is acted on
                     // and never shown as page console output (#43).
                     if self.kind == PageKind::Agent
                         && !self.agent_navigated_away
-                        && let Some(call) = crate::agent_bridge::parse_bridge_message(&message)
+                        && self.bridge_source_is_main_frame(&line.source)
+                        && let Some(call) = crate::agent_bridge::parse_bridge_message(&line.message)
                     {
                         self.dispatch_bridge_call(call, window, cx);
                         continue;
                     }
-                    log::info!("web_view: page console: {message}");
-                    self.console.push(message);
+                    log::info!("web_view: page console: {}", line.message);
+                    self.console.push(line.message);
                 }
                 if self.console.len() > 200 {
                     let excess = self.console.len() - 200;
@@ -942,6 +962,18 @@ fn focus_session_from_page(
 /// the original URL loads exactly what was shown before. Once the page has navigated away from
 /// its own agent document (RC review B2's latch), the live address is what the tab actually shows
 /// and is persisted as before, truncation and all, like any other page.
+/// Whether a console line's `source` names `agent_document_url` (RC review B2 for `--js`
+/// pages), truncation of a long address included; an empty source is treated as a match. See
+/// `OffscreenView::bridge_source_is_main_frame`, which this backs, for why.
+fn source_is_main_frame(agent_document_url: Option<&str>, source: &str) -> bool {
+    if source.is_empty() {
+        return true;
+    }
+    agent_document_url.is_some_and(|agent_url| {
+        agent_url == source || protocol::limited(agent_url, protocol::MAX_URL_BYTES) == source
+    })
+}
+
 fn persisted_url(
     kind: PageKind,
     agent_document_url: Option<&str>,
@@ -1507,6 +1539,35 @@ mod tests {
     fn a_non_agent_page_always_persists_its_live_address() {
         let live = "https://example.org/wiki/Home";
         assert_eq!(persisted_url(PageKind::External, None, false, live), live);
+    }
+
+    // RC review B2 for `--js` pages: a bridge call's console line is only trusted when its
+    // source names the agent document, not a subframe's own, different address.
+
+    #[test]
+    fn a_source_matching_the_agent_document_is_the_main_frame() {
+        let agent_url = "data:text/html;base64,AAAA";
+        assert!(source_is_main_frame(Some(agent_url), agent_url));
+    }
+
+    #[test]
+    fn an_empty_source_is_treated_as_the_main_frame() {
+        assert!(source_is_main_frame(Some("data:text/html;base64,AAAA"), ""));
+        assert!(source_is_main_frame(None, ""));
+    }
+
+    #[test]
+    fn a_different_source_is_a_subframe_not_the_main_frame() {
+        let agent_url = "data:text/html;base64,AAAA";
+        assert!(!source_is_main_frame(Some(agent_url), "data:text/html,<iframe-doc>"));
+        assert!(!source_is_main_frame(None, "data:text/html,<iframe-doc>"));
+    }
+
+    #[test]
+    fn a_source_matching_the_truncated_agent_document_is_still_the_main_frame() {
+        let agent_url = format!("data:text/html;base64,{}", "A".repeat(20_000));
+        let truncated = protocol::limited(&agent_url, protocol::MAX_URL_BYTES);
+        assert!(source_is_main_frame(Some(&agent_url), &truncated));
     }
 
     #[test]

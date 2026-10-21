@@ -262,7 +262,7 @@ wrap_display_handler! {
             _browser: Option<&mut Browser>,
             _level: LogSeverity,
             message: Option<&CefString>,
-            _source: Option<&CefString>,
+            source: Option<&CefString>,
             _line: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             let state = &self.handler.state;
@@ -273,7 +273,13 @@ wrap_display_handler! {
                 // output, and one that still does not fit becomes a clear sentinel instead of
                 // truncated, invalid JSON that `codctl open --html --wait` would never answer.
                 let message = protocol::console_payload(&message.to_string(), MAX_CONSOLE_BYTES);
-                state.send(FromBrowser::Console { page: state.id, message });
+                // The document CEF attributes this line to (RC review B2 for `--js` pages): a
+                // subframe's own address, distinct from the main document's, so Cod's side can
+                // refuse a bridge call that did not come from the page it actually built.
+                let source = source
+                    .map(|source| limited(&source.to_string(), MAX_URL_BYTES))
+                    .unwrap_or_default();
+                state.send(FromBrowser::Console { page: state.id, message, source });
             } else {
                 PENDING_CONSOLE.fetch_sub(1, Ordering::AcqRel);
             }

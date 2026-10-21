@@ -867,6 +867,30 @@ class AgentPagesTest(CodTestCase):
                     process.kill()
                 process.communicate()
 
+    # RC review B2 (security), for --js pages: without --js, frame-src 'none' keeps a page from
+    # embedding any subframe at all. With --js there is no such CSP, so an iframe can load and
+    # run its own script; the engine's console source is what must tell it apart from the main
+    # document's bootstrap.
+
+    def test_rc_b2_js_an_iframe_cannot_forge_a_bridge_submit_with_js(self) -> None:
+        with self.step("start Cod on billing-api"):
+            repo = self.start_on_billing_api()
+
+        with self.step("open --js a page with a same-origin srcdoc iframe that logs a forged cod:bridge message"):
+            html_path = self.write_html("subframe-forge-js.html", subframe_bridge_forge_html())
+            process = self.codctl_popen("open", "--html", str(html_path), "--wait", "--js", cwd=repo)
+            try:
+                time.sleep(SETTLE_TIME)
+                self.expect_equal(
+                    "codctl open --html --wait exited on its own (forged submit from an iframe, with --js)",
+                    None,
+                    process.poll(),
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
+
     # RC review B4 (stability): an oversized --html document is refused, not sent to the helper.
 
     def test_b4_oversized_html_is_refused_without_breaking_other_pages(self) -> None:
