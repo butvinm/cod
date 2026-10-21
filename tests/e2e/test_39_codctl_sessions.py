@@ -160,6 +160,27 @@ class CodctlSessionsTest(CodTestCase):
             )
             self.expect_equal("agent", "claude", chat(state)["agent"])
 
+    def test_ac1_new_session_in_a_workspace_made_just_before(self) -> None:
+        """#39 AC1 with --workspace, from the executed beta on a6712b37b0: a script that runs `workspace new` and then at once `session new --workspace <id>` got "the workspace has no agent panel", because the new workspace attaches its agent panel a moment later."""
+        with self.step("start Cod with the fake agent as claude and make a second fixture repo"):
+            script = self.write_script(
+                "claude.json",
+                {"session_ids": ["claude-session-web-1"], "turns": [{"steps": [{"chunk": "hi"}, {"end": "end_turn"}]}]},
+            )
+            self.start_with_agents(script, None)
+            web = self.make_repo("billing-web", BILLING_API)
+
+        with self.step("run codctl workspace new --folder billing-web, then at once session new --workspace <its id>"):
+            made = self.codctl.run("workspace", "new", "--folder", str(web))
+            self.expect_result(made, 0, stderr="")
+            workspace_id = made.stdout.strip()
+            result = self.codctl.run("session", "new", "--agent", "claude", "--workspace", workspace_id)
+            self.expect_result(result, 0, stdout="claude-session-web-1\n", stderr="")
+
+        with self.step("session list for that workspace has the new session"):
+            listed = json.loads(self.codctl.run("session", "list", "--workspace", workspace_id, "--json").stdout)
+            self.expect_equal("session ids of the new workspace", ["claude-session-web-1"], [entry["id"] for entry in listed])
+
     # AC2
 
     def test_ac2_list_sessions_plain_and_json(self) -> None:
