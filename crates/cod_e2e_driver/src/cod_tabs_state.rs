@@ -199,6 +199,36 @@ pub(crate) async fn click(
     Ok(())
 }
 
+/// The settle time after a hover's mouse move, so the window draws its hover style before the
+/// next request reads it (issue #77: hover background and the tabs' close control).
+const HOVER_SETTLE: Duration = Duration::from_millis(60);
+
+/// Moves the mouse to the position without pressing a button, the way a person rests the pointer
+/// over a tab before clicking it.
+#[cfg(unix)]
+pub(crate) async fn hover(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    let event = PlatformInput::MouseMove(MouseMoveEvent {
+        position,
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    });
+    let window = cx
+        .update(|cx| super::workspace_window(cx, &memory.borrow()))
+        .context("Cod has no workspace window")?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(event, cx);
+    })
+    .context("the workspace window closed")?;
+    cx.background_executor().timer(HOVER_SETTLE).await;
+    Ok(())
+}
+
 /// Writes the entry into the status store, for the workspace at `workspace_index` of the
 /// driver's `workspaces` list.
 #[cfg(unix)]

@@ -158,6 +158,7 @@ Cod started with `COD_E2E_SOCKET=<path>` listens on that Unix socket. Each reque
 - `{"cmd":"type","text":"invoice"}` types one key event per character. Reply `{"ok":true}`.
 - `{"cmd":"state"}` replies `{"ok":true,"state":{"active_tab":"invoice.rs","tabs":["invoice.rs"],"worktrees":["/abs/path"],"modal":null,...}}` with every field of the table above except `window_title`.
 - `{"cmd":"click","x":120,"y":16}` moves the mouse to the position (logical pixels from the window's top left, as in `title_bar` bounds), then presses and releases the left button there. Add `"ctrl":true` (story #32 AC3) to hold the control key for all three events, with extra settle time before the mouse down so the editor's async hover-link lookup finishes first. Reply `{"ok":true}`.
+- `{"cmd":"hover","x":120,"y":16}` moves the mouse to the position without pressing a button, and waits briefly for the hover style to settle before answering (issue #77: the workspace tabs' hover background and close control). Reply `{"ok":true}`.
 - `{"cmd":"set_entry","workspace_index":0,"key":"s1","kind":"session","title":"Claude: fix invoice rounding","status":"needs_input","context":"waiting for you"}` sets a session (or a page, `"kind":"page"`) of the workspace at that index of `workspaces` to the status, replacing the entry with the same key. It is the one request that writes app state: a test fixture that stands in for the scripted fake agent provider of #28 until it lands. Helpers: `tests/e2e/cod_status_fixtures.py`. Reply `{"ok":true}`.
 - Errors reply `{"ok":false,"error":"..."}`.
 

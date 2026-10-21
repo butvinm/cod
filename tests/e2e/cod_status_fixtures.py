@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
 from typing import Any
 
 # The widest a workspace tab gets, in logical pixels (#25 open question 1).
@@ -83,3 +85,64 @@ class CodStatusFixtures:
         if not drawn(bounds):
             raise AssertionError(f"expected the + button to be drawn, actual bounds {bounds!r}")
         self.click_at(*center(bounds))
+
+    def hover_at(self, x: float, y: float) -> None:
+        """Moves the mouse to the window position without pressing a button (issue #77: hover background, close control)."""
+        self.driver.request("hover", x=x, y=y)
+
+    def hover_tab(self, state: dict[str, Any], index: int) -> None:
+        """Hovers the middle of the tab at `index` as it was drawn in `state`."""
+        tabs = title_bar(state)["tabs"]
+        bounds = tabs[index]["bounds"]
+        if not drawn(bounds):
+            raise AssertionError(f"expected tab {index} to be drawn, actual bounds {bounds!r}")
+        self.hover_at(*center(bounds))
+
+
+def screenshot_ppm(path: Path) -> None:
+    """Saves a full native screenshot in PPM (issue #77: plain pixel sampling, no image library)."""
+    result = subprocess.run(["grim", "-t", "ppm", str(path)], capture_output=True, text=True, timeout=20)
+    if result.returncode != 0:
+        raise AssertionError(f"grim failed with status {result.returncode}: {result.stderr.strip()}")
+
+
+def read_ppm(path: Path) -> tuple[int, int, bytes]:
+    """Parses a binary (P6) PPM file: (width, height, raw RGB bytes, 8 bits per channel)."""
+    data = path.read_bytes()
+    if not data.startswith(b"P6"):
+        raise AssertionError(f"{path} is not a binary PPM (P6)")
+    fields: list[bytes] = []
+    offset = 2
+    while len(fields) < 3:
+        while offset < len(data) and data[offset : offset + 1].isspace():
+            offset += 1
+        if offset < len(data) and data[offset : offset + 1] == b"#":
+            while offset < len(data) and data[offset : offset + 1] != b"\n":
+                offset += 1
+            continue
+        start = offset
+        while offset < len(data) and not data[offset : offset + 1].isspace():
+            offset += 1
+        fields.append(data[start:offset])
+    width, height, maxval = (int(field) for field in fields)
+    if maxval != 255:
+        raise AssertionError(f"{path} has maxval {maxval}, expected 255")
+    offset += 1  # the single whitespace byte after maxval
+    return width, height, data[offset : offset + width * height * 3]
+
+
+def ppm_pixel(width: int, height: int, pixels: bytes, x: int, y: int) -> tuple[int, int, int]:
+    """The (r, g, b) of the pixel at (x, y) in a buffer `read_ppm` returned."""
+    if not (0 <= x < width and 0 <= y < height):
+        raise AssertionError(f"pixel ({x}, {y}) is outside the {width}x{height} screenshot")
+    index = (y * width + x) * 3
+    return (pixels[index], pixels[index + 1], pixels[index + 2])
+
+
+def hex_color(rgb: tuple[int, int, int]) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+
+def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    """Euclidean distance between two (r, g, b) colors, for a tolerance check against a theme token."""
+    return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5

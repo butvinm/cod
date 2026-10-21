@@ -124,6 +124,9 @@ pub enum Request {
     /// A left click at a window position, with the control key held when `ctrl` is set (#25, see
     /// `cod_tabs_state`; the control modifier was added for #32 AC3's Ctrl-click on a URL).
     Click { x: f32, y: f32, ctrl: bool },
+    /// Moves the mouse to a window position without pressing a button, so a test can check a
+    /// hover style (issue #77: the workspace tabs' hover background and close control).
+    Hover { x: f32, y: f32 },
     /// The test fixture that sets a session or page status (#25, see `cod_tabs_state`).
     SetEntry(cod_tabs_state::SetEntry),
 }
@@ -140,6 +143,10 @@ enum WireRequest {
         #[serde(default)]
         ctrl: bool,
     },
+    Hover {
+        x: f32,
+        y: f32,
+    },
     SetEntry(cod_tabs_state::SetEntry),
 }
 
@@ -154,6 +161,10 @@ pub fn parse_request(line: &str) -> Result<Request> {
         WireRequest::Click { x, y, ctrl } => {
             cod_tabs_state::check_click(x, y)?;
             Request::Click { x, y, ctrl }
+        }
+        WireRequest::Hover { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::Hover { x, y }
         }
         WireRequest::SetEntry(entry) => {
             cod_tabs_state::check_set_entry(&entry)?;
@@ -413,6 +424,7 @@ async fn run(
         Request::Click { x, y, ctrl } => {
             cod_tabs_state::click(x, y, ctrl, memory, cx).await.map(|()| None)
         }
+        Request::Hover { x, y } => cod_tabs_state::hover(x, y, memory, cx).await.map(|()| None),
         Request::SetEntry(entry) => cod_tabs_state::set_entry(entry, memory, cx).map(|()| None),
         Request::State => {
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
@@ -1230,6 +1242,14 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"cmd":"click","x":12.5,"y":4,"ctrl":true}"#).unwrap(),
             Request::Click { x: 12.5, y: 4., ctrl: true }
+        );
+    }
+
+    #[test]
+    fn parses_hover() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"hover","x":12.5,"y":4}"#).unwrap(),
+            Request::Hover { x: 12.5, y: 4. }
         );
     }
 
