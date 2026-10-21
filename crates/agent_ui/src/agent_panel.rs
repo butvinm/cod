@@ -9436,6 +9436,83 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_cod_closing_workspace_deletes_a_parked_unsent_draft(cx: &mut TestAppContext) {
+        // RC review C7: workspace ownership used to be assigned only once a chat had a
+        // persisted provider session id. A draft deliberately never gets one, so an unsent
+        // draft parked by opening another chat belonged to no workspace: closing the
+        // workspace never swept it up, and it could not come back with its workspace either.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+        let workspace_id = workspace
+            .read_with(cx, |workspace, _cx| workspace.database_id())
+            .unwrap();
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.activate_draft(true, AgentThreadSource::AgentPanel, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Type into the draft, then park it by opening a fresh new-thread slot: the typed
+        // draft moves into `retained_threads` with its content, never reaching a session id.
+        crate::test_support::type_draft_prompt(&panel, "an unsent prompt", cx);
+        let parked_draft_id = active_thread_id(&panel, cx);
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_thread(&NewThread, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.retained_threads.contains_key(&parked_draft_id),
+                "the unsent draft should be parked into retained_threads"
+            );
+        });
+
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+
+        // Closing the workspace deletes every chat that belongs to it.
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.cod_delete_workspace_chats(i64::from(workspace_id), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            assert!(
+                store.entry(parked_draft_id).is_none(),
+                "a parked, unsent draft should belong to its workspace and be deleted with it"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_cod_session_new_twice_creates_two_fresh_sessions(cx: &mut TestAppContext) {
         // RC review C3: `codctl session new --agent X` twice with nothing sent between the calls
         // used to hand back the very same empty draft both times, because `activate_new_thread`

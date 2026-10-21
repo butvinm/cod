@@ -1372,6 +1372,21 @@ impl ThreadMetadataStore {
         cx.background_spawn(async move { db.cod_assign_chat(session_id, workspace_id).await })
     }
 
+    /// Puts the chat with this thread id into the workspace as its last tab, unless it already
+    /// belongs to one (RC review C7). A draft never gets a provider session id, so
+    /// `cod_assign_chat` above can never claim it; without this a draft's chat belongs to no
+    /// workspace at all, so it is skipped when a workspace's chats come back after a restart and
+    /// is never swept up when the workspace closes for good.
+    pub fn cod_assign_chat_by_thread_id(
+        &self,
+        thread_id: ThreadId,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.cod_assign_chat_by_thread_id(thread_id, workspace_id).await })
+    }
+
     /// The provider session ids of the workspace's chats, in tab order.
     pub fn cod_workspace_sessions(
         &self,
@@ -1545,6 +1560,29 @@ impl ThreadMetadataDb {
             )?;
             let i = stmt.bind(&workspace_id, 1)?;
             stmt.bind(&session_id, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    /// Puts the chat with this thread id into the workspace as its last tab (RC review C7): the
+    /// same assignment as `cod_assign_chat` above, keyed by the row's stable local id instead of
+    /// its (possibly absent) provider session id, for drafts.
+    pub async fn cod_assign_chat_by_thread_id(
+        &self,
+        thread_id: ThreadId,
+        workspace_id: i64,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "UPDATE sidebar_threads SET cod_workspace_id = ?1, \
+                 cod_tab_order = (SELECT COALESCE(MAX(cod_tab_order), -1) + 1 \
+                     FROM sidebar_threads WHERE cod_workspace_id = ?1) \
+                 WHERE thread_id = ?2 AND cod_workspace_id IS NULL",
+            )?;
+            let i = stmt.bind(&workspace_id, 1)?;
+            stmt.bind(&thread_id, i)?;
             stmt.exec()
         })
         .await
