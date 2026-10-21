@@ -459,6 +459,11 @@ pub fn main() {
     #[cfg(target_os = "macos")]
     let _library = load_framework();
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+    // Round 2 diagnosis (Q3b): must also happen before any other CEF call, for every process type
+    // (browser, renderer, GPU), the same as every cef-rs macOS example. See mac_app's own doc
+    // comment for why skipping this is the likely cause of round 1's silent crash.
+    #[cfg(target_os = "macos")]
+    crate::mac_app::setup();
     let args = cef::args::Args::new();
     let Some(command_line) = args.as_cmd_line() else {
         eprintln!("cod-browser: cannot read the command line");

@@ -10,6 +10,8 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod engine;
+#[cfg(target_os = "macos")]
+mod mac_app;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(dead_code)]
 mod protocol;

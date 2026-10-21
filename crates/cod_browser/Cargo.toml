@@ -21,3 +21,8 @@ doctest = false
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 cef.workspace = true
 libc.workspace = true
+
+# mac_app.rs: the NSApplication subclass CEF requires on macOS (round 2 diagnosis Q3b).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit = { workspace = true, features = ["NSApplication", "NSEvent"] }
