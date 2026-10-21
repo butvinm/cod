@@ -200,7 +200,6 @@ pub fn render_cod_workspace_tabs(
         let measured_layout = layout.clone();
         let content = h_flex()
             .min_w_0()
-            .flex_1()
             .gap_1()
             .children(status_dot(status, index, &layout))
             .when_some(id, |content, id| {
@@ -212,7 +211,7 @@ pub fn render_cod_workspace_tabs(
             })
             .when(!rest.is_empty(), |content| {
                 content.child(
-                    div().min_w_0().flex_1().overflow_x_hidden().child(
+                    div().min_w_0().overflow_x_hidden().child(
                         Label::new(rest_text.clone())
                             .color(Color::Custom(text_color))
                             .truncate(),
@@ -247,7 +246,6 @@ pub fn render_cod_workspace_tabs(
             .id(("cod-workspace-tab", index))
             .h_full()
             .min_w_0()
-            .flex_1()
             .max_w(px(COD_TAB_MAX_WIDTH))
             .px_2()
             .border_x_1()
@@ -305,7 +303,6 @@ pub fn render_cod_workspace_tabs(
     h_flex()
         .h_full()
         .min_w_0()
-        .flex_1()
         .overflow_x_hidden()
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
