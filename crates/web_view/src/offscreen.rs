@@ -1315,10 +1315,21 @@ impl SerializableItem for OffscreenView {
         window.spawn(cx, async move |cx| {
             let saved = saved?.context("no saved page for this item")?;
             cx.update(|window, cx| {
+                let kind = PageKind::parse(&saved.kind);
+                // An agent page saved before bridge tokens existed comes back in the current form,
+                // or its bridge would refuse every call.
+                let url = match kind {
+                    PageKind::Agent => crate::agent_bridge::upgrade_legacy_document(
+                        &saved.url,
+                        &crate::agent_bridge::current_theme_vars(cx),
+                    )
+                    .unwrap_or(saved.url),
+                    _ => saved.url,
+                };
                 OffscreenView::build(
-                    saved.url,
+                    url,
                     PageId(saved.page_id.into()),
-                    PageKind::parse(&saved.kind),
+                    kind,
                     saved.title,
                     Some(workspace),
                     window,

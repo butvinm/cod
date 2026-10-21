@@ -329,6 +329,31 @@ pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars)
     )
 }
 
+/// The current form of an agent document saved before bridge tokens existed, or None when
+/// `document_url` already has a token or is not an agent document Cod built with its prelude
+/// first. Such a document's bootstrap sends calls without a token, which Cod now refuses, so on
+/// restore it is rebuilt from the page markup after Cod's old prelude: with a fresh token, and
+/// with the CSP exactly when the old prelude had one (the page was opened without `--js`; its
+/// markup was already stripped of scripts then).
+pub fn upgrade_legacy_document(document_url: &str, vars: &ThemeVars) -> Option<String> {
+    use base64::Engine as _;
+    if document_token(document_url).is_some() {
+        return None;
+    }
+    let encoded = document_url.strip_prefix("data:text/html;charset=utf-8;base64,")?;
+    let html = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let html = String::from_utf8(html).ok()?;
+    let rest = html.strip_prefix("<!doctype html><html><head>")?;
+    let prelude_end = rest.find("</head>")?;
+    let prelude = &rest[..prelude_end];
+    if !prelude.contains("window.cod={call:codSend}") {
+        return None;
+    }
+    let markup = &rest[prelude_end + "</head>".len()..];
+    let allow_js = !prelude.contains("Content-Security-Policy");
+    Some(data_url(&build_agent_document(markup, allow_js, vars)))
+}
+
 /// A `data:` URL that loads `html` as a document (#43 AC1, AC5, open question 1): used instead of
 /// `file://` so an agent page never gets direct file-system access of its own, and the bridge
 /// cannot be carried to a page opened any other way.
@@ -584,6 +609,40 @@ mod tests {
         let first = document_token(&data_url(&build_agent_document("<p>a</p>", true, &vars())));
         let second = document_token(&data_url(&build_agent_document("<p>a</p>", true, &vars())));
         assert_ne!(first, second);
+    }
+
+    // RC delta review: agent pages saved before tokens existed must keep a working bridge after
+    // an upgrade, with or without the CSP they were opened with.
+    #[test]
+    fn a_legacy_agent_document_is_upgraded_to_a_tokened_one() {
+        let legacy_prelude = "<script nonce=\"n\">(function(){window.cod={call:codSend};})();</script>";
+        let no_js = format!(
+            "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'nonce-n'\">{legacy_prelude}</head><p>decide</p>"
+        );
+        let upgraded = upgrade_legacy_document(&data_url(&no_js), &vars()).expect("an upgrade");
+        assert!(document_token(&upgraded).is_some());
+        let decoded = decode(&upgraded);
+        assert!(decoded.contains("Content-Security-Policy"));
+        assert!(decoded.ends_with("<p>decide</p>"));
+
+        let with_js = format!("<!doctype html><html><head>{legacy_prelude}</head><p>decide</p>");
+        let upgraded = upgrade_legacy_document(&data_url(&with_js), &vars()).expect("an upgrade");
+        assert!(document_token(&upgraded).is_some());
+        assert!(!decode(&upgraded).contains("Content-Security-Policy"));
+    }
+
+    #[test]
+    fn only_legacy_agent_documents_are_upgraded() {
+        let current = data_url(&build_agent_document("<p>a</p>", false, &vars()));
+        assert_eq!(upgrade_legacy_document(&current, &vars()), None);
+        let foreign = data_url("<!doctype html><html><head><title>x</title></head><p>a</p>");
+        assert_eq!(upgrade_legacy_document(&foreign, &vars()), None);
+    }
+
+    fn decode(url: &str) -> String {
+        use base64::Engine as _;
+        let encoded = url.strip_prefix("data:text/html;charset=utf-8;base64,").unwrap();
+        String::from_utf8(base64::engine::general_purpose::STANDARD.decode(encoded).unwrap()).unwrap()
     }
 
     #[test]

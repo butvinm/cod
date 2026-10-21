@@ -74,17 +74,23 @@ pub fn console_payload(text: &str, console_limit: usize) -> String {
 }
 
 /// The token of a bridge call whose JSON ends with `,"t":"<token>"}`, as Cod's bootstrap writes
-/// it. Only base64 characters count as a token, so nothing else in the call can pass for one.
+/// it. Only base64 characters, and no more than `MAX_BRIDGE_TOKEN_BYTES` of them, count as a
+/// token: a page that forges a huge one must not make the sentinel itself too large to send.
 fn bridge_token_at_end(text: &str) -> Option<&str> {
     let rest = text.strip_suffix("\"}")?;
     let start = rest.rfind(",\"t\":\"")? + ",\"t\":\"".len();
     let token = &rest[start..];
     (!token.is_empty()
+        && token.len() <= MAX_BRIDGE_TOKEN_BYTES
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')))
     .then_some(token)
 }
+
+/// The longest token `bridge_token_at_end` accepts. Cod's tokens are 16 random bytes in base64,
+/// 24 characters.
+const MAX_BRIDGE_TOKEN_BYTES: usize = 64;
 
 pub const KEY_RAW_DOWN: u8 = 0;
 pub const KEY_UP: u8 = 2;
@@ -909,5 +915,15 @@ mod tests {
         assert_eq!(bridge_token_at_end(r#"{"args":{},"t":"a\"b"}"#), None);
         assert_eq!(bridge_token_at_end(r#"{"args":{},"t":""}"#), None);
         assert_eq!(bridge_token_at_end(r#"{"args":{"t":"x"}}"#), None);
+    }
+
+    // RC delta review: a forged token of megabytes copied into the sentinel made the sentinel
+    // exceed the protocol's message limit, which disconnected every browser tab.
+    #[test]
+    fn a_forged_huge_token_is_not_copied_into_the_sentinel() {
+        let token = "A".repeat(2 << 20);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{}},\"t\":\"{token}\"}}");
+        let payload = console_payload(&line, 4096);
+        assert!(payload.len() < 200);
     }
 }
