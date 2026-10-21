@@ -7485,9 +7485,16 @@ impl ThreadView {
             return;
         };
         // An earlier reply can be outside the rendered part of the list, where its block is not
-        // drawn and cannot take the keyboard focus: bring its entry into view first (the
-        // executed beta found links in older replies unreachable without this).
-        self.list_state.scroll_to_reveal_item(*entry_ix);
+        // drawn and cannot take the keyboard focus (the executed beta found links in older
+        // replies unreachable). `scroll_to_reveal_item` is not enough: while the list follows
+        // its tail, every layout puts the scroll position back at the end. `scroll_to` stops
+        // following and shows the reply from its top.
+        if self.list_state.bounds_for_item(*entry_ix).is_none() {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: *entry_ix,
+                offset_in_item: px(0.),
+            });
+        }
         window.focus(&markdown.read(cx).focus_handle(cx), cx);
         cx.notify();
         cx.stop_propagation();
