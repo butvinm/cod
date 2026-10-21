@@ -161,6 +161,49 @@ jobs:
           mkdir -p smoke-artifacts
           status=0
 
+          # AC-R1: --user-data-dir must isolate Cod's logs and cache too, not only its config and
+          # application data, so a stock Zed on the same Mac keeps its own
+          # ~/Library/Logs/Zed and ~/Library/Caches/Zed untouched. Checked both before and after
+          # the run: if either already existed before Cod ever started, the after-comparison
+          # below could not tell Cod's own write apart from a pre-existing one.
+          stock_logs="$HOME/Library/Logs/Zed"
+          stock_cache="$HOME/Library/Caches/Zed"
+          echo "== stock Zed folders before launch (must not exist) =="
+          [ -e "$stock_logs" ] && echo "exists: $stock_logs" || echo "absent: $stock_logs"
+          [ -e "$stock_cache" ] && echo "exists: $stock_cache" || echo "absent: $stock_cache"
+          if [ -e "$stock_logs" ] || [ -e "$stock_cache" ]; then
+            echo "::error::a stock Zed folder already exists before Cod even launched; this runner cannot tell Cod's own writes apart from a pre-existing folder"
+            status=1
+          fi
+
+          # AC-R2: a stock Zed Stable on the same Mac, for the same user, must not stop Cod from
+          # starting (and the other way around: Cod must not stop a stock Zed from starting
+          # either). Fakes the stock Zed Stable single-instance listener at the exact port
+          # crates/zed/src/zed/mac_only_instance.rs's address() computes for this user (port base
+          # 43737 + 200, the Stable channel's block, then + the user ID wrapped the same way),
+          # answering with stock Zed's own handshake text, before Cod ever starts.
+          uid=$(id -u)
+          fake_zed_port=$(python3 -c "
+          port = 43737 + 200
+          max_uid = 65535 - port
+          print(port + ($uid % max_uid))
+          ")
+          echo "Faking a stock Zed Stable instance on 127.0.0.1:$fake_zed_port (uid $uid)"
+          python3 -c "
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('127.0.0.1', $fake_zed_port))
+          s.listen(5)
+          while True:
+              conn, _ = s.accept()
+              try:
+                  conn.sendall(b'Zed Editor Stable Instance Running')
+              finally:
+                  conn.close()
+          " &
+          fake_zed_pid=$!
+
           # GitHub Actions runs this step as `bash -eo pipefail`, on top of this script's own
           # `set -uo pipefail`, so `ls <missing dir> | wc -l` would abort the whole step right
           # here before Cod is even launched (its own nonzero exit survives the pipe under
@@ -182,8 +225,22 @@ jobs:
           sleep 20
 
           if ! kill -0 "$pid" 2>/dev/null; then
-            echo "::error::Cod exited within 20 seconds (pid $pid is gone)"
+            echo "::error::Cod exited within 20 seconds (pid $pid is gone); a stock Zed Stable instance on the same port may have been mistaken for Cod itself (AC-R2)"
             status=1
+          fi
+
+          echo "== stock Zed folders after the run (must still not exist) =="
+          if [ -e "$stock_logs" ]; then
+            echo "::error::$stock_logs exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_logs"
+          fi
+          if [ -e "$stock_cache" ]; then
+            echo "::error::$stock_cache exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_cache"
           fi
 
           after_reports=$(reports_count)
@@ -217,10 +274,21 @@ jobs:
             sleep 2
             kill -9 "$pid" 2>/dev/null || true
           fi
+          kill "$fake_zed_pid" 2>/dev/null || true
 
           cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
             || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
-          find "$data" -iname "Zed.log" -exec cp {} smoke-artifacts/zed.log \; 2>/dev/null || true
+
+          # AC-R1: Zed.log must be under $data, not under stock Zed's ~/Library/Logs/Zed
+          # (already checked above); a missing Zed.log here is itself a failure, not silently
+          # ignored, since it would mean the smoke test cannot tell whether Cod ever wrote one.
+          zed_log=$(find "$data" -iname "Zed.log" 2>/dev/null | head -n 1)
+          if [ -n "$zed_log" ]; then
+            cp "$zed_log" smoke-artifacts/zed.log
+          else
+            echo "::error::no Zed.log was found under $data"
+            status=1
+          fi
 
           exit $status
 
