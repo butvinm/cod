@@ -1221,13 +1221,28 @@ mod socket {
     /// every descriptor of this connection never has another one in a blocking read at the same
     /// time (it is either blocked in `reader.lines()` or in here, never both).
     fn client_disconnected(watch: &UnixStream) -> Result<bool> {
+        use std::os::fd::AsRawFd as _;
+
         watch.set_nonblocking(true).context("cannot poll the client connection")?;
         let mut probe = [0u8; 1];
-        let result = match watch.peek(&mut probe) {
-            Ok(0) => Ok(true),
-            Ok(_) => Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
-            Err(error) => Err(error).context("cannot poll the client connection"),
+        // A non-destructive read (MSG_PEEK): the std `peek` method is not stable on this
+        // toolchain, and a plain `read` would consume a byte `reader.lines()` still needs.
+        // SAFETY: `probe` is a valid one-byte buffer for the call's duration; `recv` writes at
+        // most that many bytes and MSG_PEEK never removes anything from the socket's buffer.
+        let read = unsafe {
+            libc::recv(watch.as_raw_fd(), probe.as_mut_ptr().cast(), probe.len(), libc::MSG_PEEK)
+        };
+        let result = match read {
+            0 => Ok(true),
+            n if n > 0 => Ok(false),
+            _ => {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Ok(false)
+                } else {
+                    Err(error).context("cannot poll the client connection")
+                }
+            }
         };
         watch.set_nonblocking(false).context("cannot restore the client connection")?;
         result
