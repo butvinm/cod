@@ -149,11 +149,15 @@ jobs:
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
       # The same command as in script/e2e, with the same environment as the release build.
+      # Pull requests from this repository write too: their entries are scoped to the pull
+      # request, so its next run hits the Cod crates it changed instead of missing the same
+      # ~120 units on every run (with READ_ONLY each miss was also counted as a write error).
+      # Pull requests from forks stay read-only.
       - name: Build
         if: steps.changes.outputs.code == 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
-          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          SCCACHE_GHA_RW_MODE: ${{ (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
         run: |
@@ -175,7 +179,7 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
-          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          SCCACHE_GHA_RW_MODE: ${{ (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
         run: script/e2e
