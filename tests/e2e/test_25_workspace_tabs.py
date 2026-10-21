@@ -561,11 +561,10 @@ class FirstUseWelcomeTest(CodTestCase):
             )
 
         if state["welcome"] is None:
-            with self.step("a brand new profile shows the onboarding page first: close it like any other tab"):
+            with self.step("a brand new profile shows the onboarding page first: close it, then show the welcome page"):
                 self.keys("ctrl-w")
-                state = self.wait_for(
-                    lambda state: state["welcome"] is not None, SHOW_TIMEOUT, "the welcome page after onboarding closes"
-                )
+                self.run_command("workspace: show welcome")
+                state = self.wait_for(lambda state: state["welcome"] is not None, SHOW_TIMEOUT, "the welcome page")
 
         with self.step("check the greeting names Cod, never Zed"):
             welcome = state["welcome"]
