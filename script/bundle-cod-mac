@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Hand-assembles Cod.app for Apple Silicon macOS from an already built target/release-fast
+# (issue #23). Unlike script/bundle-mac (upstream Zed's cargo-bundle + Apple signing) this is a
+# short, ad-hoc-signed bundle: no cargo-bundle, no notarization, no bundled git.
+#
+# Needs target/release-fast/zed and target/release-fast/codctl to exist already
+# (cargo build --locked --profile release-fast -p zed -p codctl).
+#
+# Writes:
+#   dist/Cod.app                    the app bundle, ad-hoc signed
+#   cod-macos-aarch64.zip           dist/Cod.app zipped with ditto (keeps the bundle structure)
+#   cod-macos-aarch64.zip.sha256    the zip's sha256, one line, same format as sha256sum -b
+#
+# COMMIT (env, defaults to git rev-parse HEAD) is stamped into Info.plist's CFBundleVersion and
+# into Contents/Resources/cod-commit.txt, and is checked against strings in the zed binary later
+# in the macOS release workflow, not by this script.
+set -euo pipefail
+
+build_dir=${BUILD_DIR:-target/release-fast}
+dist_dir=${DIST_DIR:-dist}
+app_path="$dist_dir/Cod.app"
+zip_name=${ZIP_NAME:-cod-macos-aarch64.zip}
+icon_src=${ICON_SRC:-crates/zed/resources/cod-app-icon-1024.png}
+commit=${COMMIT:-${GITHUB_SHA:-$(git rev-parse HEAD)}}
+
+zed_bin="$build_dir/zed"
+codctl_bin="$build_dir/codctl"
+test -x "$zed_bin" || { echo "bundle-cod-mac: missing $zed_bin (build zed first)" >&2; exit 1; }
+test -x "$codctl_bin" || { echo "bundle-cod-mac: missing $codctl_bin (build codctl first)" >&2; exit 1; }
+
+echo "Assembling $app_path from $build_dir (commit $commit)"
+rm -rf "$dist_dir"
+mkdir -p "$app_path/Contents/MacOS" "$app_path/Contents/Resources"
+
+# --- Info.plist --------------------------------------------------------------------------------
+# No CFBundleURLTypes (no "zed" URL scheme) and a bundle id distinct from stock Zed's
+# (dev.zed.Zed), so Cod never shares a running Mikhail's stock Zed install or its URL handler.
+cat > "$app_path/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>cod</string>
+	<key>CFBundleIconFile</key>
+	<string>Cod</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.cod-editor.cod-preview</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Cod</string>
+	<key>CFBundleDisplayName</key>
+	<string>Cod</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.1-preview</string>
+	<key>CFBundleVersion</key>
+	<string>$commit</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Cod is a fork of Zed, GPL-3.0-or-later. See LICENSE-GPL and LICENSE-APACHE.</string>
+</dict>
+</plist>
+PLIST
+
+# --- Icon (.icns from the 1024x1024 PNG, via sips + iconutil) -----------------------------------
+iconset=$(mktemp -d)/Cod.iconset
+mkdir -p "$iconset"
+for spec in \
+	"16 icon_16x16" \
+	"32 icon_16x16@2x" \
+	"32 icon_32x32" \
+	"64 icon_32x32@2x" \
+	"128 icon_128x128" \
+	"256 icon_128x128@2x" \
+	"256 icon_256x256" \
+	"512 icon_256x256@2x" \
+	"512 icon_512x512" \
+	"1024 icon_512x512@2x"; do
+	size=${spec%% *}
+	name=${spec#* }
+	sips -z "$size" "$size" "$icon_src" --out "$iconset/$name.png" > /dev/null
+done
+iconutil -c icns "$iconset" -o "$app_path/Contents/Resources/Cod.icns"
+rm -rf "$(dirname "$iconset")"
+
+# --- Binaries (stripped) ------------------------------------------------------------------------
+cp "$zed_bin" "$app_path/Contents/MacOS/zed"
+cp "$codctl_bin" "$app_path/Contents/MacOS/codctl"
+strip -x "$app_path/Contents/MacOS/zed" "$app_path/Contents/MacOS/codctl"
+
+# --- Launcher (CFBundleExecutable) ----------------------------------------------------------
+# Mirrors script/cod-wayland.sh: an isolated data folder, not stock Zed's
+# ~/Library/Application Support/Zed, and the app's stderr appended to a log inside it.
+# COD_PREVIEW_DIR overrides the folder, the same variable name as cod-wayland.sh's COD_PREVIEW_DIR
+# on Linux (there it overrides ~/.local/share/cod-preview).
+cat > "$app_path/Contents/MacOS/cod" <<'LAUNCHER'
+#!/usr/bin/env sh
+# Starts Cod on macOS with its own, isolated data folder (issue #23).
+# COD_PREVIEW_DIR overrides the folder; otherwise it is ~/Library/Application Support/Cod-preview.
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+data="${COD_PREVIEW_DIR:-$HOME/Library/Application Support/Cod-preview}"
+logs="$data/logs"
+mkdir -p "$logs"
+echo "=== cod start $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$logs/cod-stderr.log"
+exec "$here/zed" --user-data-dir "$data" "$@" 2>> "$logs/cod-stderr.log"
+LAUNCHER
+chmod +x "$app_path/Contents/MacOS/cod"
+
+# --- Commit stamp (checked against the zed binary by the workflow) ----------------------------
+printf '%s\n' "$commit" > "$app_path/Contents/Resources/cod-commit.txt"
+
+# --- Ad-hoc signature (no certificate: Code signing and notarization are out of scope, #23) ----
+codesign --force --deep --sign - "$app_path"
+
+# --- Zip (ditto keeps the bundle's resource forks and the single top-level Cod.app entry) ------
+rm -f "$zip_name" "$zip_name.sha256"
+ditto -c -k --keepParent "$app_path" "$zip_name"
+shasum -a 256 "$zip_name" | tee "$zip_name.sha256"
+
+echo "Bundled $app_path and $zip_name"

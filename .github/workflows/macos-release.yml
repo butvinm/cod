@@ -1,0 +1,250 @@
+# Builds the Cod preview for Apple Silicon macOS and uploads it to a GitHub prerelease (issue #23).
+# This workflow is separate from linux-release.yml so a macOS build never costs Linux preview
+# minutes, and the other way around.
+#
+# It can only start by hand (workflow_dispatch) or by a push to macos-preview/**: a workflow file
+# that is not yet on the default branch cannot be started by workflow_dispatch alone, so a branch
+# push is the only way to try this workflow itself before it is merged. It never runs on
+# pull_request, so a fork's PR (or any PR) never spends these minutes.
+#
+# The macOS archive is unsigned (ad-hoc signature only, script/bundle-cod-mac): code signing and
+# notarization cost money and need a stakeholder decision (#23 out of scope). It targets Apple
+# Silicon only; web page tabs are Linux-only for now (#31 covers the system WKWebView on macOS).
+name: macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a macOS preview prerelease when the build and smoke check pass"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - "macos-preview/**"
+
+permissions:
+  contents: write
+
+# Its own group: a macOS run never waits for, or blocks, a Linux release run.
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # No debug info: keeps the link step and the artifact small, as on Linux.
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      # The same two flags as linux-release.yml, minus the Linux-only mold linker flag.
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable"
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      # sccache keeps every compiled crate in the GitHub Actions cache, the same action and
+      # version as linux-release.yml (a different version would need a separate validation).
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      # Only the cargo registry and git checkouts, like linux-release.yml; the target folder is
+      # left to sccache. Only a push to macos-preview/** writes the cache (this workflow never
+      # runs on master), so a one-off dispatch run from another branch cannot fill or poison it.
+      - name: Restore the cargo registry cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-targets: false
+          cache-on-failure: true
+          save-if: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') }}
+
+      # cod_browser (the off-screen CEF browser helper) and remote_server are Linux-only concerns
+      # for this preview; web pages on macOS use the system WKWebView (#31, not built here yet).
+      - name: Build (cargo release-fast, sccache)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+        run: |
+          sccache --zero-stats
+          cargo build --locked --profile release-fast -p zed -p codctl
+          sccache --show-stats
+          df -h /
+
+      - name: Bundle Cod.app (script/bundle-cod-mac)
+        env:
+          COMMIT: ${{ github.sha }}
+        run: script/bundle-cod-mac
+
+      # Fails the job on the first problem found, printing enough to diagnose it without a Mac at hand.
+      - name: Bundle checks
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          app=dist/Cod.app
+
+          echo "== plutil -lint Info.plist =="
+          plutil -lint "$app/Contents/Info.plist"
+
+          echo "== codesign --verify =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          echo "== file: arch must be arm64 =="
+          for bin in zed codctl; do
+            file "$app/Contents/MacOS/$bin"
+            file "$app/Contents/MacOS/$bin" | grep -q "arm64" || {
+              echo "::error::$bin is not an arm64 binary"
+              exit 1
+            }
+          done
+
+          echo "== otool -L: only /System/ and /usr/lib/ =="
+          for bin in zed codctl; do
+            echo "-- $bin --"
+            otool -L "$app/Contents/MacOS/$bin"
+            other=$(otool -L "$app/Contents/MacOS/$bin" | tail -n +2 | awk '{print $1}' \
+              | grep -v -E '^(/System/|/usr/lib/)' || true)
+            if [ -n "$other" ]; then
+              echo "::error::$bin links libraries outside /System/ and /usr/lib/:"
+              printf '%s\n' "$other"
+              exit 1
+            fi
+          done
+
+          echo "== commit stamp =="
+          echo "Expecting commit $COMMIT"
+          count=$(strings "$app/Contents/MacOS/zed" | grep -c "$COMMIT" || true)
+          echo "Found $count occurrence(s) of $COMMIT in the zed binary"
+          [ "$count" -ge 1 ] || { echo "::error::the zed binary does not contain the full commit $COMMIT"; exit 1; }
+          stamped=$(cat "$app/Contents/Resources/cod-commit.txt")
+          [ "$stamped" = "$COMMIT" ] || { echo "::error::cod-commit.txt has '$stamped', expected '$COMMIT'"; exit 1; }
+
+          echo "== zip checksum =="
+          test -f cod-macos-aarch64.zip
+          test -f cod-macos-aarch64.zip.sha256
+          cat cod-macos-aarch64.zip.sha256
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+
+      # Tests the shipped zip, not the build tree: unzips it fresh, starts Cod.app through its
+      # launcher with an isolated, temporary data folder, and waits for the window before poking
+      # at it with codctl. A crash report under ~/Library/Logs/DiagnosticReports for this run's
+      # process also fails the job, even if the process looked alive at the check below.
+      - name: Smoke test the zip
+        id: smoke
+        run: |
+          set -uo pipefail
+          work=$(mktemp -d)
+          unzip -q cod-macos-aarch64.zip -d "$work"
+          app="$work/Cod.app"
+          data=$(mktemp -d)/cod-preview-smoke
+          mkdir -p "$data"
+          export COD_PREVIEW_DIR="$data"
+
+          mkdir -p smoke-artifacts
+          before_reports=$(ls ~/Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ')
+
+          "$app/Contents/MacOS/cod" &
+          pid=$!
+          sleep 20
+
+          status=0
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::Cod exited within 20 seconds (pid $pid is gone)"
+            status=1
+          fi
+
+          after_reports=$(ls ~/Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$after_reports" -gt "$before_reports" ]; then
+            echo "::error::a new crash report appeared in ~/Library/Logs/DiagnosticReports"
+            ls -t ~/Library/Logs/DiagnosticReports | head -n $((after_reports - before_reports)) \
+              | tee smoke-artifacts/new-crash-reports.txt
+            status=1
+          fi
+
+          echo "== codctl workspace list (proves the command server answers) =="
+          if "$app/Contents/MacOS/codctl" workspace list > smoke-artifacts/codctl-workspace-list.txt 2>&1; then
+            echo "codctl answered:"
+            cat smoke-artifacts/codctl-workspace-list.txt
+          else
+            echo "::error::codctl workspace list failed; Cod's command server did not answer"
+            cat smoke-artifacts/codctl-workspace-list.txt || true
+            status=1
+          fi
+
+          echo "== screenshot =="
+          if screencapture -x smoke-artifacts/screen.png; then
+            echo "Saved smoke-artifacts/screen.png"
+          else
+            echo "::error::screencapture failed: this runner may have no GUI session or no window opened (report this explicitly, do not pass silently)"
+            status=1
+          fi
+
+          if kill -0 "$pid" 2>/dev/null; then
+            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+
+          cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
+            || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
+          find "$data" -iname "Zed.log" -exec cp {} smoke-artifacts/zed.log \; 2>/dev/null || true
+
+          exit $status
+
+      - name: Upload the zip and its checksum
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-aarch64
+          path: |
+            cod-macos-aarch64.zip
+            cod-macos-aarch64.zip.sha256
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload app logs and smoke outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-smoke
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Only a push straight to macos-preview/publish, or a manual run with publish=true, makes a
+      # prerelease. Every other run (macos-preview/dev and any other macos-preview/* branch) only
+      # builds, checks and smoke-tests, so trying this workflow never creates a release by itself.
+      # The tag always carries the run number, so this step only ever creates a new release: it
+      # never edits or deletes one that exists already.
+      - name: Publish a macOS preview prerelease
+        if: >-
+          github.ref == 'refs/heads/macos-preview/publish' ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="macos-preview-${{ github.run_number }}"
+          gh release create "$tag" cod-macos-aarch64.zip cod-macos-aarch64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$tag (macOS, Apple Silicon, unsigned)" \
+            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Web page tabs and agent-made pages are Linux-only for now."
