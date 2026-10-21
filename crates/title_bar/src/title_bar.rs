@@ -313,6 +313,7 @@ impl Render for TitleBar {
             h_flex()
                 .h_full()
                 .min_w_0()
+                .flex_1()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = COD_SHOW_ZED_ITEMS
