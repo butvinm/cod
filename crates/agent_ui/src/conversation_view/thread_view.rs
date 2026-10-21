@@ -7424,7 +7424,7 @@ impl ThreadView {
     /// first) link; stopping the action here (`cx.stop_propagation`) skips that bubble phase
     /// entirely for this key press. A block reached this way starts with no link of its own
     /// focused, so the next Tab/Shift-Tab lands on its first (or last) link the same way entering
-    /// a reply already does. Does nothing — letting the action proceed as before — without a
+    /// a reply already does. Does nothing (letting the action proceed as before) without a
     /// currently focused block, while that block still has somewhere to go on its own, or at
     /// either end of the transcript.
     fn cod_focus_adjacent_reply_markdown(
