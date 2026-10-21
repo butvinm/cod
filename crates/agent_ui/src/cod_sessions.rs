@@ -144,6 +144,21 @@ fn find_chat(
     })
 }
 
+/// Brings this session back into `retained_threads` if the idle-eviction cache had dropped it,
+/// so a caller that needs its real transcript or status (not just to send into it) sees the chat
+/// itself instead of a placeholder. Does nothing when the chat is already resident, or when the
+/// workspace never owned this session id.
+fn ensure_resident(workspace: &Entity<Workspace>, session_id: &str, window: &mut Window, cx: &mut App) {
+    if find_chat(workspace, session_id, cx).is_some() {
+        return;
+    }
+    if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+        panel.update(cx, |panel, cx| {
+            panel.cod_ensure_session_resident(session_id, window, cx)
+        });
+    }
+}
+
 /// Sends the text as the user's message in this session and starts the agent (#39 AC3), the same
 /// way the message box's own submit does, but without ever touching the box's live contents.
 ///
@@ -171,15 +186,7 @@ pub fn send_message(
 ) -> Result<()> {
     // RC review C8: a session the idle-eviction cache dropped from `retained_threads` is still
     // owned by the workspace; bring it back before giving up on it as unknown.
-    if find_chat(workspace, session_id, cx).is_none() {
-        let panel = workspace
-            .read(cx)
-            .panel::<AgentPanel>(cx)
-            .context("the workspace has no agent panel")?;
-        panel.update(cx, |panel, cx| {
-            panel.cod_ensure_session_resident(session_id, window, cx)
-        });
-    }
+    ensure_resident(workspace, session_id, window, cx);
     let view = find_chat(workspace, session_id, cx)
         .with_context(|| format!("unknown session {session_id}"))?;
     let thread_view = view
@@ -221,11 +228,20 @@ fn pending_prompt(thread: &AcpThread, cx: &App) -> Option<String> {
 
 /// The session's current state and the text that goes with it: the pending prompt while it waits
 /// for input, else the last reply (#39 AC4). None when the session is unknown to this workspace.
+///
+/// A session the idle-eviction cache dropped from `retained_threads` is brought back resident
+/// first (the same reload `send_message` already does), so this reports its real status and
+/// transcript, not a placeholder. `cleanup_retained_threads` evicts any chat whose turn ended,
+/// including one with a real reply (`CodChatStatus::Done`), not only a chat that never had one
+/// (`CodChatStatus::Idle`); reporting a reloaded `Done` chat as `Idle` with an empty transcript
+/// used to hide that reply from `codctl session wait` and `codctl session status` alike.
 pub fn session_snapshot(
     workspace: &Entity<Workspace>,
     session_id: &str,
-    cx: &App,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Option<(CodChatStatus, String)> {
+    ensure_resident(workspace, session_id, window, cx);
     if let Some(view) = find_chat(workspace, session_id, cx) {
         let thread_entity = view.read(cx).root_thread(cx)?;
         let thread = thread_entity.read(cx);
@@ -237,10 +253,8 @@ pub fn session_snapshot(
         };
         return Some((status, text));
     }
-    // RC review C8: the chat is owned by the workspace but the idle-eviction cache dropped it
-    // from `retained_threads`. It was necessarily idle when evicted (`cleanup_retained_threads`
-    // only evicts idle chats), so report it idle; its transcript is not available without
-    // bringing it back resident first, which needs a window this read-only query does not have.
+    // The session is owned by the workspace but could not be brought back resident (for example,
+    // its metadata is gone from the `ThreadMetadataStore`). Report it idle rather than unknown.
     let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
     panel
         .read(cx)

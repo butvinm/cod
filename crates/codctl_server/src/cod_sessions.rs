@@ -123,11 +123,12 @@ pub async fn wait_session(
         if cancel.load(Ordering::Acquire) {
             bail!("the client disconnected while this command was still waiting");
         }
-        let Some((_, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
+        let Some((window, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
             bail!("unknown session {session_id}");
         };
-        let Some((status, text)) =
-            cx.update(|cx| agent_ui::cod_sessions::session_snapshot(&workspace, &session_id, cx))
+        let Some((status, text)) = window.update(cx, |_, window, cx| {
+            agent_ui::cod_sessions::session_snapshot(&workspace, &session_id, window, cx)
+        })?
         else {
             bail!("unknown session {session_id}");
         };
@@ -152,8 +153,12 @@ pub async fn wait_session(
 
 /// `codctl session status` (#39 AC5): without a line, reports the state and the current line;
 /// with one (an empty line clears it), sets the override and republishes the overview at once.
+///
+/// Reading the state reloads the session first if the idle-eviction cache had dropped it from
+/// `retained_threads` (the same reload `wait` and `send` use): otherwise an evicted chat whose
+/// turn actually ended with a reply (`done`) used to be reported `idle` instead.
 pub async fn session_status(session_id: String, line: Option<String>, cx: &mut AsyncApp) -> Result<Value> {
-    let Some((_, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
+    let Some((window, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
         bail!("unknown session {session_id}");
     };
     if let Some(line) = line {
@@ -161,12 +166,16 @@ pub async fn session_status(session_id: String, line: Option<String>, cx: &mut A
         cx.update(|cx| agent_ui::cod_sessions::republish(&workspace, cx));
         return Ok(json!({}));
     }
-    let sessions = cx.update(|cx| agent_ui::cod_sessions::list_sessions(&workspace, cx));
-    let info = sessions
-        .into_iter()
-        .find(|info| info.id == session_id)
+    let (status, _text) = window
+        .update(cx, |_, window, cx| {
+            agent_ui::cod_sessions::session_snapshot(&workspace, &session_id, window, cx)
+        })?
         .with_context(|| format!("unknown session {session_id}"))?;
-    Ok(json!({ "state": info.state, "line": info.line }))
+    let line = cx
+        .update(|cx| agent_ui::cod_sessions::line_override(&session_id, cx))
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| status.cod_context().to_owned());
+    Ok(json!({ "state": agent_ui::cod_sessions::state_name(status), "line": line }))
 }
 
 #[cfg(test)]
