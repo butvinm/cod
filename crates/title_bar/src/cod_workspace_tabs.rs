@@ -10,7 +10,7 @@ use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
 use gpui::{
     Animation, AnimationExt as _, Bounds, Entity, MouseButton, WeakEntity, pulsating_between,
 };
-use ui::{Indicator, Tooltip, prelude::*};
+use ui::{IconButtonShape, Indicator, Tooltip, prelude::*};
 use workspace::{CodMember, CodStatus, MultiWorkspace, NewWorkspace};
 
 /// The widest a tab gets, in logical pixels (#25 open question 1).
@@ -267,7 +267,12 @@ pub fn render_cod_workspace_tabs(
             CodMember::Live(workspace) => {
                 let workspace = workspace.clone();
                 let weak = weak.clone();
+                // The same compact shape Zed's own pane tab close button uses (pane.rs), so its
+                // box is tight around the icon and centers the same way the status dot does,
+                // rather than an icon button's usual (taller, padded) click target.
                 let button = IconButton::new(("cod-workspace-tab-close", index), IconName::Close)
+                    .shape(IconButtonShape::Square)
+                    .size(ButtonSize::None)
                     .icon_size(IconSize::XSmall)
                     .tooltip(Tooltip::text("Close Workspace"))
                     .when(!is_active, |button| button.visible_on_hover(""))
