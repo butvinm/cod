@@ -7398,6 +7398,7 @@ impl ThreadView {
             return;
         };
         self.list_state.scroll_to_end();
+        markdown.update(cx, |markdown, cx| markdown.cod_clear_link_focus(cx));
         window.focus(&markdown.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
@@ -7536,6 +7537,7 @@ impl ThreadView {
                 offset_in_item: px(0.),
             });
         }
+        markdown.update(cx, |markdown, cx| markdown.cod_clear_link_focus(cx));
         window.focus(&markdown.read(cx).focus_handle(cx), cx);
         cx.notify();
         cx.stop_propagation();

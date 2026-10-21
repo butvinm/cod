@@ -1180,6 +1180,15 @@ impl Markdown {
         self.focused_link_index
     }
 
+    /// Forgets which link had the keyboard focus, so the next move starts again at the first (or
+    /// last) link (Cod D26): a reply the keyboard enters again must not resume at the link it
+    /// had last time, or Tab and Shift-Tab skip the links before (or after) it.
+    pub fn cod_clear_link_focus(&mut self, cx: &mut Context<Self>) {
+        self.focused_link = None;
+        self.focused_link_index = None;
+        cx.notify();
+    }
+
     /// The rendered text of the link that has the keyboard focus, if any (Cod #28): what the
     /// link shows, not its raw markdown source (which for a real `[text](url)` link also holds
     /// the brackets, the destination and any inline formatting markers its text carries).
