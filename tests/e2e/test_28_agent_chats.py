@@ -343,7 +343,7 @@ class AgentChatLinksTest(CodTestCase):
 
         with self.step("send a new message with codctl while the keyboard is on the oldest reply's first link"):
             # QA on c18d242d36: a new turn scrolled the chat to its end and left the focused link out of view.
-            codctl = Codctl(Path(os.environ["COD_E2E_RUN_DIR"]) / "codctl", self.home)
+            codctl = Codctl(Path(os.environ["COD_E2E_RUN_DIR"]) / "codctl", self.cod.home)
             result = codctl.run("session", "send", "claude-session-pay-1234", "Question 4?")
             self.expect_equal("codctl session send exit code", 0, result.returncode)
             self.wait_for(lambda state: fourth_reply in chat(state).get("transcript", ""), 30, "reply 4")
