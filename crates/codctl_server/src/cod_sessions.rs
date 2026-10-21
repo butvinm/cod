@@ -6,7 +6,10 @@
 //! workspace shown in the active window. `send`, `wait` and `status` address a session only by its
 //! own id, so they search every live workspace of every window for the chat with that id.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    time::{Duration, Instant},
+};
 
 use agent_ui::cod_chat_status::CodChatStatus;
 use anyhow::{Context as _, Result, bail};
@@ -93,11 +96,16 @@ fn timeout_duration(secs: f64) -> Result<Duration> {
 }
 
 /// `codctl session wait` (#39 AC4): polls the session's state until it reaches `until`, the
-/// timeout runs out, or the session fails.
+/// timeout runs out, the session fails, or the client disconnects (RC review A6).
+///
+/// Without `--timeout` this can poll for as long as the session takes, which may be a very long
+/// time; `cancel` is set by the server's client thread once it notices the client disconnected,
+/// so this loop stops instead of running forever for a reply nobody will ever read.
 pub async fn wait_session(
     session_id: String,
     until: String,
     timeout: Option<f64>,
+    cancel: Arc<AtomicBool>,
     cx: &mut AsyncApp,
 ) -> Result<Value> {
     if !matches!(until.as_str(), "idle" | "needs-input") {
@@ -112,6 +120,9 @@ pub async fn wait_session(
         None => None,
     };
     loop {
+        if cancel.load(Ordering::Acquire) {
+            bail!("the client disconnected while this command was still waiting");
+        }
         let Some((_, workspace)) = cx.update(|cx| find_session_workspace(&session_id, cx)) else {
             bail!("unknown session {session_id}");
         };

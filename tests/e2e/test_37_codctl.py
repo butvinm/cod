@@ -18,6 +18,7 @@ from typing import Any
 
 from cod_e2e import CodTestCase, make_repo
 from cod_status_fixtures import CodStatusFixtures
+from fake_acp_agent import fake_agent_settings
 
 PAY_NAME = "[PAY-1234] (billing-api) Fix invoice rounding"
 WEB_NAME = "[PAY-1234] (billing-web) Show rounded totals"
@@ -48,6 +49,23 @@ COMMANDS = ["new", "list", "focus", "rename", "close", "add-folder"]
 
 def real(path: str | Path) -> str:
     return os.path.realpath(path)
+
+
+def count_threads_named(pid: int, name: str) -> int:
+    """How many threads of the process `pid` are named `name` (RC review A6): Cod names the
+    codctl server's per-client thread "codctl-client", so a disconnected `session wait` that
+    still has its thread blocked in `answer.recv()` shows up here even though nothing in the
+    driver state reflects it."""
+    task_dir = Path(f"/proc/{pid}/task")
+    count = 0
+    for entry in task_dir.iterdir():
+        try:
+            comm = (entry / "comm").read_text().strip()
+        except OSError:
+            continue
+        if comm == name:
+            count += 1
+    return count
 
 
 class Codctl:
@@ -219,6 +237,47 @@ class CodctlTest(CodStatusFixtures, CodTestCase):
             self.expect_equal("owner of the socket", os.getuid(), socket_stat.st_uid)
             self.expect_equal("group and other access to the socket folder", "0", oct(folder_stat.st_mode & 0o077)[2:])
             self.expect_equal("group and other access to the socket", "0", oct(socket_stat.st_mode & 0o077)[2:])
+
+    def test_a6_a_disconnected_session_wait_does_not_leak_a_server_thread(self) -> None:
+        """RC review A6: a client that disconnects during `session wait` (no --timeout) must
+        not leave the server's client thread blocked in answer.recv() forever, nor its
+        foreground poll task running for nobody. A session that never reaches needs-input (the
+        fake agent's script has no turns) makes the wait block exactly like a real, slow agent
+        would, until the client goes away."""
+        with self.step("start Cod with a fake claude agent and open a session that stays idle"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            script = self.workdir / "a6-agent.json"
+            script.write_text(json.dumps({"session_ids": ["a6-session"], "turns": []}))
+            agent_servers = {"claude": fake_agent_settings(script, log=self.workdir / "a6-agent.log")}
+            self.start_cod(api, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: real(api) in [real(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+            new_result = self.codctl.run("session", "new", "--agent", "claude")
+            self.expect_result(new_result, 0, stderr="")
+            session_id = new_result.stdout.strip()
+            assert session_id, f"codctl session new --agent claude printed nothing: {new_result!r}"
+            assert self.cod is not None and self.cod.process is not None
+            pid = self.cod.process.pid
+
+        with self.step("baseline count of the server's own per-client threads"):
+            baseline = count_threads_named(pid, "codctl-client")
+
+        with self.step("start and disconnect several session wait calls that never resolve on their own"):
+            for _ in range(5):
+                waiting = self.codctl.start("session", "wait", session_id, "--until", "needs-input")
+                time.sleep(0.3)
+                waiting.kill()
+                waiting.wait(timeout=COMMAND_TIMEOUT)
+
+        with self.step("the disconnected waits do not leave their server threads blocked in answer.recv() forever"):
+            self.wait_for(
+                lambda _: count_threads_named(pid, "codctl-client") <= baseline,
+                SHOW_TIMEOUT,
+                "the disconnected session wait threads to exit instead of staying blocked",
+            )
 
     # AC2
 

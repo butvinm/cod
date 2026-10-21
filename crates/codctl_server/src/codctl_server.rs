@@ -11,7 +11,10 @@
 mod cod_agent_pages;
 mod cod_sessions;
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use codctl::Request;
@@ -43,6 +46,12 @@ pub fn init(_cx: &mut App) {}
 struct Job {
     request: Request,
     reply: std::sync::mpsc::Sender<Result<Value, String>>,
+    /// Set by the client thread when it notices the client disconnected before the reply was
+    /// ready (RC review A6): the one request that can run long enough to matter,
+    /// `cod_sessions::wait_session`'s poll loop, checks this and stops instead of running
+    /// forever for nobody. Every other request finishes too quickly for a client to disconnect
+    /// in time to matter, so it is simply ignored there.
+    cancel: Arc<AtomicBool>,
 }
 
 /// Opens the socket and runs every request on the foreground, each as its own task.
@@ -64,18 +73,20 @@ async fn serve(path: PathBuf, cx: &mut AsyncApp) {
         }
     }
     while let Some(job) = incoming.next().await {
+        let Job { request, reply, cancel } = job;
         cx.spawn(async move |cx| {
-            let reply = run(job.request, cx)
+            let result = run(request, cancel, cx)
                 .await
                 .map_err(|error| format!("{error:#}"));
-            job.reply.send(reply).ok();
+            reply.send(result).ok();
         })
         .detach();
     }
 }
 
-/// Runs one request on the foreground.
-async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
+/// Runs one request on the foreground. `cancel` is set by the client thread if it notices the
+/// client disconnected (RC review A6); only `SessionWait` ever runs long enough to check it.
+async fn run(request: Request, cancel: Arc<AtomicBool>, cx: &mut AsyncApp) -> Result<Value> {
     match request {
         Request::WorkspaceList => Ok(cx.update(|cx| Value::Array(list(cx)))),
         Request::WorkspaceNew {
@@ -146,7 +157,7 @@ async fn run(request: Request, cx: &mut AsyncApp) -> Result<Value> {
             session,
             until,
             timeout,
-        } => cod_sessions::wait_session(session, until, timeout, cx).await,
+        } => cod_sessions::wait_session(session, until, timeout, cancel, cx).await,
         Request::SessionStatus { session, line } => cod_sessions::session_status(session, line, cx).await,
     }
 }
@@ -1038,19 +1049,29 @@ pub fn check_folders(request: &Request) -> Result<(), String> {
 mod socket {
     use std::{
         fs,
-        io::{BufRead as _, BufReader, Write as _},
+        io::{self, BufRead as _, BufReader, Write as _},
         os::unix::{
             fs::{DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
             net::{UnixListener, UnixStream},
         },
         path::Path,
-        sync::mpsc,
+        sync::{
+            Arc, atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
     };
 
     use anyhow::{Context as _, Result, bail};
     use futures::channel::mpsc::UnboundedSender;
+    use serde_json::Value;
 
     use super::{Job, check_folders};
+
+    /// How often `serve_client` checks, between polls for the reply, whether the client is
+    /// still there (RC review A6): short enough that a disconnect is noticed quickly, long
+    /// enough that it never meaningfully delays a reply that was already on its way.
+    const DISCONNECT_POLL: Duration = Duration::from_millis(200);
 
     /// What the server needs to know about the folder that holds the socket.
     #[derive(Debug, Clone, Copy)]
@@ -1194,8 +1215,50 @@ mod socket {
         }
     }
 
+    /// Whether the peer has closed its end of `watch` (RC review A6), checked without
+    /// disturbing any other descriptor of the same connection: `watch` is its own clone, the
+    /// nonblocking flag it sets is restored before this returns, and the single thread that owns
+    /// every descriptor of this connection never has another one in a blocking read at the same
+    /// time (it is either blocked in `reader.lines()` or in here, never both).
+    fn client_disconnected(watch: &UnixStream) -> Result<bool> {
+        watch.set_nonblocking(true).context("cannot poll the client connection")?;
+        let mut probe = [0u8; 1];
+        let result = match watch.peek(&mut probe) {
+            Ok(0) => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error).context("cannot poll the client connection"),
+        };
+        watch.set_nonblocking(false).context("cannot restore the client connection")?;
+        result
+    }
+
+    /// Waits for the job's reply, giving up (RC review A6) once `watch` shows the client is
+    /// gone: a `session wait` without `--timeout` can otherwise block here for as long as the
+    /// session takes, which may be forever, for a reply nobody is left to read. `cancel` tells
+    /// the foreground task to stop polling too, instead of leaving it running for nobody.
+    fn wait_for_reply(
+        answer: &mpsc::Receiver<Result<Value, String>>,
+        watch: &UnixStream,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Result<Value, String>> {
+        loop {
+            match answer.recv_timeout(DISCONNECT_POLL) {
+                Ok(result) => return Ok(result),
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the codctl server stopped"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if client_disconnected(watch)? {
+                        cancel.store(true, Ordering::Release);
+                        bail!("the client disconnected before the reply was ready");
+                    }
+                }
+            }
+        }
+    }
+
     fn serve_client(stream: UnixStream, jobs: UnboundedSender<Job>) -> Result<()> {
         let mut writer = stream.try_clone().context("cannot clone the client stream")?;
+        let watch = stream.try_clone().context("cannot clone the client stream")?;
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             let line = line.context("cannot read a request")?;
@@ -1207,16 +1270,18 @@ mod socket {
                     let result = match check_folders(&envelope.request) {
                         Ok(()) => {
                             let (reply, answer) = mpsc::channel();
+                            let cancel = Arc::new(AtomicBool::new(false));
                             if jobs
                                 .unbounded_send(Job {
                                     request: envelope.request,
                                     reply,
+                                    cancel: cancel.clone(),
                                 })
                                 .is_err()
                             {
                                 bail!("the codctl server stopped");
                             }
-                            answer.recv().context("the codctl server stopped")?
+                            wait_for_reply(&answer, &watch, &cancel)?
                         }
                         Err(error) => Err(error),
                     };
@@ -1237,10 +1302,42 @@ mod socket {
 
     #[cfg(test)]
     mod tests {
-        use super::{FolderFacts, folder_problem};
+        use std::os::unix::net::UnixStream;
+
+        use super::{FolderFacts, client_disconnected, folder_problem};
 
         const USER: u32 = 1000;
         const DIR: u32 = 0o040000;
+
+        // RC review A6: `client_disconnected` is what lets `serve_client` notice a gone client
+        // without ever touching the request-reading side of the same connection.
+
+        #[test]
+        fn client_disconnected_is_false_while_the_peer_is_still_there() {
+            let (watch, _peer) = UnixStream::pair().unwrap();
+            assert!(!client_disconnected(&watch).unwrap());
+        }
+
+        #[test]
+        fn client_disconnected_is_true_once_the_peer_drops_its_end() {
+            let (watch, peer) = UnixStream::pair().unwrap();
+            drop(peer);
+            assert!(client_disconnected(&watch).unwrap());
+        }
+
+        #[test]
+        fn checking_for_a_disconnect_leaves_the_socket_in_blocking_mode() {
+            use std::os::fd::AsRawFd as _;
+
+            let (watch, _peer) = UnixStream::pair().unwrap();
+            client_disconnected(&watch).unwrap();
+            // `serve_client` shares this fd's underlying open file description with `reader`
+            // (both come from the same `try_clone`), which needs blocking reads between
+            // requests; checking the kernel's own flag here is more direct than relying on a
+            // read actually blocking.
+            let flags = unsafe { libc::fcntl(watch.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(flags & libc::O_NONBLOCK, 0, "O_NONBLOCK must be cleared again");
+        }
 
         fn folder(mode: u32) -> FolderFacts {
             FolderFacts {
