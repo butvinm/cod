@@ -159,19 +159,34 @@ jobs:
           export COD_PREVIEW_DIR="$data"
 
           mkdir -p smoke-artifacts
-          before_reports=$(ls ~/Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ')
+          status=0
+
+          # GitHub Actions runs this step as `bash -eo pipefail`, on top of this script's own
+          # `set -uo pipefail`, so `ls <missing dir> | wc -l` would abort the whole step right
+          # here before Cod is even launched (its own nonzero exit survives the pipe under
+          # pipefail, and -e then exits the script, since it is a plain command, not part of an
+          # if/while condition). Reports_count uses `[ -d ... ]` instead, which -e does not
+          # apply to, and never created ~/Library/Logs/DiagnosticReports itself: a missing
+          # folder reads as zero reports, not as a reason to stop (#23 AC-R4).
+          reports_count() {
+            if [ -d ~/Library/Logs/DiagnosticReports ]; then
+              find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' '
+            else
+              echo 0
+            fi
+          }
+          before_reports=$(reports_count)
 
           "$app/Contents/MacOS/cod" &
           pid=$!
           sleep 20
 
-          status=0
           if ! kill -0 "$pid" 2>/dev/null; then
             echo "::error::Cod exited within 20 seconds (pid $pid is gone)"
             status=1
           fi
 
-          after_reports=$(ls ~/Library/Logs/DiagnosticReports 2>/dev/null | wc -l | tr -d ' ')
+          after_reports=$(reports_count)
           if [ "$after_reports" -gt "$before_reports" ]; then
             echo "::error::a new crash report appeared in ~/Library/Logs/DiagnosticReports"
             ls -t ~/Library/Logs/DiagnosticReports | head -n $((after_reports - before_reports)) \
