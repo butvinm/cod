@@ -1290,6 +1290,32 @@ impl AgentPanel {
                 .detach_and_log_err(cx);
         }
 
+        // Cod (#28, RC review C7): a draft never has a session id, so the assignment above can
+        // never claim it, whether it is the ephemeral new-draft slot or a parked draft the user
+        // navigated away from (kept alive with its own content in `retained_threads`). Without
+        // this, such a draft belongs to no workspace: it is left out of a workspace's chats when
+        // they come back after a restart, and it is not deleted when the workspace closes for
+        // good. Assign it by its own stable thread id instead.
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let draft_thread_ids = self
+                .draft_thread
+                .iter()
+                .chain(self.retained_threads.values())
+                .filter(|view| {
+                    view.read(cx)
+                        .root_thread(cx)
+                        .is_some_and(|thread| thread.read(cx).is_draft_thread())
+                })
+                .map(|view| view.read(cx).thread_id)
+                .collect::<HashSet<_>>();
+            for thread_id in draft_thread_ids {
+                store
+                    .read(cx)
+                    .cod_assign_chat_by_thread_id(thread_id, i64::from(workspace_id), cx)
+                    .detach_and_log_err(cx);
+            }
+        }
+
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(
@@ -9485,7 +9511,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        panel.read_with(cx, |panel, cx| {
+        panel.read_with(cx, |panel, _cx| {
             assert!(
                 panel.retained_threads.contains_key(&parked_draft_id),
                 "the unsent draft should be parked into retained_threads"
