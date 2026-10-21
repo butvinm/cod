@@ -27,12 +27,17 @@ static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 
 use protocol::{MAX_URL_BYTES, limited};
 
-/// Whether a console line is forwarded even once the pending-console backlog is already at
-/// `MAX_PENDING_CONSOLE` (RC review B5, final batch): a bridge call (`BRIDGE_PREFIX`) always is;
-/// an ordinary diagnostic only while the backlog still has room. See `on_console_message` for
-/// why a bridge call must never be the one this backpressure drops.
+/// Whether a console line is forwarded at this pending-console backlog (RC review B5, final
+/// batch): an ordinary diagnostic only below `MAX_PENDING_CONSOLE`, a bridge call
+/// (`BRIDGE_PREFIX`) also through a full backlog of ordinary lines, up to
+/// `protocol::BRIDGE_HEADROOM` more, so a flood of bridge-prefixed lines stays bounded. See
+/// `on_console_message` for why a bridge call must not be what ordinary console spam crowds out.
 fn forward_despite_backlog(text: &str, pending: usize) -> bool {
-    text.starts_with(protocol::BRIDGE_PREFIX) || pending < MAX_PENDING_CONSOLE
+    if text.starts_with(protocol::BRIDGE_PREFIX) {
+        pending < MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
+    } else {
+        pending < MAX_PENDING_CONSOLE
+    }
 }
 
 enum Outgoing {
@@ -769,7 +774,21 @@ mod tests {
     fn a_bridge_call_is_forwarded_even_once_the_backlog_is_completely_full() {
         let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
         assert!(forward_despite_backlog(&line, MAX_PENDING_CONSOLE));
-        assert!(forward_despite_backlog(&line, MAX_PENDING_CONSOLE * 4));
+        assert!(forward_despite_backlog(
+            &line,
+            MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM - 1
+        ));
+    }
+
+    // RC review residual: bridge-prefixed lines bypassed the cap entirely, so a `--js` page
+    // flooding them could grow the helper's queue without bound.
+    #[test]
+    fn a_flood_of_bridge_lines_stays_bounded() {
+        let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
+        assert!(!forward_despite_backlog(
+            &line,
+            MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
+        ));
     }
 
     #[test]

@@ -219,6 +219,9 @@ pub struct OffscreenView {
     /// calls are only ever acted on while `url` still equals this. Always `None` for a page that
     /// is not `PageKind::Agent`.
     agent_document_url: Option<SharedString>,
+    /// The bridge token of that agent document (`agent_bridge::document_token`): a bridge call
+    /// is acted on only when it carries this token.
+    agent_token: Option<String>,
     /// Set once the main frame's address changes away from `agent_document_url`: a same-tab
     /// navigation to another document (an external site, another `data:` URL) must not keep the
     /// bridge privileges of the agent document it replaced (RC review B2).
@@ -361,12 +364,16 @@ impl OffscreenView {
         }
 
         let agent_document_url = (kind == PageKind::Agent).then(|| SharedString::from(url.clone()));
+        let agent_token = agent_document_url
+            .as_deref()
+            .and_then(crate::agent_bridge::document_token);
         Self {
             page_id,
             kind,
             workspace: None,
             url: url.into(),
             agent_document_url,
+            agent_token,
             agent_navigated_away: false,
             title: None,
             loading: true,
@@ -656,10 +663,15 @@ impl OffscreenView {
                     // review B2 for `--js` pages, where no CSP blocks `<iframe>` the way it does
                     // without `--js`): a bridge call from Cod's own bootstrap script is acted on
                     // and never shown as page console output (#43).
+                    // The call must also carry the agent document's own token (RC review
+                    // residual): an empty console source cannot be told apart from the main
+                    // frame's, but a subframe of another origin cannot read the token.
                     if self.kind == PageKind::Agent
                         && !self.agent_navigated_away
                         && self.bridge_source_is_main_frame(&line.source)
                         && let Some(call) = crate::agent_bridge::parse_bridge_message(&line.message)
+                        && self.agent_token.is_some()
+                        && call.token == self.agent_token
                     {
                         self.dispatch_bridge_call(call, window, cx);
                         continue;

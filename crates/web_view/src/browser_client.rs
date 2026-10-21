@@ -49,11 +49,16 @@ pub(crate) enum PageEvent {
 /// Console messages kept per page between two looks by the UI; later ones are counted and dropped.
 const MAX_PENDING_CONSOLE: usize = 64;
 
-/// Whether a console line is kept even once `current_len` has already reached
-/// `MAX_PENDING_CONSOLE` (RC review B5, final batch): a bridge call (`BRIDGE_PREFIX`) always is;
-/// an ordinary diagnostic only while the backlog still has room.
+/// Whether a console line is kept at this backlog (RC review B5, final batch): an ordinary
+/// diagnostic only below `MAX_PENDING_CONSOLE`, a bridge call (`BRIDGE_PREFIX`) also through a
+/// full backlog of ordinary lines, up to `protocol::BRIDGE_HEADROOM` more, so a flood of
+/// bridge-prefixed lines stays bounded.
 fn keep_despite_backlog(message: &str, current_len: usize) -> bool {
-    message.starts_with(protocol::BRIDGE_PREFIX) || current_len < MAX_PENDING_CONSOLE
+    if message.starts_with(protocol::BRIDGE_PREFIX) {
+        current_len < MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
+    } else {
+        current_len < MAX_PENDING_CONSOLE
+    }
 }
 
 /// What the page reported since the UI last looked. Title, address and loading state keep only the latest value, console output is capped, so a busy UI never accumulates an unbounded backlog.
@@ -688,7 +693,21 @@ mod tests {
     fn a_bridge_call_is_kept_even_once_the_backlog_is_completely_full() {
         let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
         assert!(keep_despite_backlog(&line, MAX_PENDING_CONSOLE));
-        assert!(keep_despite_backlog(&line, MAX_PENDING_CONSOLE * 4));
+        assert!(keep_despite_backlog(
+            &line,
+            MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM - 1
+        ));
+    }
+
+    // RC review residual: bridge-prefixed lines bypassed the cap entirely, so a `--js` page
+    // flooding them could grow this queue without bound.
+    #[test]
+    fn a_flood_of_bridge_lines_stays_bounded() {
+        let line = format!("{}{{\"name\":\"submit\",\"args\":{{}}}}", protocol::BRIDGE_PREFIX);
+        assert!(!keep_despite_backlog(
+            &line,
+            MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
+        ));
     }
 
     #[test]

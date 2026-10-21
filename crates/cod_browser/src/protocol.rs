@@ -17,6 +17,13 @@ pub const MAX_URL_BYTES: usize = 8192;
 /// page is expected to start a log line this way.
 pub const BRIDGE_PREFIX: &str = "cod:bridge:";
 
+/// How many bridge lines may queue beyond the ordinary console backlog, on each side of the
+/// helper connection. A bridge line must not be dropped just because ordinary console output
+/// filled the backlog, but a page that floods bridge-prefixed lines (only a `--js` page can) must
+/// not grow memory without bound either. A user's click sends one line, so this is far above
+/// any real page.
+pub const BRIDGE_HEADROOM: usize = 64;
+
 /// The name of the sentinel bridge call the engine sends in place of a bridge console line it
 /// cannot carry whole (RC review B5): `args` is always empty. Cod's side recognizes this name
 /// specially and closes the page instead of leaving `codctl open --html --wait` blocked forever
@@ -56,7 +63,27 @@ pub fn console_payload(text: &str, console_limit: usize) -> String {
     if text.len() <= MAX_BRIDGE_BYTES {
         return text.to_owned();
     }
-    format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}")
+    // Cod accepts a bridge call only with its document's token, which Cod's bootstrap writes as
+    // the last field of the call, so the sentinel carries the token over from the call's tail.
+    match bridge_token_at_end(text) {
+        Some(token) => format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}},\"t\":\"{token}\"}}"
+        ),
+        None => format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}"),
+    }
+}
+
+/// The token of a bridge call whose JSON ends with `,"t":"<token>"}`, as Cod's bootstrap writes
+/// it. Only base64 characters count as a token, so nothing else in the call can pass for one.
+fn bridge_token_at_end(text: &str) -> Option<&str> {
+    let rest = text.strip_suffix("\"}")?;
+    let start = rest.rfind(",\"t\":\"")? + ",\"t\":\"".len();
+    let token = &rest[start..];
+    (!token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')))
+    .then_some(token)
 }
 
 pub const KEY_RAW_DOWN: u8 = 0;
@@ -859,5 +886,28 @@ mod tests {
         let payload = console_payload(&line, 4096);
         let expected = format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}");
         assert_eq!(payload, expected);
+    }
+
+    // RC review residual: Cod acts only on bridge calls with their document's token, so the
+    // sentinel for an oversized call must keep the call's token or the page would never close.
+    #[test]
+    fn the_oversized_sentinel_keeps_the_calls_document_token() {
+        let value = "x".repeat(200_000);
+        let line = format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}},\"t\":\"q+8/Zz==\"}}"
+        );
+        let payload = console_payload(&line, 4096);
+        let expected = format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}},\"t\":\"q+8/Zz==\"}}"
+        );
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn only_base64_at_the_end_of_a_call_counts_as_its_token() {
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":"abc+/="}"#), Some("abc+/="));
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":"a\"b"}"#), None);
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":""}"#), None);
+        assert_eq!(bridge_token_at_end(r#"{"args":{"t":"x"}}"#), None);
     }
 }

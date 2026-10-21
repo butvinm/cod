@@ -30,6 +30,8 @@ pub const ALLOWED_ACTIONS: &[&str] = &["submit", "open-file", "focus-session"];
 pub struct BridgeCall {
     pub name: String,
     pub args: Value,
+    /// The document token the call carries (`document_token`), if any.
+    pub token: Option<String>,
 }
 
 /// Reads a bridge call from one console line, if it is one.
@@ -38,7 +40,28 @@ pub fn parse_bridge_message(line: &str) -> Option<BridgeCall> {
     let value: Value = serde_json::from_str(payload).ok()?;
     let name = value.get("name")?.as_str()?.to_owned();
     let args = value.get("args").cloned().unwrap_or(Value::Null);
-    Some(BridgeCall { name, args })
+    let token = value.get("t").and_then(Value::as_str).map(str::to_owned);
+    Some(BridgeCall { name, args, token })
+}
+
+/// The marker in Cod's bootstrap script just before the document's token.
+const TOKEN_MARKER: &str = ",t:'";
+
+/// The random token Cod's own bootstrap script puts in every bridge call of this agent document,
+/// read back from the document's `data:` URL (RC review residual, B2 for `--js` pages). Cod's
+/// prelude always comes first in the document, so the first `<script>` element is Cod's
+/// bootstrap, never page content. The token lives only in that script's closure: a subframe of
+/// another origin cannot read it, so a console line it forges carries no valid token, whatever
+/// source CEF reports for that line.
+pub fn document_token(document_url: &str) -> Option<String> {
+    use base64::Engine as _;
+    let encoded = document_url.strip_prefix("data:text/html;charset=utf-8;base64,")?;
+    let html = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let html = String::from_utf8(html).ok()?;
+    let bootstrap = &html[..html.find("</script>")?];
+    let start = bootstrap.find(TOKEN_MARKER)? + TOKEN_MARKER.len();
+    let length = bootstrap[start..].find('\'')?;
+    Some(bootstrap[start..start + length].to_owned())
 }
 
 /// A string argument of a bridge call, or empty when it is missing.
@@ -160,7 +183,10 @@ fn js_string(text: &str) -> String {
 /// RC review B1): it names this `<script>` element as the one the page's CSP allows to run, so
 /// the bootstrap keeps working even while every other script and inline event handler the page's
 /// own content tries to run is blocked.
-pub fn bootstrap_script(vars: &ThemeVars, nonce: Option<&str>) -> String {
+///
+/// `token` is the document's own bridge token (`document_token`): every call carries it, and Cod
+/// acts only on calls with the token of the agent document it built.
+pub fn bootstrap_script(vars: &ThemeVars, nonce: Option<&str>, token: &str) -> String {
     let nonce_attr = match nonce {
         Some(nonce) => format!(" nonce=\"{nonce}\""),
         None => String::new(),
@@ -168,7 +194,7 @@ pub fn bootstrap_script(vars: &ThemeVars, nonce: Option<&str>) -> String {
     format!(
         "<script{nonce_attr}>(function(){{\
          {theme_vars}\
-         function codSend(name,args){{console.log({prefix}+JSON.stringify({{name:name,args:args||{{}}}}));}}\
+         function codSend(name,args){{console.log({prefix}+JSON.stringify({{name:name,args:args||{{}}{TOKEN_MARKER}{token}'}}));}}\
          window.cod={{call:codSend}};\
          document.addEventListener('click',function(e){{\
          var el=e.target&&e.target.closest?e.target.closest('[data-cod]'):null;\
@@ -287,10 +313,11 @@ pub fn strip_inline_scripts(html: &str) -> String {
 /// consent to run the page's own JavaScript, so no CSP is added for it: the page's scripts run as
 /// they always have, Cod's bootstrap included.
 pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars) -> String {
+    let token = new_nonce();
     if allow_js {
         return format!(
             "<!doctype html><html><head>{}</head>{source_html}",
-            bootstrap_script(vars, None)
+            bootstrap_script(vars, None, &token)
         );
     }
     let body = strip_inline_scripts(source_html);
@@ -298,7 +325,7 @@ pub fn build_agent_document(source_html: &str, allow_js: bool, vars: &ThemeVars)
     format!(
         "<!doctype html><html><head>{}{}</head>{body}",
         csp_meta_tag(&nonce),
-        bootstrap_script(vars, Some(&nonce))
+        bootstrap_script(vars, Some(&nonce), &token)
     )
 }
 
@@ -530,6 +557,43 @@ mod tests {
     fn allow_js_adds_no_content_security_policy() {
         let built = build_agent_document("<p>hi</p>", true, &vars());
         assert!(!built.contains("Content-Security-Policy"));
+    }
+
+    // RC review residual (B2 for `--js` pages): bridge calls are matched to their document by a
+    // random token in Cod's bootstrap, not by the console source CEF reports.
+    #[test]
+    fn the_document_token_round_trips_through_the_data_url_with_and_without_js() {
+        for allow_js in [true, false] {
+            let built = build_agent_document("<p>hi</p>", allow_js, &vars());
+            let token = document_token(&data_url(&built)).expect("a token in Cod's bootstrap");
+            assert!(token.len() >= 20);
+            assert!(built.contains(&format!("{TOKEN_MARKER}{token}'")));
+        }
+    }
+
+    #[test]
+    fn a_token_written_by_the_page_itself_is_never_the_documents_token() {
+        let page = "<p>,t:'forged'</p><script>console.log(\",t:'forged'\")</script>";
+        let built = build_agent_document(page, true, &vars());
+        let token = document_token(&data_url(&built)).expect("a token in Cod's bootstrap");
+        assert_ne!(token, "forged");
+    }
+
+    #[test]
+    fn two_documents_never_share_a_token() {
+        let first = document_token(&data_url(&build_agent_document("<p>a</p>", true, &vars())));
+        let second = document_token(&data_url(&build_agent_document("<p>a</p>", true, &vars())));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_bridge_call_carries_its_token() {
+        let call = parse_bridge_message(r#"cod:bridge:{"name":"submit","args":{},"t":"abc"}"#)
+            .expect("a bridge call");
+        assert_eq!(call.token.as_deref(), Some("abc"));
+        let call = parse_bridge_message(r#"cod:bridge:{"name":"submit","args":{}}"#)
+            .expect("a bridge call");
+        assert_eq!(call.token, None);
     }
 
     #[test]
