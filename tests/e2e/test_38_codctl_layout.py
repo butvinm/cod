@@ -209,14 +209,16 @@ class LayoutTest(CodTestCase):
             self.expect_result(split_down, 0, stderr="")
             c_id = int(split_down.stdout)
             self.wait_for(lambda state: len(self.panes_json()) == 3, SHOW_TIMEOUT, "three panes after the second split")
-            # Splitting A down may replace A's own pane id with two fresh ones (top and bottom);
-            # c_id is one of them, by the split command's own result. The third id, whatever it
-            # now is, is A's other half, found here by elimination instead of assumed to still
-            # be `first`.
-            a_id = next(pane["id"] for pane in self.panes_json() if pane["id"] not in (b_id, c_id))
 
         with self.step("B is full height before any resize, A and C each about half of it"):
+            # One snapshot for everything below: splitting A down may replace A's own pane id
+            # with two fresh ones (top and bottom), c_id is one of them by the split command's
+            # own result, and the third id, whatever it now is, is A's other half, found here by
+            # elimination instead of assumed to still be `first`. Two separate driver calls could
+            # race a layout still settling right after the split; one snapshot cannot.
             before = {pane["id"]: pane["bounds"] for pane in self.panes_json()}
+            self.expect_equal("three panes after both splits", 3, len(before))
+            a_id = next(pane_id for pane_id in before if pane_id not in (b_id, c_id))
             full_height = before[b_id]["height"]
             self.expect_equal("A is about half height", True, abs(before[a_id]["height"] - full_height / 2) < 5)
             self.expect_equal("C is about half height", True, abs(before[c_id]["height"] - full_height / 2) < 5)
