@@ -1136,13 +1136,34 @@ impl MultiWorkspace {
         self.cod_pressed_tab.is_some()
     }
 
-    /// Cod (#25): shows the member, loading it first when it is pending.
+    /// Cod (#25): shows the member, loading it first when it is pending. See
+    /// `cod_show_member_awaiting` for a caller that needs the outcome instead of fire-and-forget.
     pub fn cod_show_member(
         &mut self,
         member: CodMember,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cod_show_member_awaiting(member, window, cx)
+            .detach_and_log_err(cx);
+    }
+
+    /// Cod (#25, RC review A4): the same request `cod_show_member` makes for a tab click, as a
+    /// task a caller can await instead of fire-and-forget.
+    ///
+    /// `codctl workspace focus` used to call `activate` and `cod_show_pending` directly, without
+    /// this bump: a pending member B already loading would then finish after a CLI `workspace
+    /// focus A` and still switch away from A, because the stale-load check
+    /// (`cod_join_loading_member`) only ever compares against the window's activation stamp, and
+    /// the CLI focus never touched it. Routing both the tab click and the CLI command through
+    /// this one bump keeps every "show this workspace" request, however it was asked for,
+    /// indistinguishable to that check.
+    pub fn cod_show_member_awaiting(
+        &mut self,
+        member: CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
         // Cod (#25 review): a fresh request even when `member` is the one already shown, so a
         // pending member loading elsewhere knows a newer request came in (see
         // `CodActivationIntents` and `cod_activate_pending`, which bumps again for its own
@@ -1150,10 +1171,11 @@ impl MultiWorkspace {
         let window_entity = cx.entity_id();
         CodActivationIntents::bump(cx, window_entity);
         match member {
-            CodMember::Live(workspace) => self.activate(workspace, None, window, cx),
-            CodMember::Pending(id) => self
-                .cod_show_pending(id, window, cx)
-                .detach_and_log_err(cx),
+            CodMember::Live(workspace) => {
+                self.activate(workspace, None, window, cx);
+                Task::ready(Ok(()))
+            }
+            CodMember::Pending(id) => self.cod_show_pending(id, window, cx),
         }
     }
 }

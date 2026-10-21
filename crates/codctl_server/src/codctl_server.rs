@@ -460,21 +460,20 @@ async fn rename_workspace(reference: &str, name: String, cx: &mut AsyncApp) -> R
 async fn focus_workspace(reference: &str, cx: &mut AsyncApp) -> Result<Value> {
     let member = cx.update(|cx| resolve(reference, cx))?;
     let id = id_of(&member)?;
-    match member.live {
-        Some(workspace) => member
-            .window
-            .update(cx, |multi_workspace, window, cx| {
-                multi_workspace.activate(workspace, None, window, cx)
-            })?,
-        None => {
-            member
-                .window
-                .update(cx, |multi_workspace, window, cx| {
-                    multi_workspace.cod_show_pending(id, window, cx)
-                })?
-                .await?
-        }
-    }
+    // RC review A4: routed through the same activation-intent bump a tab click makes
+    // (`cod_show_member_awaiting`), live or pending, instead of calling `activate` or
+    // `cod_show_pending` directly; a CLI focus bypassing that bump used to let a still-loading
+    // pending member's completion switch away from the workspace this command just showed.
+    let target = match member.live {
+        Some(workspace) => CodMember::Live(workspace),
+        None => CodMember::Pending(id),
+    };
+    member
+        .window
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.cod_show_member_awaiting(target, window, cx)
+        })?
+        .await?;
     Ok(json!({ "id": i64::from(id) }))
 }
 

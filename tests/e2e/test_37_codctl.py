@@ -396,6 +396,40 @@ class CodctlTest(CodTestCase):
             self.expect_result(self.codctl.run("workspace", "focus", str(first)), 0, stdout="", stderr="")
             self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
 
+    def test_a4_cli_focus_does_not_lose_to_a_still_loading_pending_tabs_completion(self) -> None:
+        """RC review A4: `workspace focus` must bump the window's activation intent exactly as a
+        tab click does. Start loading pending billing-web, then `workspace focus` billing-api
+        while it is still shown; billing-web's own completion must not switch away from
+        billing-api afterwards."""
+        with self.step("save a session with billing-api active and billing-web added, then restart so billing-web is pending"):
+            api = self.make_work_repo("billing-api", BILLING_API)
+            web = self.make_work_repo("billing-web", BILLING_WEB)
+            self.start_cod(api, persistent=True)
+            self.wait_for_codctl()
+            api_id = self.list_json()[0]["id"]
+            web_id = self.new_workspace("--folder", str(web))
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+            self.restart_cod()
+            self.wait_for(lambda state: state["workspace_count"] == 2, RESTORE_TIMEOUT, "both workspaces to come back")
+            pending = next(workspace for workspace in self.list_json() if workspace["id"] == web_id)
+            self.expect_equal("billing-web is pending right after the restart", False, pending["loaded"])
+
+        with self.step("start loading billing-web without waiting for it, then focus billing-api before it finishes"):
+            loading = self.codctl.start("workspace", "focus", str(web_id))
+            self.addCleanup(lambda: loading.poll() is None and loading.kill())
+            focus_result = self.codctl.run("workspace", "focus", str(api_id))
+            self.expect_result(focus_result, 0, stdout="", stderr="")
+            self.wait_for_window({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+
+        with self.step("billing-api stays shown even once billing-web finishes loading in the background"):
+            self.expect_window_stays({"names": [None, None], "folders": [[real(api)], [real(web)]], "active": 0})
+            loading_out, loading_err = loading.communicate(timeout=COMMAND_TIMEOUT)
+            self.expect_equal(
+                f"the background focus on billing-web itself still succeeded (stderr {loading_err!r})",
+                0,
+                loading.returncode,
+            )
+
     def test_ac4_rename(self) -> None:
         with self.step("create the fixture repos billing-api and billing-web"):
             api = self.make_work_repo("billing-api", BILLING_API)
