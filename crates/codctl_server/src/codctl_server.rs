@@ -184,6 +184,8 @@ struct Member {
     live: Option<Entity<Workspace>>,
     name: Option<String>,
     folders: Vec<String>,
+    /// False for a remote (SSH) workspace, loaded or pending: its folders are on another host.
+    local: bool,
     active: bool,
 }
 
@@ -209,6 +211,7 @@ fn members(cx: &App) -> Vec<Member> {
                                 worktree.read(cx).abs_path().to_string_lossy().into_owned()
                             })
                             .collect(),
+                        local: read.project().read(cx).is_local(),
                         active: workspace == active,
                         live: Some(workspace),
                     });
@@ -226,6 +229,7 @@ fn members(cx: &App) -> Vec<Member> {
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect(),
+                        local: !multi_workspace.cod_pending_is_remote(id),
                         active: false,
                     });
                 }
@@ -303,12 +307,32 @@ fn same_folder_set(wanted: &[PathBuf], open: &[String]) -> bool {
 
 /// The member already open on exactly these folders, if any (#A2): a live one first, else a pending one, a saved tab that is not loaded yet or still loading (RC review A2 remainder). `Workspace::new_local` would restore a pending tab's saved row too, into a second entity with the same id as the tab's own restoration.
 fn find_open_with_same_folders(folders: &[PathBuf], cx: &App) -> Option<Member> {
-    let matching: Vec<Member> = members(cx)
+    let mut members = members(cx);
+    let position = open_member_position(
+        folders,
+        members
+            .iter()
+            .map(|member| (member.folders.as_slice(), member.live.is_some(), member.local)),
+    )?;
+    Some(members.swap_remove(position))
+}
+
+/// The pure half of `find_open_with_same_folders`: the position of the member `workspace new` must reuse for `folders`, given each member's folders, whether it is loaded and whether it is local. A loaded one wins over a pending one.
+fn open_member_position<'a>(
+    folders: &[PathBuf],
+    members: impl IntoIterator<Item = (&'a [String], bool, bool)>,
+) -> Option<usize> {
+    let matching: Vec<(usize, bool)> = members
         .into_iter()
-        .filter(|member| same_folder_set(folders, &member.folders))
+        .enumerate()
+        .filter(|(_, (open, _, _))| same_folder_set(folders, open))
+        .map(|(position, (_, live, _))| (position, live))
         .collect();
-    let live_index = matching.iter().position(|member| member.live.is_some());
-    matching.into_iter().nth(live_index.unwrap_or(0))
+    matching
+        .iter()
+        .find(|(_, live)| *live)
+        .or(matching.first())
+        .map(|(position, _)| *position)
 }
 
 /// Folder sets with a `workspace new` creation in flight (RC review A2), each with every
@@ -1463,5 +1487,26 @@ mod tests {
         assert!(!same_folder_set(&wanted, &["/a".to_owned()]));
         assert!(!same_folder_set(&wanted, &["/a".to_owned(), "/b".to_owned(), "/c".to_owned()]));
         assert!(!same_folder_set(&[], &["/a".to_owned()]));
+    }
+
+    #[test]
+    fn workspace_new_reuses_only_a_local_tab_and_prefers_a_loaded_one() {
+        // RC delta review: `workspace new --folder /a` names a local folder, so a saved SSH tab on a remote /a must not count, loaded or pending.
+        // Else its id comes back and --focus connects to the remote host instead of opening the local folder.
+        let wanted = vec![PathBuf::from("/a")];
+        let a = vec!["/a".to_owned()];
+        let b = vec!["/b".to_owned()];
+        let position = |members: &[(&Vec<String>, bool, bool)]| {
+            open_member_position(
+                &wanted,
+                members.iter().map(|(folders, live, local)| (folders.as_slice(), *live, *local)),
+            )
+        };
+        assert_eq!(position(&[(&b, true, true), (&a, false, true)]), Some(1));
+        assert_eq!(position(&[(&a, false, true), (&a, true, true)]), Some(1));
+        assert_eq!(position(&[(&a, false, false)]), None);
+        assert_eq!(position(&[(&a, true, false)]), None);
+        assert_eq!(position(&[(&a, true, false), (&a, false, true)]), Some(1));
+        assert_eq!(position(&[(&b, true, true)]), None);
     }
 }
