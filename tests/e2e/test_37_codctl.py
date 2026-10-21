@@ -255,7 +255,14 @@ class CodctlTest(CodStatusFixtures, CodTestCase):
                 SHOW_TIMEOUT,
                 "the billing-api folder to open",
             )
+            # The agent panel can take a moment to become ready after the window first shows;
+            # retry instead of failing on that unrelated timing, as wait_for_codctl does for the
+            # socket itself.
+            deadline = time.monotonic() + COMMAND_TIMEOUT
             new_result = self.codctl.run("session", "new", "--agent", "claude")
+            while new_result.returncode != 0 and time.monotonic() < deadline:
+                time.sleep(0.2)
+                new_result = self.codctl.run("session", "new", "--agent", "claude")
             self.expect_result(new_result, 0, stderr="")
             session_id = new_result.stdout.strip()
             assert session_id, f"codctl session new --agent claude printed nothing: {new_result!r}"
