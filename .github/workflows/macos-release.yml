@@ -312,14 +312,18 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      # Only a push straight to macos-preview/publish, or a manual run with publish=true, makes a
-      # prerelease. Every other run (macos-preview/dev and any other macos-preview/* branch) only
+      # Only a push event whose ref is exactly macos-preview/publish, or a workflow_dispatch run
+      # with its publish input set to true, makes a prerelease; both halves of each arm are
+      # required, so a manual dispatch that merely targets the macos-preview/publish branch
+      # without publish=true does not publish (a dispatch run's github.ref already equals
+      # whatever branch it is run against, which is exactly what let that happen before this
+      # fix). Every other run (macos-preview/dev and any other macos-preview/* branch) only
       # builds, checks and smoke-tests, so trying this workflow never creates a release by itself.
       # The tag always carries the run number, so this step only ever creates a new release: it
       # never edits or deletes one that exists already.
       - name: Publish a macOS preview prerelease
         if: >-
-          github.ref == 'refs/heads/macos-preview/publish' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/macos-preview/publish') ||
           (github.event_name == 'workflow_dispatch' && inputs.publish == true)
         env:
           GH_TOKEN: ${{ github.token }}
