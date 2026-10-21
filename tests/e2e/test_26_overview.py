@@ -6,6 +6,8 @@ Session and page states come from the driver's set_entry test fixture (tests/e2e
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import unittest
 from collections.abc import Callable
@@ -13,6 +15,12 @@ from typing import Any
 
 from cod_e2e import CodTestCase
 from cod_status_fixtures import CodStatusFixtures
+from fake_acp_agent import fake_agent_settings
+
+# RC fixes item 2: the fake agent of #28, used to get a real session row (one whose open
+# callback actually focuses a chat) into the overview; the set_entry fixture's rows always have
+# no open callback (tests/e2e/cod_status_fixtures.py), so they cannot show this defect.
+AGENT_ID = "claude-acp"
 
 NEW_WORKSPACE = "workspace: new workspace"
 RENAME_WORKSPACE = "workspace: rename workspace"
@@ -78,6 +86,10 @@ def titles(state: dict[str, Any]) -> list[str]:
 
 def is_open(state: dict[str, Any]) -> bool:
     return isinstance(state.get("overview"), dict)
+
+
+def chat(state: dict[str, Any]) -> dict[str, Any]:
+    return state.get("chat") or {}
 
 
 class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
@@ -474,6 +486,74 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
                 and (state["focus"] or {}).get("tab") == "README.md",
                 PENDING_LOAD_SETTLE,
                 "DOC-208 active with README.md focused while PAY-1234 loads in the background",
+            )
+
+    def test_ac6_enter_on_a_session_row_focuses_the_chat_itself(self) -> None:
+        """RC fixes item 2: Enter on a session row must open that chat with the keyboard focus
+        in it (the agent panel focused on that session), not leave the focus where it was in the
+        pane. A fake agent chat (#28) gives a session row a real open callback; the set_entry
+        fixture's rows never do (tests/e2e/cod_status_fixtures.py), so they cannot show this."""
+        with self.step("create the fixture repo billing-api and an agent script with one scripted reply"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            script = self.workdir / "agent-script.json"
+            script.write_text(
+                json.dumps(
+                    {
+                        "session_ids": ["claude-session-pay-1234"],
+                        "turns": [{"steps": [{"chunk": "The rounding happens in src/main.rs."}, {"end": "end_turn"}]}],
+                    }
+                )
+            )
+            agent_servers = {AGENT_ID: fake_agent_settings(script, log=self.workdir / "agent.log")}
+
+        with self.step("start Cod on billing-api and start a chat with the fake agent"):
+            self.start_cod(repo, extra_settings={"agent_servers": agent_servers})
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, SHOW_TIMEOUT, "the agent panel to load")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            self.keys("end up enter")
+            self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, SHOW_TIMEOUT, "a chat with the fake agent")
+            self.type("Where does the rounding happen?")
+            self.keys("enter")
+            self.wait_for(
+                lambda state: "src/main.rs" in chat(state).get("transcript", ""), SHOW_TIMEOUT, "the scripted reply in the transcript"
+            )
+            session_id = chat(self.state()).get("session_id")
+
+        with self.step("move the focus out of the agent panel and into an editor item"):
+            self.keys("ctrl-p")
+            self.wait_for(lambda state: state["file_finder_ready"], SHOW_TIMEOUT, "the file finder to take typed keys")
+            self.type("Cargo.toml")
+            self.keys("enter")
+            self.wait_for(
+                lambda state: state["modal"] is None
+                and (state["focus"] or {}).get("kind") == "item"
+                and (state["focus"] or {}).get("tab") == "Cargo.toml"
+                and state.get("agent_panel_focused") is False,
+                SHOW_TIMEOUT,
+                "Cargo.toml open with the focus, outside the agent panel",
+            )
+
+        with self.step("open the overview and select the chat's session row"):
+            state = self.open_overview()
+            rows = overview(state)["rows"]
+            row_index = next(index for index, row in enumerate(rows) if row["kind"] == "session")
+            self.keys(" ".join(["down"] * row_index))
+            self.wait_for_selected(row_index)
+
+        with self.step("press enter: the overview closes and the agent panel is focused on that chat"):
+            self.keys("enter")
+            self.wait_for(
+                lambda state: state["overview"] is None
+                and state.get("agent_panel_focused") is True
+                and chat(state).get("session_id") == session_id,
+                SHOW_TIMEOUT,
+                "the agent panel to focus the chat",
             )
 
     def add_folder_to_active_workspace(self, folder: Any) -> None:
