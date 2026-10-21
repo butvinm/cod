@@ -387,7 +387,7 @@ async fn new_workspace(
         .collect();
     let key = folder_key(&canonical);
     if let Some(key) = &key {
-        match cx.update(|cx| reserve_or_follow(key, cx))? {
+        match cx.update(|cx| reserve_or_follow(key, cx)) {
             Reservation::Lead => {}
             Reservation::Follow(receiver) => {
                 return receiver
@@ -399,7 +399,7 @@ async fn new_workspace(
     }
     let result = new_workspace_leader(name, folders, &canonical, focus, cx).await;
     if let Some(key) = &key {
-        cx.update(|cx| release_and_notify(key, &result, cx)).ok();
+        cx.update(|cx| release_and_notify(key, &result, cx));
     }
     result
 }
