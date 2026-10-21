@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp_v1;
 use anyhow::{Context as _, Result, bail};
-use gpui::{App, AppContext as _, Entity, Global, SharedString, Task, Window};
+use gpui::{App, AppContext as _, Entity, Global, SharedString, Window};
 use project::AgentId;
 use workspace::Workspace;
 
@@ -196,7 +196,8 @@ pub fn send_message(
             if is_generating || !view.message_queue.is_empty() {
                 view.add_to_queue(contents, Vec::new(), window, cx);
             } else {
-                view.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+                // A leading built-in command (`/compact ...`) is handled as from the box.
+                view.cod_send_text(text, window, cx);
             }
         });
         return Ok(());

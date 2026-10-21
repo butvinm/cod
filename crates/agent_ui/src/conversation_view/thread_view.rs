@@ -1816,6 +1816,40 @@ impl ThreadView {
     /// it as a follow-up message. The queued remainder auto-processes when the
     /// command turn stops, so e.g. `/compact do X` compacts and then runs `do X`
     /// rather than discarding it.
+    /// Sends `text` the way `send` would send it from the message box while the thread is idle,
+    /// without reading or clearing the box (`codctl session send`, RC review residual): a leading
+    /// built-in command (for example `/compact`) runs bare and any text after it is queued, as
+    /// `send_command_queueing_remainder` does for typed text; anything else is sent as one
+    /// message. `/login` and `/logout` open interactive UI in the box, so here they stay text.
+    pub(crate) fn cod_send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let native_command =
+            leading_native_command(text, self.session_capabilities.read().available_commands());
+        let Some(command_name) = native_command else {
+            let contents = vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                text.to_owned(),
+            ))];
+            self.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+            return;
+        };
+        let remainder = strip_leading_command(text, &command_name);
+        if !remainder.trim().is_empty() {
+            self.add_to_queue(
+                vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(remainder))],
+                Vec::new(),
+                window,
+                cx,
+            );
+        }
+        let command_block =
+            acp_v1::ContentBlock::Text(acp_v1::TextContent::new(format!("/{command_name}")));
+        self.send_content(
+            Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+            true,
+            window,
+            cx,
+        );
+    }
+
     fn send_command_queueing_remainder(
         &mut self,
         message_editor: Entity<MessageEditor>,
