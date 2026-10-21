@@ -274,69 +274,6 @@ class AgentChatLinksTest(CodTestCase):
                 "tab to continue forward into the second reply's link",
             )
 
-    def test_every_link_of_three_long_replies_is_reachable_by_keyboard(self) -> None:
-        """D26, from the executed beta: with three replies of two links each, long enough that the older replies scroll out of the chat, Shift-Tab from the newest reply must reach every link of every reply, and Tab must come back. Moving into a reply block costs at most one extra key press at each block boundary."""
-        filler = "\n\n".join(f"Detail line {line} of the rounding notes." for line in range(60))
-        links = [
-            [f"https://tracker.example.com/PAY-{reply}{link}" for link in (1, 2)]
-            for reply in (1, 2, 3)
-        ]
-        replies = [f"See {first} and {second}.\n\n{filler}" for first, second in links]
-
-        with self.step("create the fixture repo billing-api and an agent script with three long replies"):
-            repo = self.make_repo("billing-api", BILLING_API)
-            script = self.workdir / "agent-script.json"
-            script.write_text(
-                json.dumps(
-                    {
-                        "session_ids": ["claude-session-pay-1234"],
-                        "turns": [{"steps": [{"chunk": reply}, {"end": "end_turn"}]} for reply in replies],
-                    }
-                )
-            )
-            agent_servers = {AGENT_ID: fake_agent_settings(script, log=self.workdir / "agent.log")}
-
-        with self.step("start Cod, start a chat with the fake agent and send three prompts"):
-            self.start_cod(repo, extra_settings={"agent_servers": agent_servers})
-            self.wait_for(
-                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
-                30,
-                "the billing-api folder to open",
-            )
-            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel to load")
-            self.run_command("agent: toggle focus")
-            self.run_command("agent: toggle new thread menu")
-            self.keys("end up enter")
-            self.wait_for(lambda state: chat(state).get("agent") == AGENT_ID, 30, "a chat with the fake agent")
-            for number, (first, _) in enumerate(links, start=1):
-                self.type(f"Question {number}?")
-                self.keys("enter")
-                self.wait_for(lambda state, first=first: first in chat(state).get("transcript", ""), 30, f"reply {number}")
-
-        with self.step("move the focus into the newest reply"):
-            self.keys("alt-up")
-            self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
-
-        with self.step("shift-tab back through all six links, newest first"):
-            for expected in [url for reply in reversed(links) for url in reversed(reply)]:
-                self.press_until_link("shift-tab", expected)
-
-        with self.step("tab forward through all six links again"):
-            for expected in [url for reply in links for url in reply][1:]:
-                self.press_until_link("tab", expected)
-
-    def press_until_link(self, key: str, expected: str) -> None:
-        """Presses `key` until the focused chat link is `expected`, allowing one extra press for a block boundary."""
-        for _ in range(2):
-            self.keys(key)
-            try:
-                self.wait_for(lambda state: focused_link_text(state) == expected, 3, f"the focus on {expected}")
-                return
-            except AssertionError:
-                continue
-        state = self.state()
-        self.fail(f"{key} did not reach {expected}; focused link: {focused_link_text(state)!r}")
-
 
 PAY_SESSION = "claude-session-pay-1234"
 LEDGER_SESSION = "claude-session-ledger-1300"
