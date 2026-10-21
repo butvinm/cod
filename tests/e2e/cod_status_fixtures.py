@@ -150,6 +150,11 @@ def bounds_pixel(width: int, height: int, pixels: bytes, scale: float, bounds: d
     return ppm_pixel(width, height, pixels, x, y)
 
 
+def logical_pixel(width: int, height: int, pixels: bytes, scale: float, x: float, y: float) -> tuple[int, int, int]:
+    """The pixel at a window position in logical pixels, at the screenshot's `scale`."""
+    return ppm_pixel(width, height, pixels, round(x * scale), round(y * scale))
+
+
 def ink_vertical_center(width: int, height: int, pixels: bytes, scale: float, bounds: dict[str, Any]) -> float:
     """The vertical center, in logical pixels, of the ink (any pixel that differs from the box's own most common color) inside `bounds`.
 
