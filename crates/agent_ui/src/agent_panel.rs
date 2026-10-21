@@ -131,6 +131,8 @@ pub struct CodChatSnapshot {
     /// #32 e2e driver click target): the driver cannot otherwise find where a link was drawn
     /// inside a reply, so this is its target for a real mouse click on the link.
     pub link_bounds: Vec<CodChatLinkBounds>,
+    /// Whether the reply that has the keyboard focus reaches into the visible part of the chat, None without a focused reply (Cod D26 QA F1). Unlike `link_bounds`, which keep the bounds a reply had when it was last painted, this reads the chat's current scroll position.
+    pub focused_reply_visible: Option<bool>,
 }
 
 /// The link of an agent reply that has the keyboard focus (Cod #28).
@@ -4497,6 +4499,9 @@ impl AgentPanel {
             reply_focused: focused_markdown.is_some(),
             focused_link,
             link_bounds,
+            focused_reply_visible: self
+                .active_thread_view(cx)
+                .and_then(|thread_view| thread_view.read(cx).cod_focused_reply_visible(window, cx)),
         })
     }
 

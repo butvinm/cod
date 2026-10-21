@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from pathlib import Path
 from typing import Any
 
 from cod_e2e import CodTestCase
 from fake_acp_agent import fake_agent_settings
 from page_server import PageServer
+from test_39_codctl_sessions import Codctl
 
 AGENT_ID = "claude-acp"
 
@@ -282,6 +284,8 @@ class AgentChatLinksTest(CodTestCase):
             for reply in (1, 2, 3)
         ]
         replies = [f"See {first} and {second}.\n\n{filler}" for first, second in links]
+        fourth_reply = "Filed https://tracker.example.com/PAY-41 for the follow-up."
+        replies.append(f"{fourth_reply}\n\n{filler}")
 
         with self.step("create the fixture repo billing-api and an agent script with three long replies"):
             repo = self.make_repo("billing-api", BILLING_API)
@@ -332,6 +336,17 @@ class AgentChatLinksTest(CodTestCase):
             self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
             for expected in [url for reply in reversed(links) for url in reversed(reply)]:
                 self.press_until_link("shift-tab", expected)
+
+        with self.step("send a new message with codctl while the keyboard is on the oldest reply's first link"):
+            # QA on c18d242d36: a new turn scrolled the chat to its end and left the focused link out of view.
+            codctl = Codctl(Path(os.environ["COD_E2E_RUN_DIR"]) / "codctl", self.home)
+            result = codctl.run("session", "send", "claude-session-pay-1234", "Question 4?")
+            self.expect_equal("codctl session send exit code", 0, result.returncode)
+            self.wait_for(lambda state: fourth_reply in chat(state).get("transcript", ""), 30, "reply 4")
+            self.wait_for(lambda state: chat(state).get("status") in ("idle", "done"), 30, "the chat to finish its turn")
+            state = self.state()
+            self.expect_equal("the focused link after the new turn", links[0][0], focused_link_text(state))
+            self.expect_equal("the focused reply is still in view", True, chat(state).get("focused_reply_visible"))
 
     def press_until_link(self, key: str, expected: str) -> None:
         """Presses `key` until the focused chat link is `expected`, allowing one extra press for a block boundary."""

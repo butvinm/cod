@@ -7431,6 +7431,25 @@ impl ThreadView {
             .collect()
     }
 
+    /// The thread entry (also its `list_state` item) of the reply block that has the keyboard focus, if any (Cod D26 QA F1).
+    fn cod_focused_reply_entry(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.cod_all_reply_markdowns(cx)
+            .into_iter()
+            .find(|(_, markdown)| markdown.read(cx).focus_handle(cx).is_focused(window))
+            .map(|(entry_ix, _)| entry_ix)
+    }
+
+    /// Whether the reply that has the keyboard focus reaches into the visible part of the chat, None without a focused reply (Cod D26 QA F1, for the end-to-end driver).
+    pub fn cod_focused_reply_visible(&self, window: &Window, cx: &App) -> Option<bool> {
+        let entry_ix = self.cod_focused_reply_entry(window, cx)?;
+        let viewport = self.list_state.viewport_bounds();
+        Some(
+            self.list_state
+                .bounds_for_item(entry_ix)
+                .is_some_and(|bounds| bounds.intersects(&viewport)),
+        )
+    }
+
     /// Whether moving further in this direction within `markdown`'s own links would do nothing:
     /// either it has no links at all, or the link that already has the keyboard focus is the
     /// last one (moving forward) or the first one (moving backward) (RC review B7/C4).
