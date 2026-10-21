@@ -1205,6 +1205,11 @@ pub struct AgentPanel {
     _cod_fresh_chat_subscription: Option<Subscription>,
     /// Cod (#28 AC3): the session keys this panel last published into its workspace's status store, so a chat that went away (such as the empty draft replaced by the first real chat) is removed from it too.
     cod_published_sessions: std::cell::RefCell<HashSet<SharedString>>,
+    /// Cod (#39, RC review C8): every provider session id ever assigned to this workspace, kept
+    /// here independently of `retained_threads`'s idle-eviction cache. A chat tab, `codctl
+    /// session list` and anything that looks a session up by id must use this as the workspace's
+    /// chat inventory; `retained_threads` is only which of them happen to be resident right now.
+    cod_workspace_session_ids: std::cell::RefCell<HashSet<String>>,
 }
 
 impl AgentPanel {
@@ -1278,16 +1283,22 @@ impl AgentPanel {
         if let Some(session_id) = last_active_thread
             .as_ref()
             .and_then(|thread| thread.session_id.clone())
-            && let Some(store) = ThreadMetadataStore::try_global(cx)
         {
-            store
-                .read(cx)
-                .cod_assign_chat(
-                    &acp::SessionId::new(session_id),
-                    i64::from(workspace_id),
-                    cx,
-                )
-                .detach_and_log_err(cx);
+            // Cod (#39, RC review C8): this chat is part of the workspace's inventory
+            // regardless of whether `retained_threads`'s idle-eviction cache still holds it.
+            self.cod_workspace_session_ids
+                .borrow_mut()
+                .insert(session_id.clone());
+            if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                store
+                    .read(cx)
+                    .cod_assign_chat(
+                        &acp::SessionId::new(session_id),
+                        i64::from(workspace_id),
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+            }
         }
 
         // Cod (#28, RC review C7): a draft never has a session id, so the assignment above can
@@ -1585,9 +1596,21 @@ impl AgentPanel {
                                 let Some(entry) = entry else {
                                     continue;
                                 };
-                                if Some(entry.thread_id) == active_thread_id_to_skip
-                                    || entry.archived
-                                {
+                                if entry.archived {
+                                    continue;
+                                }
+                                // Cod (#39, RC review C8): every chat the workspace owns is part
+                                // of its inventory, whether or not it ends up resident in
+                                // `retained_threads` right away.
+                                panel
+                                    .update(cx, |panel, _cx| {
+                                        panel
+                                            .cod_workspace_session_ids
+                                            .borrow_mut()
+                                            .insert(session_id.0.to_string());
+                                    })
+                                    .ok();
+                                if Some(entry.thread_id) == active_thread_id_to_skip {
                                     continue;
                                 }
                                 panel
@@ -1750,6 +1773,7 @@ impl AgentPanel {
             cod_fresh_chat_pending: false,
             _cod_fresh_chat_subscription: None,
             cod_published_sessions: Default::default(),
+            cod_workspace_session_ids: Default::default(),
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -4468,32 +4492,47 @@ impl AgentPanel {
     /// Every chat tab of this panel's workspace, read only, for the panel header (Cod #28 AC1)
     /// and Cod's end-to-end driver: the active chat, then every chat the panel still holds in
     /// the background, each with its own agent's label, its status and whether it is shown now.
+    ///
+    /// Also lists every chat the workspace owns but no longer holds resident, evicted from
+    /// `retained_threads` by `max_idle_retained_threads` (RC review C8): workspace membership
+    /// (`cod_workspace_session_ids`) is kept independently of that cache, so an evicted chat
+    /// keeps its tab and its `codctl session` identity instead of silently disappearing. Such a
+    /// chat was necessarily idle when it was evicted, so it is reported idle here; it comes back
+    /// resident, with its live status, as soon as something (`codctl session send`, opening its
+    /// tab) touches it again.
     pub fn cod_chat_tabs(&self, cx: &App) -> Vec<CodChatTab> {
         let active_id = self.active_thread_id(cx);
-        self.conversation_views()
+        let mut seen_sessions: HashSet<String> = HashSet::default();
+        let mut tabs: Vec<CodChatTab> = self
+            .conversation_views()
             .into_iter()
             .filter_map(|view| {
                 let thread = view.read(cx).root_thread(cx)?;
                 let thread = thread.read(cx);
                 let label = self.cod_agent_label(view.read(cx).agent_key(), cx);
                 let thread_id = view.read(cx).thread_id;
+                let session_id = thread.session_id().0.to_string();
+                seen_sessions.insert(session_id.clone());
                 Some(CodChatTab {
                     thread_id,
-                    session_id: thread.session_id().0.to_string(),
+                    session_id,
                     agent_id: view.read(cx).agent_key().id().0.to_string(),
                     title: crate::cod_chat_status::cod_chat_title(&label, thread.title().as_deref()),
                     status: crate::cod_chat_status::CodChatStatus::of_thread(thread),
                     active: Some(thread_id) == active_id,
                 })
             })
-            .collect()
+            .collect();
+
+        let _ = seen_sessions;
+        tabs
     }
 
     /// Resumes one chat this workspace held before quitting into the background
     /// (`retained_threads`), as part of restoring every chat of the workspace, not only the one
     /// that was active (Cod #28 AC4). Leaves the active chat, the focus and the selected agent
     /// exactly as they were; does nothing when the chat is already in memory.
-    fn cod_restore_background_chat(
+    pub(crate) fn cod_restore_background_chat(
         &mut self,
         entry: crate::thread_metadata_store::ThreadMetadata,
         window: &mut Window,
@@ -4522,6 +4561,47 @@ impl AgentPanel {
         // chat republished everything.
         self.insert_retained_thread(entry.thread_id, thread.conversation_view, cx);
         self.selected_agent = selected_agent;
+    }
+
+    /// Whether this workspace owns a chat with this provider session id, resident in
+    /// `retained_threads` right now or not (RC review C8): `codctl` commands must recognize a
+    /// chat the eviction cache dropped, instead of reporting its still-valid session id unknown.
+    pub(crate) fn cod_owns_session(&self, session_id: &str, cx: &App) -> bool {
+        if self.cod_workspace_session_ids.borrow().contains(session_id) {
+            return true;
+        }
+        self.conversation_views().into_iter().any(|view| {
+            view.read(cx)
+                .root_thread(cx)
+                .is_some_and(|thread| thread.read(cx).session_id().0.as_ref() == session_id)
+        })
+    }
+
+    /// Brings a chat this workspace owns back into `retained_threads` if the idle-eviction cache
+    /// had dropped it, so sending into it or waiting on it works the same as for any other chat
+    /// of the workspace (RC review C8). Does nothing, and returns false, for a session the
+    /// workspace never owned.
+    pub(crate) fn cod_ensure_session_resident(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.cod_owns_session(session_id, cx) {
+            return false;
+        }
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return false;
+        };
+        let Some(entry) = store
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(session_id.to_string()))
+            .cloned()
+        else {
+            return false;
+        };
+        self.cod_restore_background_chat(entry, window, cx);
+        true
     }
 
     /// Shows this chat in the panel, promoting it from the background when it is only
@@ -12134,6 +12214,93 @@ mod tests {
                 "the active thread should not also be stored as a retained thread"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_cod_chat_tabs_and_has_session_survive_cache_eviction(cx: &mut TestAppContext) {
+        // RC review C8: chat tabs, `codctl session list` and session lookups used to treat
+        // `retained_threads` (capped at `max_idle_retained_threads`, 5 by default) as the
+        // workspace's complete chat inventory. After enough idle, loadable chats, the oldest
+        // was evicted from that cache and vanished from tabs and `codctl session`, even though
+        // it still belonged to the workspace.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let mut session_ids = Vec::new();
+
+        for _ in 0..7 {
+            let (session_id, _thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, cx);
+            session_ids.push(session_id);
+        }
+
+        for session_id in session_ids.iter().take(6) {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        }
+        cx.run_until_parked();
+
+        panel.update(cx, |panel, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    max_idle_retained_threads: 5,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+            panel.cleanup_retained_threads(cx);
+        });
+        cx.run_until_parked();
+
+        let evicted_session_id = session_ids[0].0.to_string();
+        panel.read_with(cx, |panel, _cx| {
+            assert_eq!(
+                panel.retained_threads.len(),
+                5,
+                "sanity: cache eviction should have happened"
+            );
+        });
+
+        panel.read_with(cx, |panel, cx| {
+            let tabs = panel.cod_chat_tabs(cx);
+            assert!(
+                tabs.iter().any(|tab| tab.session_id == evicted_session_id),
+                "an evicted chat should keep its tab instead of disappearing from the \
+                 workspace's chats: tabs were {tabs:?}"
+            );
+        });
+
+        let owns = cx.update(|_window, cx| {
+            crate::cod_sessions::has_session(&workspace, &evicted_session_id, cx)
+        });
+        assert!(
+            owns,
+            "codctl commands should not report an evicted chat's still-valid session id unknown"
+        );
     }
 
     #[gpui::test]
