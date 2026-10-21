@@ -208,7 +208,11 @@ class LayoutTest(CodTestCase):
             split_down = self.codctl("pane", "split", str(first), "--down")
             self.expect_result(split_down, 0, stderr="")
             c_id = int(split_down.stdout)
-            self.wait_for(lambda state: len(self.panes_json()) == 3, SHOW_TIMEOUT, "three panes after the second split")
+            def three_panes_laid_out(_: dict[str, Any]) -> bool:
+                panes = self.panes_json()
+                return len(panes) == 3 and all(pane["bounds"] is not None for pane in panes)
+
+            self.wait_for(three_panes_laid_out, SHOW_TIMEOUT, "three panes, all laid out, after the second split")
 
         with self.step("B is full height before any resize, A and C each about half of it"):
             # One snapshot for everything below: splitting A down may replace A's own pane id
