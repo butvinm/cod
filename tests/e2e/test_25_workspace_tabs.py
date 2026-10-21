@@ -500,7 +500,8 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     f"actual the same {hex_color(hover_bg)}"
                 )
 
-    # Issue #77 AC(d): tab content (label and dot) is vertically centered within 1 px.
+    # Issue #77 AC(d)/F4: tab content (label, dot, close button) and "+" are vertically centered
+    # within 1 px of the title bar's own center.
 
     def test_ac7_tab_content_is_vertically_centered(self) -> None:
         with self.step("start Cod and give the first (only) workspace a visible dot"):
@@ -513,7 +514,8 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step("check the drawn content (dot and label) sits within 1 px of the tab's own vertical center"):
             screenshot_ppm(shot)
             width, height, pixels = read_ppm(shot)
-            bounds = title_bar(state)["tabs"][0]["bounds"]
+            bar = title_bar(state)
+            bounds = bar["tabs"][0]["bounds"]
             ink_center = ink_vertical_center(width, height, pixels, FIRST_USE_OUTPUT_SCALE, bounds)
             tab_center = bounds["y"] + bounds["height"] / 2
             if abs(ink_center - tab_center) > 1.0:
@@ -521,12 +523,22 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     f"expected the tab's content centered within 1 px of {tab_center:.1f}, actual ink center {ink_center:.1f}"
                 )
 
-    # Issue #77 AC(e): a hovered or active tab shows a close control that closes that workspace.
+        with self.step("check the close button and the + button centers against the title bar's own center"):
+            bar_center = bounds["y"] + bounds["height"] / 2  # the title bar's content row is as tall as a tab
+            close_bounds = bar["tabs"][0]["close_bounds"]
+            if not drawn(close_bounds):
+                raise AssertionError(f"expected a close button drawn on the active tab, actual {close_bounds!r}")
+            close_center = close_bounds["y"] + close_bounds["height"] / 2
+            if abs(close_center - bar_center) > 1.0:
+                raise AssertionError(f"expected the close button centered within 1 px of {bar_center:.1f}, actual {close_center:.1f}")
+            add_bounds = bar["add_button"]["bounds"]
+            add_center = add_bounds["y"] + add_bounds["height"] / 2
+            if abs(add_center - bar_center) > 1.0:
+                raise AssertionError(f'expected the "+" button centered within 1 px of {bar_center:.1f}, actual {add_center:.1f}')
 
-    def test_ac7_hovered_tab_has_a_close_control_that_closes_it(self) -> None:
-        """No close control exists on a tab today (#77): clicking near where one would sit (the
-        tab's right edge) only re-selects the tab, so the workspace count never drops and this
-        times out."""
+    # Issue #77 AC(e)/F3: a hovered or active tab shows a close control that closes that workspace.
+
+    def test_ac7_close_button_shows_on_active_and_hover_and_closes_the_tab(self) -> None:
         with self.step("start Cod: one default workspace, add a second"):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
@@ -535,17 +547,91 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                 "the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True], "workspace_count": 2}
             )
 
-        with self.step("hover the inactive tab and click where its close control should be, its right edge"):
+        with self.step("both loaded tabs have a close button (its space is always reserved)"):
             tabs = title_bar(state)["tabs"]
-            bounds = tabs[0]["bounds"]
+            for index, tab in enumerate(tabs):
+                if not drawn(tab["close_bounds"]):
+                    raise AssertionError(f"expected tab {index} to have a close button, actual {tab['close_bounds']!r}")
+
+        shot = self.workdir / "close.ppm"
+        with self.step("the active tab's close icon is visible without hovering; the inactive one is not"):
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            active_close = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["close_bounds"])
+            active_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"], dy=0.15)
+            if color_distance(active_close, active_bg) <= COLOR_TOLERANCE:
+                raise AssertionError("expected the active tab's close icon visible (a color different from its own background)")
+            inactive_close = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["close_bounds"])
+            inactive_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["bounds"], dy=0.15)
+            if color_distance(inactive_close, inactive_bg) > COLOR_TOLERANCE:
+                raise AssertionError("expected the inactive tab's close icon not visible before hovering it")
+
+        with self.step("hover the inactive tab: its close icon becomes visible, its own width does not change"):
+            width_before = tabs[0]["bounds"]["width"]
             self.hover_tab(state, 0)
-            self.click_at(bounds["x"] + bounds["width"] - 10, bounds["y"] + bounds["height"] / 2)
-            state = self.wait_for(
-                lambda state: state["workspace_count"] == 1, SHOW_TIMEOUT, "the hovered workspace to close, leaving one"
+            state = self.state()
+            hovered_bounds = title_bar(state)["tabs"][0]["bounds"]
+            self.expect_equal("hovered tab width unchanged", width_before, hovered_bounds["width"])
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            hovered_close = bounds_pixel(
+                width, height, pixels, FIRST_USE_OUTPUT_SCALE, title_bar(state)["tabs"][0]["close_bounds"]
+            )
+            hovered_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, hovered_bounds, dy=0.15)
+            if color_distance(hovered_close, hovered_bg) <= COLOR_TOLERANCE:
+                raise AssertionError("expected the hovered tab's close icon visible")
+
+        with self.step("click the hovered tab's close button: it closes, the other workspace stays active"):
+            self.click_close_button(state, 0)
+            state = self.wait_for_tabs(
+                "one workspace left, the previously active one still active",
+                {"names": [UNNAMED], "active": [True], "workspace_count": 1},
             )
 
-        with self.step("the remaining workspace is the one that was active, not the one closed"):
-            self.expect_equal("remaining tab active", True, title_bar(state)["tabs"][0]["active"])
+    def test_ac7_close_button_shows_the_unsaved_confirmation_and_keep_keeps_it(self) -> None:
+        with self.step("create the fixture repo billing-api"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+
+        with self.step("start Cod on billing-api, add a second default workspace"):
+            self.start_cod(billing_api)
+            state = self.wait_for_tabs("the first tab", {"names": ["billing-api"], "active": [True]})
+            self.click_add_button(state)
+            state = self.wait_for_tabs("the second tab", {"names": ["billing-api", UNNAMED], "active": [False, True]})
+
+        with self.step("dirty a buffer in the first (now inactive) workspace"):
+            self.click_tab(state, 0)
+            self.wait_for_tabs("the first tab active", {"active": [True, False]})
+            self.keys("ctrl-p")
+            self.wait_for(lambda state: state["modal"] == "file_finder", SHOW_TIMEOUT, "the file finder to open")
+            self.wait_for(lambda state: state["file_finder_ready"], SHOW_TIMEOUT, "the file finder to be drawn with the focus")
+            self.type("main.rs")
+            self.keys("enter")
+            self.wait_for(
+                lambda state: state["modal"] is None and state["active_tab"] == "main.rs", SHOW_TIMEOUT, "main.rs to open"
+            )
+            self.type("// draft ")
+            self.wait_for(lambda state: state["dirty_tabs"] == ["main.rs"], SHOW_TIMEOUT, "main.rs to have unsaved changes")
+
+        with self.step("switch to the second (clean) workspace, hover the first tab, click its close button"):
+            self.click_tab(self.state(), 1)
+            state = self.wait_for_tabs("the second tab active", {"active": [False, True]})
+            self.hover_tab(state, 0)
+            state = self.state()
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "a prompt to save main.rs")
+
+        with self.step("cancel the prompt (escape): the workspace is kept, both tabs remain"):
+            self.keys("escape")
+            self.wait_for(lambda state: state["prompt"] is None, SHOW_TIMEOUT, "the prompt to close")
+            self.wait_for_tabs(
+                "both workspaces still open, the second still active",
+                {"names": ["billing-api", UNNAMED], "active": [False, True], "workspace_count": 2},
+            )
+
+        with self.step("the dirtied buffer is still dirty: nothing was saved or discarded"):
+            self.click_tab(self.state(), 0)
+            state = self.wait_for_tabs("the first tab active again", {"active": [True, False]})
+            self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
 
 
 class FirstUseWelcomeTest(CodTestCase):
@@ -561,12 +647,17 @@ class FirstUseWelcomeTest(CodTestCase):
             )
 
         if state["welcome"] is None:
-            with self.step("a brand new profile shows the onboarding page first: close it, then show the welcome page"):
+            with self.step("check the onboarding page's own header names Cod, never Zed"):
+                onboarding_header = state["onboarding_header"]
+                if onboarding_header is None or "Zed" in onboarding_header:
+                    raise AssertionError(f'expected the onboarding header to never say "Zed", actual {onboarding_header!r}')
+
+            with self.step("close the onboarding page, then show the welcome page"):
                 self.keys("ctrl-w")
                 self.run_command("zed: show welcome")
                 state = self.wait_for(lambda state: state["welcome"] is not None, SHOW_TIMEOUT, "the welcome page")
 
-        with self.step("check the greeting names Cod, never Zed"):
+        with self.step("check the welcome greeting names Cod, never Zed"):
             welcome = state["welcome"]
             if "Zed" in welcome:
                 raise AssertionError(f'expected the welcome greeting to never say "Zed", actual {welcome!r}')
