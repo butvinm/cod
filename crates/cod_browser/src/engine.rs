@@ -130,14 +130,21 @@ wrap_app! {
             command_line: Option<&mut CommandLine>,
         ) {
             let Some(command_line) = command_line else { return };
-            command_line.append_switch_with_value(
-                Some(&"ozone-platform".into()),
-                Some(&"headless".into()),
-            );
+            // Ozone is Chromium's Linux windowing abstraction and "disable the /dev/shm cache" is
+            // a Linux container workaround: neither switch means anything on macOS, which has no
+            // Ozone platform and no /dev/shm, so both stay Linux-only (#23 round 1: widening this
+            // function to macOS must not add switches macOS does not understand).
+            #[cfg(target_os = "linux")]
+            {
+                command_line.append_switch_with_value(
+                    Some(&"ozone-platform".into()),
+                    Some(&"headless".into()),
+                );
+                command_line.append_switch(Some(&"disable-dev-shm-usage".into()));
+            }
             command_line.append_switch(Some(&"disable-gpu".into()));
             command_line.append_switch(Some(&"disable-gpu-compositing".into()));
             command_line.append_switch(Some(&"no-sandbox".into()));
-            command_line.append_switch(Some(&"disable-dev-shm-usage".into()));
         }
     }
 }
@@ -406,7 +413,51 @@ fn switch_value(prefix: &str) -> Option<String> {
     std::env::args().find_map(|argument| argument.strip_prefix(prefix).map(str::to_owned))
 }
 
+/// macOS cannot dynamically link against "Chromium Embedded Framework.framework" the ordinary
+/// way (there is no stable on-disk path at link time, since the bundle can be installed
+/// anywhere): the framework has to be `dlopen`-ed at startup, before any other CEF call,
+/// including `api_hash` (#23 round 1). `cef::library_loader::LibraryLoader` resolves the
+/// framework relative to the running executable's own location inside the app bundle: `../
+/// Frameworks` for the main `cod-browser` executable (`Contents/MacOS/cod-browser`), or `../../..`
+/// for a copy running from the nested helper bundle this module places at
+/// `helper_subprocess_path()` (see `script/bundle-cod-mac`). Keeping the returned loader alive for
+/// the rest of `main` matches every CEF Rust example (it unloads the framework on drop).
+#[cfg(target_os = "macos")]
+fn load_framework() -> cef::library_loader::LibraryLoader {
+    let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
+    let is_helper = exe.file_name().is_some_and(|name| name == "Cod Helper");
+    let loader = cef::library_loader::LibraryLoader::new(&exe, is_helper);
+    if !loader.load() {
+        eprintln!("cod-browser: cannot load the CEF framework next to {}", exe.display());
+        std::process::exit(3);
+    }
+    loader
+}
+
+/// Where CEF should re-launch this same helper for its renderer, GPU and utility subprocesses on
+/// macOS (#23 round 1). Chromium's macOS convention is four differently-entitled helper bundles
+/// (plain, GPU, Renderer, Plugin) for the App Store sandbox; Cod's preview is ad-hoc signed and
+/// already passes `--no-sandbox`, so one helper bundles every subprocess type here, pointed at
+/// explicitly through `Settings::browser_subprocess_path` instead of CEF's automatic per-type
+/// naming (which would otherwise look for "Cod Helper (GPU).app" and so on next to this one).
+#[cfg(target_os = "macos")]
+fn helper_subprocess_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
+    let macos_dir = exe.parent().expect("cod-browser: no Contents/MacOS parent");
+    let contents_dir = macos_dir.parent().expect("cod-browser: no Contents parent");
+    contents_dir
+        .join("Frameworks")
+        .join("Cod Helper.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("Cod Helper")
+}
+
 pub fn main() {
+    // Must happen before any other CEF call on macOS (see `load_framework`); a no-op on Linux,
+    // which links libcef the ordinary way, so `_library` only exists there to be dropped last.
+    #[cfg(target_os = "macos")]
+    let _library = load_framework();
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let args = cef::args::Args::new();
     let Some(command_line) = args.as_cmd_line() else {
@@ -452,13 +503,27 @@ pub fn main() {
     let started = Instant::now();
     let mut settings = Settings {
         windowless_rendering_enabled: 1,
-        multi_threaded_message_loop: 1,
         no_sandbox: 1,
         root_cache_path: CefString::from(cache.as_str()),
         log_file: CefString::from(format!("{cache}/cef.log").as_str()),
         log_severity: LogSeverity::WARNING,
         ..Default::default()
     };
+    // Only Windows and Linux support `multi_threaded_message_loop` (CEF spins its own UI thread);
+    // on macOS it must stay 0 (the default) and the main thread runs `run_message_loop` instead,
+    // handled below. `browser_host_create_browser` and the `BrowserHost` methods `handle` calls
+    // are documented safe to call from any thread in both modes (that is the point of the
+    // `multi_threaded_message_loop` Linux already relies on here), so `handle` itself needs no
+    // macOS-specific change: only which thread drives CEF's own message pump differs.
+    #[cfg(target_os = "linux")]
+    {
+        settings.multi_threaded_message_loop = 1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let helper = helper_subprocess_path();
+        settings.browser_subprocess_path = CefString::from(&*helper.to_string_lossy());
+    }
     if let Ok(dir) = std::env::var("COD_CEF_DIR") {
         settings.resources_dir_path = CefString::from(dir.as_str());
         settings.locales_dir_path = CefString::from(format!("{dir}/locales").as_str());
@@ -492,6 +557,43 @@ pub fn main() {
     std::thread::spawn(move || write_loop(writer_stream, outgoing, writer_pages));
     out.send(Outgoing::Message(FromBrowser::Ready)).ok();
 
+    // Linux has CEF run its own UI thread (`multi_threaded_message_loop` above), so this thread
+    // is free to block reading the control socket directly, exactly as it always has.
+    //
+    // macOS has no such option: CEF's message loop must run on the thread that called
+    // `initialize` (`run_message_loop`, blocking until something calls `quit_message_loop`), so
+    // the control-socket read loop moves to its own thread instead, and this one blocks in
+    // `run_message_loop` until `input_loop` asks it to stop. `handle`'s own CEF calls do not
+    // change: see the `multi_threaded_message_loop` comment above for why they stay safe to call
+    // from this reader thread rather than the one actually running CEF's message loop.
+    #[cfg(target_os = "macos")]
+    {
+        let input_out = out.clone();
+        let input_pages = pages.clone();
+        std::thread::Builder::new()
+            .name("cod-browser-input".into())
+            .spawn(move || {
+                // `input_loop` only returns by calling `std::process::exit` itself (on the
+                // control socket closing), which ends the whole process immediately regardless
+                // of which thread called it, so `run_message_loop` below never actually has to
+                // return through `quit_message_loop`. It is still called here, defensively, in
+                // case `input_loop` is ever changed to return normally instead.
+                input_loop(stream, input_out, input_pages);
+                quit_message_loop();
+            })
+            .expect("cod-browser: cannot start the input thread");
+        run_message_loop();
+        shutdown();
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    input_loop(stream, out, pages);
+}
+
+/// Reads one `ToBrowser` message at a time from the control socket and runs it, until the socket
+/// closes (Cod exited) or sends something unreadable twice in a row is never the case here:
+/// `ToBrowser::read_from` already resyncs after a single oversized message (RC review B4).
+fn input_loop(stream: UnixStream, out: mpsc::Sender<Outgoing>, pages: Pages) {
     let mut input = BufReader::new(stream);
     loop {
         let message = match ToBrowser::read_from(&mut input) {

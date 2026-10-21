@@ -14,7 +14,10 @@ name = "cod-browser"
 path = "src/cod_browser.rs"
 doctest = false
 
-# The binary does nothing on other platforms, so the CEF crates are only fetched and built on Linux.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The binary does nothing on other platforms, so the CEF and libc crates are only fetched and
+# built on Linux and macOS (issue #23 round 1 adds macOS; cef-rs supports both as aarch64 and
+# x86_64 targets, see https://github.com/tauri-apps/cef-rs). `engine.rs`'s `libc::dup2` call is
+# POSIX, not Linux-specific, so `libc` is needed on both.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 cef.workspace = true
 libc.workspace = true
