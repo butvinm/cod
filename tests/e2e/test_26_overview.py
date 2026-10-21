@@ -6,7 +6,9 @@ Session and page states come from the driver's set_entry test fixture (tests/e2e
 
 from __future__ import annotations
 
+import time
 import unittest
+from collections.abc import Callable
 from typing import Any
 
 from cod_e2e import CodTestCase
@@ -50,6 +52,11 @@ SHOW_TIMEOUT = 15.0
 
 # How long Cod may take to restore its workspaces after a restart.
 RESTORE_TIMEOUT = 45.0
+
+# RC fixes item 1: how long a pending workspace's background load, lost in a race against a
+# newer switch, may still take to finish; watched long enough that a stale completion stealing
+# the focus afterward would be caught (about 1-3 s in CI, see test_25's PENDING_LOAD_SETTLE).
+PENDING_LOAD_SETTLE = 6.0
 
 BILLING_API = {
     "Cargo.toml": '[package]\nname = "billing-api"\nversion = "0.1.0"\nedition = "2021"\n',
@@ -146,6 +153,17 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
             SHOW_TIMEOUT,
             f"row {index} to be selected",
         )
+
+    def stays(self, predicate: Callable[[dict[str, Any]], bool], seconds: float, description: str) -> dict[str, Any]:
+        """Reads the state for the given time and fails as soon as predicate(state) is false."""
+        deadline = time.monotonic() + seconds
+        while True:
+            state = self.state()
+            if not predicate(state):
+                raise AssertionError(f"{description} did not hold; state: {state}")
+            if time.monotonic() >= deadline:
+                return state
+            time.sleep(0.1)
 
     # AC1
 
@@ -380,6 +398,72 @@ class WorkspaceOverviewTest(CodStatusFixtures, CodTestCase):
                 and (state["project_panel"] or {}).get("selected") == "billing-api",
                 RESTORE_TIMEOUT,
                 "PAY-1234 to load and focus billing-api in the project panel",
+            )
+
+    def test_ac6_a_newer_switch_wins_the_race_and_keeps_its_focus(self) -> None:
+        """RC fixes item 1: selecting a pending workspace's folder row and pressing enter kicks
+        off its background load. If a newer "show this workspace" request (even a click on the
+        workspace already shown) wins the race before that load finishes, the overview's own
+        completion must not apply the folder row's target to the workspace that lost the race:
+        that would focus its hidden project panel and steal the window's focus away from the
+        workspace that is actually shown."""
+        with self.step("start Cod on billing-api, keep the session and name the workspace PAY-1234"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(billing_api, persistent=True)
+            self.wait_for(lambda state: state["workspace_count"] == 1 and state["modal"] is None, SHOW_TIMEOUT, "the first workspace")
+            self.rename_workspace(PAY_NAME)
+
+        with self.step("open a second workspace on billing-api too and name it DOC-208"):
+            self.new_workspace()
+            self.add_folder_to_active_workspace(billing_api)
+            self.rename_workspace(DOC_NAME)
+
+        with self.step("restart Cod: DOC-208 (the last active) loads eagerly, PAY-1234 stays pending until shown"):
+            self.restart_cod()
+            self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["modal"] is None,
+                RESTORE_TIMEOUT,
+                "both workspaces back",
+            )
+
+        with self.step("open README.md in DOC-208 and focus it there"):
+            self.keys("ctrl-p")
+            self.wait_for(lambda state: state["file_finder_ready"], SHOW_TIMEOUT, "the file finder to take typed keys")
+            self.type("README")
+            self.keys("enter")
+            tabs_state = self.wait_for(
+                lambda state: state["modal"] is None
+                and (state["focus"] or {}).get("kind") == "item"
+                and (state["focus"] or {}).get("tab") == "README.md",
+                SHOW_TIMEOUT,
+                "README.md to be open with the focus in DOC-208",
+            )
+
+        with self.step("open the overview and select PAY-1234's folder row"):
+            state = self.open_overview()
+            rows = overview(state)["rows"]
+            # Both workspaces hold the same folder, so "billing-api" is not a unique title: the
+            # second line carries the workspace id ("[PAY-1234] - ...", #26 AC2), which is.
+            row_index = next(
+                index
+                for index, row in enumerate(rows)
+                if row["kind"] == "folder" and row["title"] == "billing-api" and row["detail"].startswith("[PAY-1234]")
+            )
+            self.keys(" ".join(["down"] * row_index))
+            self.wait_for_selected(row_index)
+
+        with self.step("press enter on PAY-1234's folder row, then immediately click DOC-208's own tab before PAY-1234 finishes loading"):
+            self.keys("enter")
+            self.wait_for(lambda state: state["overview"] is None, SHOW_TIMEOUT, "the overview to close")
+            self.click_tab(tabs_state, DOC)
+
+        with self.step("DOC-208 stays active with README.md still focused while PAY-1234 loads in the background"):
+            self.stays(
+                lambda state: state["active_workspace"] == DOC
+                and (state["focus"] or {}).get("kind") == "item"
+                and (state["focus"] or {}).get("tab") == "README.md",
+                PENDING_LOAD_SETTLE,
+                "DOC-208 active with README.md focused while PAY-1234 loads in the background",
             )
 
     def add_folder_to_active_workspace(self, folder: Any) -> None:

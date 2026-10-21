@@ -375,7 +375,7 @@ fn activate(
                     cx.update(|window, cx| {
                         let Some(workspace) = multi_workspace
                             .update(cx, |multi_workspace, cx| {
-                                multi_workspace.cod_members(cx).into_iter().find_map(
+                                let workspace = multi_workspace.cod_members(cx).into_iter().find_map(
                                     |member| match member {
                                         CodMember::Live(workspace)
                                             if workspace.read(cx).database_id() == Some(id) =>
@@ -384,7 +384,13 @@ fn activate(
                                         }
                                         _ => None,
                                     },
-                                )
+                                )?;
+                                // A newer request (a click on another workspace, for example)
+                                // may have won the race while this one loaded: only the target
+                                // of the request that is still shown gets applied, so a stale
+                                // one never steals the window's focus into this workspace's
+                                // hidden project panel (RC fixes item 1).
+                                (multi_workspace.workspace() == &workspace).then_some(workspace)
                             })
                             .ok()
                             .flatten()
