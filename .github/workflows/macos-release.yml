@@ -151,15 +151,19 @@ jobs:
         id: smoke
         run: |
           set -uo pipefail
+
+          # AC-R5: ditto -x -k (not unzip) restores the code signature's extended attributes, so
+          # codesign --verify below checks the same bits a user's double-click-to-unzip would
+          # produce, not a copy unzip silently stripped the signature from.
           work=$(mktemp -d)
-          unzip -q cod-macos-aarch64.zip -d "$work"
+          ditto -x -k cod-macos-aarch64.zip "$work"
           app="$work/Cod.app"
-          data=$(mktemp -d)/cod-preview-smoke
-          mkdir -p "$data"
-          export COD_PREVIEW_DIR="$data"
 
           mkdir -p smoke-artifacts
           status=0
+
+          echo "== codesign --verify on the extracted bundle =="
+          codesign --verify --deep --strict --verbose=2 "$app"
 
           # AC-R1: --user-data-dir must isolate Cod's logs and cache too, not only its config and
           # application data, so a stock Zed on the same Mac keeps its own
@@ -220,12 +224,29 @@ jobs:
           }
           before_reports=$(reports_count)
 
-          "$app/Contents/MacOS/cod" &
-          pid=$!
+          # AC-R5: launch it the way Finder does (open -n), not by executing the inner binary
+          # directly. open --env passes the temporary, isolated data folder through to the
+          # launched app (a plain shell `export` would not reach it: open hands the app to
+          # launchd, which does not inherit this script's environment). Falls back to Cod's
+          # default data folder, and says so, if this runner's open(1) predates --env.
+          data=$(mktemp -d)/cod-preview-smoke
+          mkdir -p "$data"
+          if open --help 2>&1 | grep -q -- '--env'; then
+            echo "Launching with open -n --env COD_PREVIEW_DIR=$data"
+            open -n --env "COD_PREVIEW_DIR=$data" "$app"
+          else
+            echo "::warning::this runner's open(1) has no --env option; Cod will use its default data directory instead of the temporary one made for this smoke test"
+            data="$HOME/Library/Application Support/Cod-preview"
+            open -n "$app"
+          fi
           sleep 20
 
-          if ! kill -0 "$pid" 2>/dev/null; then
-            echo "::error::Cod exited within 20 seconds (pid $pid is gone); a stock Zed Stable instance on the same port may have been mistaken for Cod itself (AC-R2)"
+          # open -n returns as soon as launchd takes over, so its own $! is already gone; the
+          # launcher script (Contents/MacOS/cod) execs zed in place (same PID, new process
+          # image), so the running process is found by the extracted bundle's own zed path.
+          pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+          if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::Cod is not running 20 seconds after open -n (no process matches $app/Contents/MacOS/zed); a stock Zed Stable instance on the same port may have been mistaken for Cod itself (AC-R2)"
             status=1
           fi
 
@@ -269,7 +290,7 @@ jobs:
             status=1
           fi
 
-          if kill -0 "$pid" 2>/dev/null; then
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
             sleep 2
             kill -9 "$pid" 2>/dev/null || true
