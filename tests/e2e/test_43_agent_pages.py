@@ -670,6 +670,45 @@ class AgentPagesTest(CodTestCase):
                     process.kill()
                 process.communicate()
 
+    # RC review B2 (security blocker, final batch): a restart must not re-grant bridge rights
+    # to whatever external address an agent page last navigated to.
+
+    def test_b2_a_page_navigated_away_is_not_a_trusted_agent_document_after_a_restart(self) -> None:
+        with self.step("start Cod with a saved session and open a page that links to an outside page"):
+            repo = self.start_on_billing_api(persistent=True)
+            forged = ForgedBridgeServer()
+            self.addCleanup(forged.close)
+            html_path = self.write_html("navigate-away-restart.html", navigate_away_html(forged.url()))
+            page_id = self.codctl("open", "--html", str(html_path), cwd=repo).stdout.strip()
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("state") == "loaded",
+                LOAD_TIMEOUT,
+                "the agent page to load",
+            )
+            page = page_by_id(self.state(), page_id)
+            assert page is not None
+            self.expect_equal("page kind before navigating away", "agent", page["kind"])
+
+        with self.step("follow the same-tab link to the outside page"):
+            self.click_in_page(page_id, 20, 20)
+            self.wait_for(
+                lambda state: (page_by_id(state, page_id) or {}).get("kind") == "external",
+                SHOW_TIMEOUT,
+                "the page to stop being agent-made once navigated away",
+            )
+
+        with self.step("restart Cod"):
+            self.restart_cod()
+
+        with self.step("the restored page is an ordinary page, not a re-trusted agent document"):
+            state = self.wait_for(
+                lambda state: len(pages(state)) == 1,
+                RESTORE_TIMEOUT,
+                "the page to come back",
+            )
+            restored = pages(state)[0]
+            self.expect_equal("restored page kind", "external", restored["kind"])
+
     # RC review new defect #1 (regression): a page over about 6 KiB must not trip the
     # navigated-away latch on its own first load, just because the engine truncates the address
     # it reports.
