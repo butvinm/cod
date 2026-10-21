@@ -7371,13 +7371,15 @@ impl ThreadView {
     /// Every agent reply's markdown blocks, in reading order (RC review B7/C4): unlike
     /// `cod_last_reply_markdown`, which only enters the newest reply, this is every block of
     /// every reply, so Tab and Shift-Tab can keep moving once they run out of links in one
-    /// block, instead of stopping there.
-    fn cod_all_reply_markdowns(&self, cx: &App) -> Vec<Entity<Markdown>> {
+    /// block, instead of stopping there. Each block comes with the index of its thread entry,
+    /// which is also its item in `list_state`.
+    fn cod_all_reply_markdowns(&self, cx: &App) -> Vec<(usize, Entity<Markdown>)> {
         self.thread
             .read(cx)
             .entries()
             .iter()
-            .flat_map(|entry| match entry {
+            .enumerate()
+            .flat_map(|(entry_ix, entry)| match entry {
                 AgentThreadEntry::AssistantMessage(message) => message
                     .chunks
                     .iter()
@@ -7387,6 +7389,7 @@ impl ThreadView {
                         }
                         AssistantMessageChunk::Thought { .. } => Vec::new(),
                     })
+                    .map(|markdown| (entry_ix, markdown))
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             })
@@ -7465,11 +7468,12 @@ impl ThreadView {
         let markdowns = self.cod_all_reply_markdowns(cx);
         let Some(current_index) = markdowns
             .iter()
-            .position(|markdown| markdown.read(cx).focus_handle(cx).is_focused(window))
+            .position(|(_, markdown)| markdown.read(cx).focus_handle(cx).is_focused(window))
         else {
             return;
         };
-        if !Self::cod_markdown_link_navigation_exhausted(&markdowns[current_index], forward, cx) {
+        if !Self::cod_markdown_link_navigation_exhausted(&markdowns[current_index].1, forward, cx)
+        {
             return;
         }
         let next_index = if forward {
@@ -7477,9 +7481,13 @@ impl ThreadView {
         } else {
             current_index.checked_sub(1)
         };
-        let Some(markdown) = next_index.and_then(|index| markdowns.get(index)) else {
+        let Some((entry_ix, markdown)) = next_index.and_then(|index| markdowns.get(index)) else {
             return;
         };
+        // An earlier reply can be outside the rendered part of the list, where its block is not
+        // drawn and cannot take the keyboard focus: bring its entry into view first (the
+        // executed beta found links in older replies unreachable without this).
+        self.list_state.scroll_to_reveal_item(*entry_ix);
         window.focus(&markdown.read(cx).focus_handle(cx), cx);
         cx.notify();
         cx.stop_propagation();
