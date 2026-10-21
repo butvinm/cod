@@ -882,10 +882,24 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let doomed = self.workspace().clone();
+        self.cod_close_live_workspace(doomed, window, cx);
+    }
+
+    /// Issue #77 F3: the same close (consent to save, pick a replacement, detach) as
+    /// `close_workspace`, but for a given workspace rather than always the active one, so a
+    /// tab's own close button can close a workspace that is not shown. A pending (not loaded)
+    /// member has no live `Workspace` to close this way; its tab has no close button instead
+    /// (see `cod_workspace_tabs.rs`), so this is never called for one.
+    pub fn cod_close_live_workspace(
+        &mut self,
+        doomed: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
             return;
         };
-        let doomed = self.workspace().clone();
         let app_state = doomed.read(cx).app_state().clone();
         cx.spawn_in(window, async move |this, cx| {
             let consent = doomed
@@ -906,12 +920,19 @@ impl MultiWorkspace {
 
             // The replacement is the member before the closed one (else the one after it), loaded
             // or pending; a listed member whose saved data was not found is skipped.
-            let replacement = this.update(cx, |this, cx| {
+            // Issue #77 F3: a replacement is only shown when the closed workspace was the one
+            // shown; closing a tab in the background (the hovered-but-inactive case the story's
+            // test covers) must leave the active workspace exactly as it was.
+            let (replacement, was_active) = this.update(cx, |this, cx| {
+                let was_active = *this.workspace() == doomed;
                 let members = this.cod_members(cx);
                 let index = members.iter().position(|member| match member {
                     CodMember::Live(workspace) => *workspace == doomed,
                     CodMember::Pending(_) => false,
-                })?;
+                });
+                let Some(index) = index else {
+                    return (None, was_active);
+                };
                 let candidates: Vec<(usize, CodMember)> = members
                     .into_iter()
                     .enumerate()
@@ -923,14 +944,15 @@ impl MultiWorkspace {
                             }
                     })
                     .collect();
-                candidates
+                let replacement = candidates
                     .iter()
                     .rev()
                     .find(|(position, _)| *position < index)
                     .or_else(|| candidates.iter().find(|(position, _)| *position > index))
-                    .map(|(_, member)| member.clone())
+                    .map(|(_, member)| member.clone());
+                (replacement, was_active)
             })?;
-            match replacement {
+            match replacement.filter(|_| was_active) {
                 Some(CodMember::Live(replacement)) => {
                     this.update_in(cx, |this, window, cx| {
                         this.activate(replacement, None, window, cx);
@@ -942,7 +964,7 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
-                None => {
+                None if was_active => {
                     cx.update(|_window, cx| {
                         Workspace::new_local(
                             Vec::new(),
@@ -956,6 +978,8 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
+                // Not active: nothing was shown, so nothing needs to replace it.
+                None => {}
             }
 
             this.update(cx, |this, cx| {

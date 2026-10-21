@@ -128,6 +128,8 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
                 "tooltip": tab.tooltip,
                 "truncated": tab.truncated(),
                 "bounds": bounds_json(tab.bounds),
+                // #77 F3: None for a pending (not yet loaded) member, which has no close button.
+                "close_bounds": bounds_json(tab.close_bounds),
             })
         })
         .collect();

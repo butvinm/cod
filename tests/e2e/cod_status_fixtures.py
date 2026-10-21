@@ -98,6 +98,14 @@ class CodStatusFixtures:
             raise AssertionError(f"expected tab {index} to be drawn, actual bounds {bounds!r}")
         self.hover_at(*center(bounds))
 
+    def click_close_button(self, state: dict[str, Any], index: int) -> None:
+        """Clicks the middle of the close button of the tab at `index` (issue #77 F3)."""
+        tabs = title_bar(state)["tabs"]
+        bounds = tabs[index]["close_bounds"]
+        if not drawn(bounds):
+            raise AssertionError(f"expected tab {index} to have a drawn close button, actual {bounds!r}")
+        self.click_at(*center(bounds))
+
 
 def screenshot_ppm(path: Path) -> None:
     """Saves a full native screenshot in PPM (issue #77: plain pixel sampling, no image library)."""
