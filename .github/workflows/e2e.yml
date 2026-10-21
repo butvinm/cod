@@ -4,6 +4,8 @@
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 # Pushes to master run it too, which keeps the caches warm: only master writes them.
 # The job's status is the "Run end-to-end tests" step: every test_*.py, all local. The remote (SSH) tests need the remote server, which takes long to build, so they run only in the optional workflow "E2E remote (optional)" (e2e-remote.yml).
+# This job no longer waits on the fast compile check (check.yml): that duplicated the same compile in sequence.
+# The Build step below builds with --locked instead, which keeps the one distinct signal of the check (lockfile enforcement).
 name: E2E
 
 on:
@@ -20,19 +22,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The fast compile check (check.yml) of the same commit runs first. The full build below starts only after it passed, so a compile error costs the check's minutes, not a full build.
-  check:
-    name: check
-    uses: ./.github/workflows/check.yml
-    permissions:
-      contents: read
-      actions: write
-
   e2e:
     name: e2e
-    needs: check
-    # Runs also when the check failed, only to fail at once: a skipped job would count as passed for a required check.
-    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     # The same values as the build job of linux-release.yml. A difference makes sccache miss and rebuild everything.
@@ -45,12 +36,6 @@ jobs:
       CC: clang
       CXX: clang++
     steps:
-      - name: Admit the build only after the compile check passed
-        if: needs.check.result != 'success'
-        run: |
-          echo "The compile check of this commit did not pass (${{ needs.check.result }}), so the full build does not start."
-          exit 1
-
       - name: Check out
         uses: actions/checkout@v4
         with:
@@ -163,7 +148,7 @@ jobs:
         run: |
           echo "build started at $(date -u '+%H:%M:%S')"
           sccache --zero-stats
-          cargo build --profile release-fast -p zed -p cod_browser -p codctl
+          cargo build --locked --profile release-fast -p zed -p cod_browser -p codctl
           sccache --show-stats
           echo "build finished at $(date -u '+%H:%M:%S')"
 
