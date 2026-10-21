@@ -1301,7 +1301,9 @@ impl SerializableItem for OffscreenView {
             self.url.as_ref(),
         );
         let title = self.title.as_ref().map(|title| title.to_string());
-        let kind = self.kind.as_str().to_string(); // TEMP: reproduce the B2 bug for the failing-first run
+        let kind = persisted_kind(self.kind, self.agent_navigated_away)
+            .as_str()
+            .to_string();
         Some(cx.background_spawn(async move {
             db.save_page(item_id, workspace_id, page_id, url, title, kind)
                 .await
