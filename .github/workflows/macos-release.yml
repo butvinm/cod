@@ -9,7 +9,12 @@
 #
 # The macOS archive is unsigned (ad-hoc signature only, script/bundle-cod-mac): code signing and
 # notarization cost money and need a stakeholder decision (#23 out of scope). It targets Apple
-# Silicon only; web page tabs are Linux-only for now (#31 covers the system WKWebView on macOS).
+# Silicon only.
+#
+# #23 round 1 ports Linux's off-screen CEF page-tab backend (cod_browser) to macOS: the CEF
+# runtime is downloaded and cached the same way as linux-release.yml's own CEF steps (CEF_PATH,
+# restored/saved by actions/cache, keyed by CEF version and this platform), and script/bundle-cod-mac
+# packages "Chromium Embedded Framework.framework" plus one helper app bundle inside Cod.app.
 name: macOS release
 
 on:
@@ -42,6 +47,12 @@ jobs:
       CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
       # The same two flags as linux-release.yml, minus the Linux-only mold linker flag.
       RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable"
+      # The cef crate's build script downloads CEF into here if it is not already present, the
+      # same two variables linux-release.yml uses, so the download is cached the same way.
+      # CEF_VERSION is the distribution version the pinned cef crate resolves to, not the crate's
+      # own semver; it must stay in step with Cargo.toml's `cef = "=154.5.0"` on every platform.
+      CEF_VERSION: 154.0.34
+      CEF_PATH: /Users/runner/cef
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -75,8 +86,16 @@ jobs:
           cache-on-failure: true
           save-if: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') }}
 
-      # cod_browser (the off-screen CEF browser helper) and remote_server are Linux-only concerns
-      # for this preview; web pages on macOS use the system WKWebView (#31, not built here yet).
+      # remote_server is a Linux-only concern for this preview. cod_browser (the off-screen CEF
+      # page-tab helper) now builds here too (#23 round 1): its cef dependency needs the CEF
+      # download restored below, same as linux-release.yml's own cef-cache step.
+      - name: Restore the CEF download
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
       - name: Build (cargo release-fast, sccache)
         env:
           SCCACHE_GHA_ENABLED: "true"
@@ -84,9 +103,28 @@ jobs:
           RUSTC_WRAPPER: sccache
         run: |
           sccache --zero-stats
-          cargo build --locked --profile release-fast -p zed -p codctl
+          cargo build --locked --profile release-fast -p zed -p codctl -p cod_browser
           sccache --show-stats
           df -h /
+
+      - name: Save the CEF download
+        if: startsWith(github.ref, 'refs/heads/macos-preview/') && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
+      # Finds wherever the cef crate's build script actually put "Chromium Embedded
+      # Framework.framework" under CEF_PATH, instead of assuming its exact subfolder name (that
+      # name is cef-dll-sys's own internal convention, not documented, and guessing it wrong would
+      # fail the bundle step below for a reason this search avoids entirely).
+      - name: Find the downloaded CEF framework
+        run: |
+          set -euo pipefail
+          framework=$(find "$CEF_PATH" -maxdepth 6 -type d -name "Chromium Embedded Framework.framework" | head -n 1)
+          test -n "$framework"
+          echo "Found $framework"
+          echo "CEF_RUNTIME_DIR=$(dirname "$framework")" >> "$GITHUB_ENV"
 
       - name: Bundle Cod.app (script/bundle-cod-mac)
         env:
@@ -109,23 +147,35 @@ jobs:
           echo "== codesign --verify =="
           codesign --verify --deep --strict --verbose=2 "$app"
 
+          echo "== CEF framework and helper bundle are in place (#23 round 1) =="
+          framework="$app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          helper="$app/Contents/Frameworks/Cod Helper.app/Contents/MacOS/Cod Helper"
+          test -d "$framework" || { echo "::error::no CEF framework at $framework"; exit 1; }
+          test -x "$helper" || { echo "::error::no Cod Helper executable at $helper"; exit 1; }
+
           echo "== file: arch must be arm64 =="
-          for bin in zed codctl; do
-            file "$app/Contents/MacOS/$bin"
-            file "$app/Contents/MacOS/$bin" | grep -q "arm64" || {
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "$helper"; do
+            file "$bin"
+            file "$bin" | grep -q "arm64" || {
               echo "::error::$bin is not an arm64 binary"
               exit 1
             }
           done
 
-          echo "== otool -L: only /System/ and /usr/lib/ =="
-          for bin in zed codctl; do
+          # Besides /System/ and /usr/lib/, a bundled binary may only reference the CEF framework
+          # this same bundle carries, through a path relative to itself (@executable_path, @rpath
+          # or @loader_path); anything else outside the bundle would break once Cod.app moves
+          # (#23 round 1, P3).
+          echo "== otool -L: only /System/, /usr/lib/, and the bundled CEF framework =="
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "$helper"; do
             echo "-- $bin --"
-            otool -L "$app/Contents/MacOS/$bin"
-            other=$(otool -L "$app/Contents/MacOS/$bin" | tail -n +2 | awk '{print $1}' \
-              | grep -v -E '^(/System/|/usr/lib/)' || true)
+            otool -L "$bin"
+            other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+              | grep -v -E '^(/System/|/usr/lib/|@executable_path/|@rpath/|@loader_path/)' || true)
             if [ -n "$other" ]; then
-              echo "::error::$bin links libraries outside /System/ and /usr/lib/:"
+              echo "::error::$bin links libraries outside /System/, /usr/lib/ and the bundle:"
               printf '%s\n' "$other"
               exit 1
             fi
@@ -305,6 +355,65 @@ jobs:
             status=1
           fi
 
+          # #23 round 1, P4: a real page tab, end to end, through the ported off-screen CEF
+          # backend. The fixture is invented data served locally (no captured real page, per the
+          # public-repo rule), with a distinct title so the read-back cannot be confused with a
+          # stale or unrelated page.
+          echo "== page tab: serve a local fixture =="
+          fixture_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac page smoke</title></head>' \
+            '<body><h1>Cod Mac page smoke</h1></body>' \
+            '</html>' \
+            > "$fixture_dir/index.html"
+          fixture_port=8934
+          python3 -m http.server "$fixture_port" --directory "$fixture_dir" \
+            > smoke-artifacts/fixture-server.log 2>&1 &
+          fixture_server_pid=$!
+          sleep 1
+
+          echo "== page tab: codctl open =="
+          page_id=""
+          if "$app/Contents/MacOS/codctl" open "http://127.0.0.1:$fixture_port/index.html" \
+            > smoke-artifacts/codctl-open.txt 2>&1; then
+            page_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open.txt)
+            echo "codctl open reported page id: $page_id"
+          else
+            echo "::error::codctl open failed to open the local page fixture"
+            cat smoke-artifacts/codctl-open.txt || true
+            status=1
+          fi
+          if [ -z "$page_id" ]; then
+            echo "::error::codctl open printed no page id"
+            status=1
+          fi
+
+          # Off-screen CEF loads the page asynchronously; give it a moment before reading it back.
+          sleep 3
+
+          echo "== page tab: codctl page get (read-back) =="
+          if [ -n "$page_id" ]; then
+            if "$app/Contents/MacOS/codctl" page get "$page_id" --json \
+              > smoke-artifacts/codctl-page-get.txt 2>&1; then
+              echo "codctl page get reported:"
+              cat smoke-artifacts/codctl-page-get.txt
+              if ! grep -q "Cod Mac page smoke" smoke-artifacts/codctl-page-get.txt \
+                && ! grep -q "127.0.0.1:$fixture_port" smoke-artifacts/codctl-page-get.txt; then
+                echo "::error::codctl page get did not report the fixture's title or URL"
+                status=1
+              fi
+            else
+              echo "::error::codctl page get $page_id failed"
+              cat smoke-artifacts/codctl-page-get.txt || true
+              status=1
+            fi
+          else
+            echo "::error::no page id to read back (codctl open did not report one)"
+            status=1
+          fi
+
           echo "== screenshot =="
           if screencapture -x smoke-artifacts/screen.png; then
             echo "Saved smoke-artifacts/screen.png"
@@ -319,6 +428,7 @@ jobs:
             kill -9 "$pid" 2>/dev/null || true
           fi
           kill "$fake_zed_pid" 2>/dev/null || true
+          kill "$fixture_server_pid" 2>/dev/null || true
 
           cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
             || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
@@ -378,4 +488,4 @@ jobs:
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "$tag (macOS, Apple Silicon, unsigned)" \
-            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Web page tabs and agent-made pages are Linux-only for now."
+            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Page tabs use the same off-screen CEF backend as Linux (round 1: opening a plain URL); agent-made HTML pages and the bridge are not ported yet."

@@ -6,6 +6,13 @@
 # Needs target/release-fast/zed and target/release-fast/codctl to exist already
 # (cargo build --locked --profile release-fast -p zed -p codctl).
 #
+# Page tabs (issue #23 round 1 ports Linux's off-screen CEF backend) also need
+# target/release-fast/cod-browser (cargo build ... -p cod_browser) and CEF_RUNTIME_DIR, the
+# directory holding the downloaded "Chromium Embedded Framework.framework" (see
+# .github/workflows/macos-release.yml's "Find the downloaded CEF framework" step). Without
+# either, this script still builds Cod.app, just without page tabs, and says so: that keeps a
+# plain local `zed` + `codctl` build working for anyone who has not fetched CEF.
+#
 # Writes:
 #   dist/Cod.app                    the app bundle, ad-hoc signed
 #   cod-macos-aarch64.zip           dist/Cod.app zipped with ditto (keeps the bundle structure)
@@ -29,8 +36,21 @@ run_number=${RUN_NUMBER:-1}
 
 zed_bin="$build_dir/zed"
 codctl_bin="$build_dir/codctl"
+cod_browser_bin=${COD_BROWSER_BIN:-$build_dir/cod-browser}
 test -x "$zed_bin" || { echo "bundle-cod-mac: missing $zed_bin (build zed first)" >&2; exit 1; }
 test -x "$codctl_bin" || { echo "bundle-cod-mac: missing $codctl_bin (build codctl first)" >&2; exit 1; }
+
+bundle_pages=1
+if [ ! -x "$cod_browser_bin" ]; then
+	echo "bundle-cod-mac: no $cod_browser_bin; bundling Cod.app without page tabs" >&2
+	bundle_pages=0
+elif [ -z "${CEF_RUNTIME_DIR:-}" ]; then
+	echo "bundle-cod-mac: CEF_RUNTIME_DIR is not set; bundling Cod.app without page tabs" >&2
+	bundle_pages=0
+elif [ ! -d "$CEF_RUNTIME_DIR/Chromium Embedded Framework.framework" ]; then
+	echo "bundle-cod-mac: no Chromium Embedded Framework.framework under $CEF_RUNTIME_DIR; bundling Cod.app without page tabs" >&2
+	bundle_pages=0
+fi
 
 echo "Assembling $app_path from $build_dir (commit $commit)"
 rm -rf "$dist_dir"
@@ -106,6 +126,66 @@ cp "$zed_bin" "$app_path/Contents/MacOS/zed"
 cp "$codctl_bin" "$app_path/Contents/MacOS/codctl"
 strip -x "$app_path/Contents/MacOS/zed" "$app_path/Contents/MacOS/codctl"
 
+# --- Page tabs: cod-browser, one CEF subprocess helper bundle, and the CEF framework -----------
+# (issue #23 round 1: porting Linux's off-screen CEF backend to macOS.)
+#
+# `cod-browser` finds the CEF framework the same way on both platforms: as a path relative to
+# its own location inside the bundle (crates/cod_browser/src/engine.rs's `load_framework`, mirroring
+# how crates/web_view/src/browser_client.rs's `helper_path` finds `cod-browser` itself next to
+# `zed` on both platforms already). The framework also carries its own Resources (icudtl.dat,
+# *.pak, locales), unlike Linux where those are loose files next to libcef.so, so nothing else
+# needs to be copied for CEF to find them.
+#
+# One helper app bundle ("Cod Helper.app", a second copy of the same cod-browser binary, renamed)
+# stands in for every CEF subprocess type (renderer, GPU, utility). Upstream CEF samples ship four
+# differently-entitled helper bundles (plain, GPU, Renderer, Plugin) for Apple's App Store sandbox;
+# Cod's ad-hoc-signed preview already runs CEF with --no-sandbox (crates/cod_browser/src/engine.rs),
+# so `Settings::browser_subprocess_path` points every subprocess type at this one helper instead of
+# CEF's automatic per-type bundle names, which this script does not need to produce.
+if [ "$bundle_pages" = 1 ]; then
+	cp "$cod_browser_bin" "$app_path/Contents/MacOS/cod-browser"
+	strip -x "$app_path/Contents/MacOS/cod-browser"
+
+	helper_app="$app_path/Contents/Frameworks/Cod Helper.app"
+	mkdir -p "$helper_app/Contents/MacOS"
+	cat > "$helper_app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Cod Helper</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.cod-editor.cod-preview.helper</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Cod Helper</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.1</string>
+	<key>CFBundleVersion</key>
+	<string>$run_number</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+	cp "$cod_browser_bin" "$helper_app/Contents/MacOS/Cod Helper"
+	strip -x "$helper_app/Contents/MacOS/Cod Helper"
+
+	# ditto (not cp -R) preserves the framework's internal versioned symlinks
+	# (Versions/Current -> Versions/A, and so on), which a plain recursive copy would instead
+	# resolve into duplicate regular files, breaking the framework.
+	ditto "$CEF_RUNTIME_DIR/Chromium Embedded Framework.framework" \
+		"$app_path/Contents/Frameworks/Chromium Embedded Framework.framework"
+fi
+
 # --- Launcher (CFBundleExecutable) ----------------------------------------------------------
 # Mirrors script/cod-wayland.sh: an isolated data folder, not stock Zed's
 # ~/Library/Application Support/Zed, and the app's stderr appended to a log inside it.
@@ -129,6 +209,13 @@ chmod +x "$app_path/Contents/MacOS/cod"
 printf '%s\n' "$commit" > "$app_path/Contents/Resources/cod-commit.txt"
 
 # --- Ad-hoc signature (no certificate: Code signing and notarization are out of scope, #23) ----
+# Signed inside-out: the CEF framework and the helper bundle it is nested under first (codesign
+# refuses to sign an outer bundle whose nested code is unsigned), then the whole of Cod.app last,
+# which also covers zed, codctl and cod-browser in Contents/MacOS.
+if [ "$bundle_pages" = 1 ]; then
+	codesign --force --sign - "$app_path/Contents/Frameworks/Chromium Embedded Framework.framework"
+	codesign --force --sign - "$app_path/Contents/Frameworks/Cod Helper.app"
+fi
 codesign --force --deep --sign - "$app_path"
 
 # --- Zip (ditto keeps the bundle's resource forks and the single top-level Cod.app entry) ------
