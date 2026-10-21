@@ -369,7 +369,10 @@ jobs:
             '</html>' \
             > "$fixture_dir/index.html"
           fixture_port=8934
-          python3 -m http.server "$fixture_port" --directory "$fixture_dir" \
+          # --bind 127.0.0.1: round 2 diagnosis Q1. Bound to all interfaces, the previous round's
+          # server made macOS ask "Allow Python to find devices on local networks?", a dialog that
+          # has nothing to do with this smoke test and that nothing here answers.
+          python3 -m http.server "$fixture_port" --bind 127.0.0.1 --directory "$fixture_dir" \
             > smoke-artifacts/fixture-server.log 2>&1 &
           fixture_server_pid=$!
           sleep 1
@@ -390,30 +393,46 @@ jobs:
             status=1
           fi
 
-          # Off-screen CEF loads the page asynchronously; give it a moment before reading it back.
-          sleep 3
-
-          echo "== page tab: codctl page get (read-back) =="
+          # Round 2 diagnosis Q1: round 1's smoke test read the page back once, a few seconds
+          # after opening it, while it still said state "loading" (and passed anyway, because it
+          # only checked for the title or URL, both already known before the page ever loaded).
+          # This polls for up to 30 s and requires state "loaded" and the fixture's exact title,
+          # so a page that never finishes loading (or whose helper has died) fails here instead of
+          # looking like a pass.
+          echo "== page tab: codctl page get (poll up to 30s for state=loaded) =="
+          loaded=0
           if [ -n "$page_id" ]; then
-            if "$app/Contents/MacOS/codctl" page get "$page_id" --json \
-              > smoke-artifacts/codctl-page-get.txt 2>&1; then
-              echo "codctl page get reported:"
-              cat smoke-artifacts/codctl-page-get.txt
-              if ! grep -q "Cod Mac page smoke" smoke-artifacts/codctl-page-get.txt \
-                && ! grep -q "127.0.0.1:$fixture_port" smoke-artifacts/codctl-page-get.txt; then
-                echo "::error::codctl page get did not report the fixture's title or URL"
-                status=1
+            for _attempt in $(seq 1 30); do
+              if "$app/Contents/MacOS/codctl" page get "$page_id" --json \
+                > smoke-artifacts/codctl-page-get.txt 2>&1; then
+                state=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('state', ''))" 2> /dev/null || echo "")
+                title=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$state" = "loaded" ] && [ "$title" = "Cod Mac page smoke" ]; then
+                  loaded=1
+                  break
+                fi
+                if [ "$state" = "failed" ]; then
+                  echo "codctl page get reported state=failed, not waiting out the rest of the 30s"
+                  break
+                fi
               fi
-            else
-              echo "::error::codctl page get $page_id failed"
-              cat smoke-artifacts/codctl-page-get.txt || true
-              status=1
-            fi
-          else
+              sleep 1
+            done
+          fi
+          echo "codctl page get (last read):"
+          cat smoke-artifacts/codctl-page-get.txt 2> /dev/null || echo "(no output captured)"
+          if [ -z "$page_id" ]; then
             echo "::error::no page id to read back (codctl open did not report one)"
             status=1
+          elif [ "$loaded" != "1" ]; then
+            echo "::error::codctl page get never reported state=loaded with title 'Cod Mac page smoke' within 30s"
+            status=1
+          else
+            echo "page tab loaded: state=loaded title='Cod Mac page smoke'"
           fi
 
+          # Round 2 diagnosis Q1: the screenshot is taken after the poll above, once the page has
+          # either loaded or the 30s have run out, not a few seconds after codctl open.
           echo "== screenshot =="
           if screencapture -x smoke-artifacts/screen.png; then
             echo "Saved smoke-artifacts/screen.png"
