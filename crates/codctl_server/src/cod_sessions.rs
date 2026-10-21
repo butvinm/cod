@@ -24,6 +24,15 @@ use crate::{members, target_workspace};
 /// fake agent of the tests).
 pub async fn new_session(workspace_ref: Option<&str>, agent: String, cx: &mut AsyncApp) -> Result<Value> {
     let (window, workspace) = cx.update(|cx| target_workspace(workspace_ref, cx))?;
+    // A workspace `codctl workspace new` made a moment ago attaches its agent panel
+    // asynchronously; wait for it instead of failing a script that runs both commands in a row.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cx.update(|cx| workspace.read(cx).panel::<agent_ui::AgentPanel>(cx).is_none()) {
+        if Instant::now() >= deadline {
+            bail!("the workspace has no agent panel");
+        }
+        cx.background_executor().timer(Duration::from_millis(20)).await;
+    }
     let thread_id = window.update(cx, |_, window, cx| {
         agent_ui::cod_sessions::new_session(&workspace, &agent, window, cx)
     })??;
