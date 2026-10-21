@@ -325,6 +325,14 @@ class AgentChatLinksTest(CodTestCase):
             for expected in [url for reply in links for url in reply][1:]:
                 self.press_until_link("tab", expected)
 
+        with self.step("enter the newest reply again and shift-tab back through all six links a second time"):
+            # QA on c18d242d36: a reply entered again resumed at the link it had last time, so
+            # the second pass skipped links.
+            self.keys("alt-up")
+            self.wait_for(lambda state: chat(state).get("reply_focused") is True, 10, "the reply to take the focus")
+            for expected in [url for reply in reversed(links) for url in reversed(reply)]:
+                self.press_until_link("shift-tab", expected)
+
     def press_until_link(self, key: str, expected: str) -> None:
         """Presses `key` until the focused chat link is `expected`, allowing one extra press for a block boundary."""
         for _ in range(2):
