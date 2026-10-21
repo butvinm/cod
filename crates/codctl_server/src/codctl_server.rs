@@ -381,10 +381,20 @@ async fn new_workspace(
     // exists, even while a live workspace already has them open; the new call's workspace
     // entity would then share that row's id and persistence with the one already showing it.
     // Canonicalize first, the same as `Workspace::new_local` does before it looks the roots up.
-    let canonical: Vec<PathBuf> = folders
-        .iter()
-        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
-        .collect();
+    // This whole function runs on GPUI's foreground executor (`run` is `cx.spawn`, not
+    // `cx.background_spawn`), so the canonicalize calls themselves run on the background
+    // executor instead (RC review, final batch): a folder under a stalled network mount or
+    // automount would otherwise freeze the whole app for as long as the filesystem call takes.
+    let to_canonicalize = folders.clone();
+    let canonical: Vec<PathBuf> = cx
+        .background_executor()
+        .spawn(async move {
+            to_canonicalize
+                .iter()
+                .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+                .collect()
+        })
+        .await;
     let key = folder_key(&canonical);
     if let Some(key) = &key {
         match cx.update(|cx| reserve_or_follow(key, cx)) {
