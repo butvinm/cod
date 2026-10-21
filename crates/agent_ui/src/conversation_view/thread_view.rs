@@ -1994,8 +1994,13 @@ impl ThreadView {
                 this.set_editor_is_expanded(false, cx);
             })?;
 
-            let _ = this.update(cx, |this, cx| {
-                this.list_state.scroll_to_end();
+            let _ = this.update_in(cx, |this, window, cx| {
+                // A message sent while the keyboard is on a link in a reply (for example by `codctl session send`) must not scroll that link out of view (Cod D26 QA F1): the view stays where it is, as when the user has scrolled up.
+                if this.cod_focused_reply_entry(window, cx).is_some() {
+                    this.list_state.pause_following_tail();
+                } else {
+                    this.list_state.scroll_to_end();
+                }
                 cx.notify();
             });
 
