@@ -26,8 +26,25 @@ pub async fn new_session(workspace_ref: Option<&str>, agent: String, cx: &mut As
     let (window, workspace) = cx.update(|cx| target_workspace(workspace_ref, cx))?;
     // A workspace `codctl workspace new` made a moment ago attaches its agent panel
     // asynchronously; wait for it instead of failing a script that runs both commands in a row.
+    // With AI disabled the panel never comes, and a workspace closed meanwhile must not get a
+    // session nobody can address, so both are checked on every poll.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while cx.update(|cx| workspace.read(cx).panel::<agent_ui::AgentPanel>(cx).is_none()) {
+    loop {
+        let ready = cx.update(|cx| -> Result<bool> {
+            if agent_ui::cod_sessions::ai_disabled(cx) {
+                bail!("AI is disabled in the settings, so the workspace has no agent panel");
+            }
+            let open = members(cx)
+                .iter()
+                .any(|member| member.window == window && member.live.as_ref() == Some(&workspace));
+            if !open {
+                bail!("the workspace was closed");
+            }
+            Ok(workspace.read(cx).panel::<agent_ui::AgentPanel>(cx).is_some())
+        })?;
+        if ready {
+            break;
+        }
         if Instant::now() >= deadline {
             bail!("the workspace has no agent panel");
         }

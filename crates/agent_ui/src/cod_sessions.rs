@@ -19,7 +19,8 @@ use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp_v1;
 use anyhow::{Context as _, Result, bail};
 use gpui::{App, AppContext as _, Entity, Global, SharedString, Window};
-use project::AgentId;
+use project::{AgentId, DisableAiSettings};
+use settings::Settings as _;
 use workspace::Workspace;
 
 use crate::{Agent, AgentInitialContent, AgentPanel, ThreadId, cod_chat_status::CodChatStatus};
@@ -77,6 +78,12 @@ pub fn new_session(
         .context("no chat opened after starting the session")?;
     cx.default_global::<RequestedSessions>().0.insert(thread_id);
     Ok(thread_id)
+}
+
+/// Whether `disable_ai` is on, so no workspace gets an agent panel (#39 AC1: `codctl session new`
+/// fails at once instead of waiting for one).
+pub fn ai_disabled(cx: &App) -> bool {
+    DisableAiSettings::get_global(cx).disable_ai
 }
 
 /// The chats `codctl session new` started (#39 AC1). The caller asked for each of them, so an
