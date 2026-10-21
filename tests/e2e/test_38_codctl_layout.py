@@ -244,6 +244,40 @@ class LayoutTest(CodTestCase):
                 f"pane {b_id} to take 70% of the split's width",
             )
 
+    def test_a5_resize_in_a_nested_split_is_a_share_of_that_split_only(self) -> None:
+        """RC review residual (A5 nested): split P right (C), P down (B), then P right again (E), so P and E share a row inside the left column. Resizing P to 30% must give P 30% of that row, as Zed's own resize works within the split that holds P, not 30% of a span that takes in C from the outer split."""
+        with self.step("start Cod on billing-api and build the nested layout"):
+            repo = self.start_on_billing_api()
+            self.expect_result(self.codctl("open", "src/invoice.rs", cwd=repo), 0, stdout="", stderr="")
+            self.wait_for_values("panes", {"tabs": [["invoice.rs"]], "split": None}, self.pane_view, SHOW_TIMEOUT)
+            p_id = self.panes_json()[0]["id"]
+            for direction in ("--right", "--down", "--right"):
+                count = len(self.panes_json())
+                result = self.codctl("pane", "split", str(p_id), direction)
+                self.expect_result(result, 0, stderr="")
+                if direction == "--right" and count == 3:
+                    e_id = int(result.stdout)
+                self.wait_for(
+                    lambda _, count=count: len(self.panes_json()) == count + 1
+                    and all(pane["bounds"] is not None for pane in self.panes_json()),
+                    SHOW_TIMEOUT,
+                    f"{count + 1} panes laid out after splitting {direction}",
+                )
+
+        with self.step(f"run codctl pane resize {p_id} --size 30% and check P takes 30% of its row with E"):
+            result = self.codctl("pane", "resize", str(p_id), "--size", "30%")
+            self.expect_result(result, 0, stdout="", stderr="")
+
+            def share_of_p(_: dict[str, Any]) -> float:
+                widths = {pane["id"]: pane["bounds"]["width"] for pane in self.panes_json()}
+                return widths[p_id] / (widths[p_id] + widths[e_id])
+
+            self.wait_for(
+                lambda state: abs(share_of_p(state) - 0.3) < 0.05,
+                SHOW_TIMEOUT,
+                f"pane {p_id} to take 30% of the row it shares with pane {e_id}",
+            )
+
     # AC2
 
     def test_ac2_open_file_at_line_and_column(self) -> None:

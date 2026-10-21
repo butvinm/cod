@@ -6101,6 +6101,58 @@ impl Workspace {
         }
     }
 
+    /// The split that holds `pane` directly, for `codctl pane resize`: its axis, `pane`'s size
+    /// along it and the split's whole size along it, from the pane tree itself. `resize_pane`
+    /// resizes within exactly this split, so a percentage of any other span (a geometric guess
+    /// from neighboring panes can take in panes of an outer split) resizes to the wrong size.
+    /// None when `pane` is the only pane or has not been laid out yet.
+    pub fn cod_containing_split(&self, pane: &Entity<Pane>) -> Option<(Axis, Pixels, Pixels)> {
+        fn parent_of<'a>(member: &'a Member, pane: &Entity<Pane>) -> Option<&'a PaneAxis> {
+            let Member::Axis(axis) = member else {
+                return None;
+            };
+            if axis
+                .members
+                .iter()
+                .any(|child| matches!(child, Member::Pane(candidate) if candidate == pane))
+            {
+                return Some(axis);
+            }
+            axis.members.iter().find_map(|child| parent_of(child, pane))
+        }
+        fn union_of_panes(
+            member: &Member,
+            workspace: &Workspace,
+            union: &mut Option<Bounds<Pixels>>,
+        ) {
+            match member {
+                Member::Pane(pane) => {
+                    if let Some(bounds) = workspace.bounding_box_for_pane(pane) {
+                        *union = Some(union.map_or(bounds, |so_far| so_far.union(&bounds)));
+                    }
+                }
+                Member::Axis(axis) => {
+                    for child in &axis.members {
+                        union_of_panes(child, workspace, union);
+                    }
+                }
+            }
+        }
+
+        let split = parent_of(&self.center.root, pane)?;
+        let pane_bounds = self.bounding_box_for_pane(pane)?;
+        let mut whole = None;
+        for child in &split.members {
+            union_of_panes(child, self, &mut whole);
+        }
+        let whole = whole?;
+        let along = |bounds: &Bounds<Pixels>| match split.axis {
+            Axis::Horizontal => bounds.size.width,
+            Axis::Vertical => bounds.size.height,
+        };
+        Some((split.axis, along(&pane_bounds), along(&whole)))
+    }
+
     pub fn move_pane_to_border(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
         if self
             .center
