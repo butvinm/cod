@@ -181,6 +181,26 @@ class CodctlSessionsTest(CodTestCase):
             listed = json.loads(self.codctl.run("session", "list", "--workspace", workspace_id, "--json").stdout)
             self.expect_equal("session ids of the new workspace", ["claude-session-web-1"], [entry["id"] for entry in listed])
 
+    def test_ac1_new_session_with_ai_disabled_fails_at_once(self) -> None:
+        """#39 AC1, from the review of the wait above: with `disable_ai` the agent panel never comes, so session new must fail at once with one line instead of waiting for it."""
+        with self.step("start Cod with disable_ai on a fixture repo"):
+            repo = self.make_repo("billing-api", BILLING_API)
+            self.start_cod(repo, extra_settings={"disable_ai": True})
+            self.wait_for(
+                lambda state: os.path.realpath(repo) in [os.path.realpath(path) for path in state["worktrees"]],
+                SHOW_TIMEOUT,
+                "the billing-api folder to open",
+            )
+
+        with self.step("session new --agent claude fails with one stderr line in under 3 seconds"):
+            started = time.monotonic()
+            result = self.codctl.run("session", "new", "--agent", "claude")
+            elapsed = time.monotonic() - started
+            self.expect_equal(f"exit code ({result.stderr!r})", 1, result.returncode)
+            self.expect_equal("stdout", "", result.stdout)
+            self.expect_equal(f"one stderr line ({result.stderr!r})", 1, len(result.stderr.splitlines()))
+            self.expect_equal(f"failed in under 3 seconds (took {elapsed:.1f} s)", True, elapsed < 3)
+
     # AC2
 
     def test_ac2_list_sessions_plain_and_json(self) -> None:
