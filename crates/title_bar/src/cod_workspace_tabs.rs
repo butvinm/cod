@@ -209,12 +209,17 @@ pub fn render_cod_workspace_tabs(
     let members = multi_workspace.cod_shown_members(cx);
     // #77 C4: capping the row's own box (with min_w_0 removed for F1, or with an absolute
     // max_w measured from the window) did not make the tabs inside it actually shrink when the
-    // title bar is genuinely too narrow for all of them at COD_TAB_MAX_WIDTH each (measured: no
-    // combination tried changed the overflow at all); each tab's own `max_w` is what reliably
-    // works (it already does, for the constant 280 px cap), so when an equal share of the
-    // title bar's measured width for every shown tab is less than that, each tab's own cap
-    // shrinks to that share instead, forcing the real constraint without depending on the row's
-    // own shrink behavior at all.
+    // title bar is genuinely too narrow for all of them at COD_TAB_MAX_WIDTH each; each tab's
+    // own `max_w` is what reliably works (it already does, for the constant 280 px cap), so when
+    // an equal share of the title bar's measured width for every shown tab is less than that,
+    // each tab's own cap shrinks to that share instead, forcing the real constraint without
+    // depending on the row's own shrink behavior at all. Confirmed against the real 640 px
+    // output this story's test uses (COD_E2E_OUTPUT_MODE=640x600, its own invocation, run
+    // separately from the ample-space tests at 1280x800): a run of the test earlier that reused
+    // the 1280x800 output by mistake kept "failing" identically across several different fixes
+    // here, because at 1280 px six tabs legitimately fit without any shrinking at all, so no fix
+    // to the narrow case could have changed that number; it was never evidence against any of
+    // them.
     let tab_max_width = {
         let available = (window.viewport_size().width - px(96.)).max(px(0.));
         let fair_share = px(f32::from(available) / members.len().max(1) as f32);
