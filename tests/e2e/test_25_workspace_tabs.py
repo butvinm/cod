@@ -8,9 +8,11 @@ Session states come from the driver's set_entry test fixture (tests/e2e/cod_stat
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from cod_e2e import CodTestCase
@@ -20,11 +22,13 @@ from cod_status_fixtures import (
     CodStatusFixtures,
     active_tabs,
     bounds_pixel,
+    center,
     color_distance,
     drawn,
     hex_color,
     ink_vertical_center,
     logical_pixel,
+    output_scale,
     read_ppm,
     screenshot_ppm,
     tab_dots,
@@ -57,7 +61,9 @@ UNNAMED_3 = "New workspace 3"
 # report measured. This reproduction's own fixture environment (headless sway, no desktop portal)
 # settled on a light-looking title bar rather than the stakeholder's dark one (see AC(c) below);
 # the truncation and layout bugs reproduce the same regardless.
-FIRST_USE_OUTPUT_SCALE = 1.0
+# #77 C5: derived from COD_E2E_OUTPUT_MODE, not hardcoded, so the scale-2 tests sample the
+# right pixel coordinates too.
+FIRST_USE_OUTPUT_SCALE = output_scale()
 
 # Issue #77 AC(c): colors are checked relative to each other in the same screenshot, not against
 # a hardcoded theme hex. A headless sway with no desktop portal reports no system appearance, and
@@ -152,6 +158,24 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             and state["modal"] is None,
             SHOW_TIMEOUT,
             "the new workspace to be active at the end",
+        )
+
+    def codctl(self, *args: str) -> subprocess.CompletedProcess[str]:
+        """Runs the shipped codctl against the running Cod, the way an agent does (issue #77 C1)."""
+        run_dir = os.environ.get("COD_E2E_RUN_DIR")
+        if not run_dir:
+            raise RuntimeError("COD_E2E_RUN_DIR is not set: run the end-to-end tests with script/e2e")
+        env = dict(os.environ)
+        for name in ("COD_WORKSPACE", "COD_SOCKET"):
+            env.pop(name, None)
+        env["HOME"] = str(self.cod.home)
+        return subprocess.run(
+            [str(Path(run_dir) / "codctl"), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+            stdin=subprocess.DEVNULL,
         )
 
     def start_with_three_named_workspaces(self, persistent: bool = False) -> None:
@@ -431,17 +455,21 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.expect_equal("overview workspace names", sorted([UNNAMED, UNNAMED_2, UNNAMED_3]), sorted(workspace_rows))
             self.keys("escape")
 
-        with self.step("renaming the first workspace takes it out of the numbering; the others keep their rank"):
+        with self.step("renaming the first workspace takes it out of the numbering; the remaining two renumber"):
             self.wait_for(lambda state: state["overview"] is None, SHOW_TIMEOUT, "the overview to close")
             self.click_tab(self.state(), 0)
             self.wait_for_tabs("the first tab active", {"active": [True, False, False]})
             self.rename_workspace("Renamed")
-            state = self.wait_for_tabs("renamed, the others unchanged", {"names": ["Renamed", UNNAMED_2, UNNAMED_3]})
+            # Numbering is recomputed from the current members, not stored on each workspace, so
+            # with one fewer unnamed workspace the remaining two are "New workspace" and "New
+            # workspace 2" now, not "New workspace 2" and "New workspace 3" (#77, a stated rough
+            # edge: renumbering when an earlier one leaves the unnamed set is acceptable).
+            state = self.wait_for_tabs("renamed, the remaining two renumbered", {"names": ["Renamed", UNNAMED, UNNAMED_2]})
 
-        with self.step("a new fourth workspace becomes the next unnamed rank, not reusing a freed one"):
+        with self.step("a new fourth workspace becomes the next unnamed rank"):
             self.click_add_button(state)
             self.wait_for_tabs(
-                "the fourth tab", {"names": ["Renamed", UNNAMED_2, UNNAMED_3, "New workspace 4"], "active": one_hot(4, 3)}
+                "the fourth tab", {"names": ["Renamed", UNNAMED, UNNAMED_2, UNNAMED_3], "active": one_hot(4, 3)}
             )
 
     # Issue #77 AC(b): a long name ellipsizes only as needed and stays distinguishable.
@@ -619,11 +647,46 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                 raise AssertionError("expected the hovered tab's close icon visible")
 
         with self.step("click the hovered tab's close button: it closes, the other workspace stays active"):
+            # #77 C5: asserted by the surviving workspace's own id, not just its name or
+            # position, now that the two have distinct names (the numbering) too.
+            surviving_id = state["workspaces"][1]["id"]
             self.click_close_button(state, 0)
             state = self.wait_for_tabs(
                 "one workspace left, the previously active one still active",
                 {"names": [UNNAMED], "active": [True], "workspace_count": 1},
             )
+            self.expect_equal("the surviving workspace is the one that was active, by id", surviving_id, state["workspaces"][0]["id"])
+
+    def test_ac7_a_held_close_press_cannot_migrate_to_another_workspace(self) -> None:
+        """#77 C1: both the tab and its close button are keyed by the workspace's own identity,
+        not its index, so a held press cannot end up acting on whichever workspace now sits at
+        that position. Press B's close button, remove A through codctl before releasing, then
+        release: C (checked by id) must never be the one that closes, whatever happens to B."""
+        with self.step("start Cod: three workspaces A, B, C, C active"):
+            self.start_cod(None)
+            self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            self.rename_workspace("A")
+            self.new_workspace()
+            self.rename_workspace("B")
+            self.new_workspace()
+            self.rename_workspace("C")
+            state = self.wait_for_tabs("three named tabs", {"names": ["A", "B", "C"], "active": [False, False, True]})
+
+        ids = {workspace["name"]: workspace["id"] for workspace in state["workspaces"]}
+        c_id = ids["C"]
+
+        with self.step("press B's close button, remove A through codctl before releasing"):
+            self.mouse_down_on_close_button(state, 1)
+            result = self.codctl("workspace", "close", "--workspace", "A", "--force", "--json")
+            if result.returncode != 0:
+                raise AssertionError(f"codctl workspace close A failed: exit {result.returncode}, {result.stdout!r} {result.stderr!r}")
+            self.mouse_up_at(*center(title_bar(state)["tabs"][1]["close_bounds"]))
+
+        with self.step("C is never the one that closed, whether or not B also did"):
+            state = self.wait_for(lambda state: state["workspace_count"] <= 2, SHOW_TIMEOUT, "A gone (and maybe B)")
+            remaining_ids = [workspace["id"] for workspace in state["workspaces"]]
+            if c_id not in remaining_ids:
+                raise AssertionError(f"expected C (id {c_id}) to survive, actual surviving workspace ids {remaining_ids}")
 
     def test_ac7_close_button_shows_the_unsaved_confirmation_and_keep_keeps_it(self) -> None:
         with self.step("create the fixture repo billing-api"):
@@ -669,6 +732,45 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
         with self.step("the dirtied buffer is still dirty: nothing was saved or discarded"):
             self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
+
+    # Issue #77 C4: natural width when there is room must not break correct shrinking when the
+    # title bar is genuinely full. Run with COD_E2E_OUTPUT_MODE=640x600.
+
+    def test_ac7_narrow_window_many_short_tabs_stay_inside_the_bar(self) -> None:
+        """Six default workspaces, each able to grow up to COD_TAB_MAX_WIDTH, in a 640 px title
+        bar: every tab, its close button and "+" must stay inside it, and a name that does not
+        fit is cut (truncated), not left overflowing past the window edge or blank."""
+        with self.step("start Cod with a fresh profile and open five more default workspaces"):
+            self.start_cod(None)
+            self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            for _ in range(5):
+                self.click_add_button(self.state())
+            state = self.wait_for(lambda state: state["workspace_count"] == 6, SHOW_TIMEOUT, "six workspaces")
+
+        with self.step("every tab, its close button and + stay inside the 640 px title bar"):
+            bar = title_bar(state)
+            tabs = bar["tabs"]
+            self.expect_equal("six tabs drawn", 6, len(tabs))
+            bar_width = 640.0
+            for index, tab in enumerate(tabs):
+                if not drawn(tab["bounds"]) or tab["bounds"]["width"] <= 0:
+                    raise AssertionError(f"expected tab {index} drawn with a positive width, actual {tab['bounds']!r}")
+                right = tab["bounds"]["x"] + tab["bounds"]["width"]
+                if right > bar_width + 0.5:
+                    raise AssertionError(f"tab {index} ({tab['name']!r}) right edge {right} is past the {bar_width} px title bar")
+                close = tab["close_bounds"]
+                if close is not None:
+                    close_right = close["x"] + close["width"]
+                    if close_right > bar_width + 0.5:
+                        raise AssertionError(f"tab {index}'s close button right edge {close_right} is past the title bar")
+            add = bar["add_button"]["bounds"]
+            add_right = add["x"] + add["width"]
+            if add_right > bar_width + 0.5:
+                raise AssertionError(f'expected the "+" button inside the {bar_width} px title bar, actual right edge {add_right}')
+
+        with self.step("at least one name that does not fit is marked cut"):
+            if not any(tab["truncated"] for tab in tabs):
+                raise AssertionError("expected at least one of six tabs in a 640 px bar to be cut")
 
 
 class FirstUseWelcomeTest(CodStatusFixtures, CodTestCase):

@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::*;
 use crate::item::test::TestItem;
@@ -1918,4 +1920,64 @@ async fn test_cod_pending_tab_press_matches_its_loaded_tab(cx: &mut TestAppConte
     multi_workspace.read_with(cx, |multi_workspace, _| {
         assert_eq!(multi_workspace.workspace(), &pay);
     });
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &mut TestAppContext) {
+    // Issue #77 C3: with two windows and no active window (nothing has keyboard focus, as in
+    // the headless test compositor that first found this), a shared action like "zed: show
+    // welcome" must reach the window that was focused most recently, not whichever `cx.windows()`
+    // happens to enumerate last.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    let workspace_b = window_b
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+
+    // A was focused, then B: B is the one "with_active_or_new_workspace" must use.
+    cx.update(|cx| cod_set_last_focused_window(window_a, cx));
+    cx.update(|cx| cod_set_last_focused_window(window_b, cx));
+
+    let seen: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    cx.update(|cx| {
+        let seen = seen.clone();
+        with_active_or_new_workspace(cx, move |workspace, _window, cx| {
+            seen.borrow_mut().replace(cx.entity().clone());
+            let _ = workspace;
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        seen.borrow().as_ref(),
+        Some(&workspace_b),
+        "expected the action to reach the last-focused window's workspace (B), not A or a new window"
+    );
+
+    // Clearing A's record (as its window releasing would) while B is the current record must
+    // not clear B's.
+    cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
+    let seen_again: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    cx.update(|cx| {
+        let seen_again = seen_again.clone();
+        with_active_or_new_workspace(cx, move |_workspace, _window, cx| {
+            seen_again.borrow_mut().replace(cx.entity().clone());
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        seen_again.borrow().as_ref(),
+        Some(&workspace_b),
+        "clearing a different window's record must not clear the current one"
+    );
 }

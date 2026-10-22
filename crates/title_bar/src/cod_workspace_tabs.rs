@@ -309,7 +309,13 @@ pub fn render_cod_workspace_tabs(
                 // The same compact shape Zed's own pane tab close button uses (pane.rs), so its
                 // box is tight around the icon and centers the same way the status dot does,
                 // rather than an icon button's usual (taller, padded) click target.
-                let button = IconButton::new(("cod-workspace-tab-close", index), IconName::Close)
+                // #77 C1: keyed by the workspace's own entity id, not the tab's index, so a held
+                // press cannot migrate to a different workspace if the member list changes
+                // (another tab closing, for example) between the mouse down and the mouse up:
+                // gpui keeps pending press state by element id across frames
+                // (crates/gpui/src/elements/div.rs), and an index-based id would let whichever
+                // workspace now sits at that position inherit a press meant for another one.
+                let button = IconButton::new(("cod-workspace-tab-close", workspace.entity_id()), IconName::Close)
                     .shape(IconButtonShape::Square)
                     .size(ButtonSize::None)
                     .icon_size(IconSize::XSmall)
@@ -339,6 +345,12 @@ pub fn render_cod_workspace_tabs(
         };
         let has_close = close_button.is_some();
         let close_layout = layout.clone();
+        // #77 C1: the tab's own id is also keyed by the workspace's identity, not its index, for
+        // the same reason as the close button's id above.
+        let tab_id: gpui::ElementId = match &member {
+            CodMember::Live(workspace) => ("cod-workspace-tab", workspace.entity_id()).into(),
+            CodMember::Pending(id) => ("cod-workspace-tab-pending", u64::from(i64::from(*id).unsigned_abs())).into(),
+        };
         // `on_children_prepainted` is only on the plain `Div` gpui gives back from `h_flex()`,
         // not on the `Stateful<Div>` that `.id(...)` turns it into below (needed for `tooltip`,
         // `on_mouse_down` and `on_mouse_up`), so it is attached first.
@@ -350,7 +362,7 @@ pub fn render_cod_workspace_tabs(
                     }
                 })
             })
-            .id(("cod-workspace-tab", index))
+            .id(tab_id)
             .group("")
             .h_full()
             .min_w_0()

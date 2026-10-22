@@ -5,12 +5,23 @@
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
 # The widest a workspace tab gets, in logical pixels (#25 open question 1).
 TAB_MAX_WIDTH = 280.0
+
+
+def output_scale() -> float:
+    """The sway output scale this run uses, from COD_E2E_OUTPUT_MODE (issue #77 C5: derived, not
+    hardcoded), for example 2.0 from "2560x1600 scale 2". 1.0 when the env var is unset or has no
+    "scale" clause (script/e2e's own default, scale 1)."""
+    mode = os.environ.get("COD_E2E_OUTPUT_MODE", "")
+    match = re.search(r"scale\s+(\d+(?:\.\d+)?)", mode)
+    return float(match.group(1)) if match else 1.0
 
 # The dot of each status, as the driver reports it (#25 AC4): the theme's warning, error, info and success colors.
 DOTS = {"needs_input": "yellow", "error": "red", "working": "blue", "done": "green", "idle": None}
@@ -105,6 +116,22 @@ class CodStatusFixtures:
         if not drawn(bounds):
             raise AssertionError(f"expected tab {index} to have a drawn close button, actual {bounds!r}")
         self.click_at(*center(bounds))
+
+    def mouse_down_at(self, x: float, y: float) -> None:
+        """Presses the left button at the window position without releasing it (issue #77 C1: a
+        test changes what is under the held press before the matching `mouse_up_at`)."""
+        self.driver.request("mouse_down", x=x, y=y)
+
+    def mouse_up_at(self, x: float, y: float) -> None:
+        """Releases the left button at the window position, the other half of `mouse_down_at`."""
+        self.driver.request("mouse_up", x=x, y=y)
+
+    def mouse_down_on_close_button(self, state: dict[str, Any], index: int) -> None:
+        """Presses (without releasing) the close button of the tab at `index`."""
+        bounds = title_bar(state)["tabs"][index]["close_bounds"]
+        if not drawn(bounds):
+            raise AssertionError(f"expected tab {index} to have a drawn close button, actual {bounds!r}")
+        self.mouse_down_at(*center(bounds))
 
 
 def screenshot_ppm(path: Path) -> None:

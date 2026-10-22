@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from cod_e2e import CodTestCase
+from cod_status_fixtures import CodStatusFixtures, drawn, title_bar
 from fake_acp_agent import fake_agent_settings
 from page_server import PageServer
 from test_39_codctl_sessions import Codctl
@@ -393,7 +394,7 @@ def chat_of(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class WorkspaceChatsTest(CodTestCase):
+class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
     def open_chat(self, other_sessions: list[str]) -> dict[str, Any]:
         """Opens the agent panel of the active workspace, starts a chat with the fake agent from the new thread menu and returns the first state that shows it."""
         # The agent commands join the palette once the panel has loaded, a moment after the workspace.
@@ -502,6 +503,63 @@ class WorkspaceChatsTest(CodTestCase):
             self.type("And the tax lines?")
             self.keys("enter")
             self.wait_for_values("chat status", {"status": "error"}, lambda state: {"status": chat(state).get("status")}, 2)
+
+    # Issue #77 C2: closing a workspace through its tab's close button (or CloseWorkspace)
+    # while an agent in it is still generating or waiting for permission must ask first.
+
+    def test_ac7_closing_a_workspace_with_a_working_agent_asks_first(self) -> None:
+        with self.step("start Cod on billing-api with a fake agent that streams, then waits"):
+            self.start_fake_agent_cod(
+                persistent=False,
+                turns=[{"steps": [{"chunk": "Reading src/invoice.rs."}, {"wait": "streamed"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]}],
+            )
+
+        with self.step("send a prompt: the chat (and the workspace) is working"):
+            self.open_chat([])
+            self.type("Fix the rounding.")
+            self.keys("enter")
+            self.wait_for_values("chat status", {"status": "working"}, lambda state: {"status": chat(state).get("status")}, 10)
+            state = self.wait_for(lambda state: state["workspaces"][0]["status"] == "working", 10, "the workspace itself working")
+
+        with self.step("add a second, idle workspace so closing the first does not leave an empty replacement"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1 and state["modal"] is None,
+                30,
+                "the second workspace",
+            )
+            self.click_tab(self.state(), 0)
+            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
+
+        close_bounds = title_bar(state)["tabs"][0]["close_bounds"]
+        if not drawn(close_bounds):
+            raise AssertionError(f"expected the working workspace's tab to have a close button, actual {close_bounds!r}")
+
+        with self.step("click close: the confirmation shows"):
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the agent-working confirmation")
+            self.expect_equal(
+                "confirmation message",
+                "An agent in this workspace is still working. Close the workspace and stop it?",
+                state["prompt"]["message"],
+            )
+            self.expect_equal("confirmation answers", ["Close", "Cancel"], state["prompt"]["answers"])
+
+        with self.step("Cancel: the workspace and the running session are kept"):
+            self.keys("escape")
+            self.wait_for(lambda state: state["prompt"] is None, 10, "the prompt to close")
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["workspaces"][0]["status"] == "working",
+                10,
+                "both workspaces kept, the first still working",
+            )
+
+        with self.step("click close again and choose Close: the workspace (and its session) closes"):
+            self.click_close_button(state, 0)
+            self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
+            self.keys("enter")
+            self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
 
     def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
         with self.step("start Cod on billing-api with the fake agent"):

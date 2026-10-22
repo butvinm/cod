@@ -33,7 +33,8 @@ pub use cod_status::{
 mod cod_workspaces;
 pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
+    RenameWorkspaceModal, cod_clear_last_focused_window, cod_last_focused_window,
+    cod_set_last_focused_window, cod_workspace_name, cod_workspace_name_by_id,
 };
 pub use cod_workspaces::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
@@ -414,12 +415,28 @@ impl MultiWorkspace {
     }
 
     pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let release_subscription = cx.on_release(|this: &mut MultiWorkspace, _cx| {
+        // Issue #77 C3: tracks this window as the last focused Cod window whenever the platform
+        // reports it active, and clears that record when it releases, so
+        // `with_active_or_new_workspace` can reach the window a person was last actually looking
+        // at (see `cod_workspaces::cod_last_focused_window`) instead of a window enumeration
+        // order that is not focus history.
+        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+        let release_subscription = cx.on_release(move |this: &mut MultiWorkspace, cx| {
             if let Some(task) = this._serialize_task.take() {
                 task.detach();
             }
             for task in std::mem::take(&mut this.pending_removal_tasks) {
                 task.detach();
+            }
+            if let Some(window_handle) = window_handle {
+                cod_workspaces::cod_clear_last_focused_window(window_handle, cx);
+            }
+        });
+        let activation_subscription = cx.observe_window_activation(window, |_this, window, cx| {
+            if window.is_window_active()
+                && let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>()
+            {
+                cod_workspaces::cod_set_last_focused_window(window_handle, cx);
             }
         });
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
@@ -485,7 +502,7 @@ impl MultiWorkspace {
             cod_group_move: None,
             cod_moving_ids: Vec::new(),
             _serialize_task: None,
-            _subscriptions: vec![release_subscription, settings_subscription],
+            _subscriptions: vec![release_subscription, settings_subscription, activation_subscription],
             previous_focus_handle: None,
         }
     }

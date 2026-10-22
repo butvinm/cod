@@ -201,9 +201,68 @@ pub(crate) async fn click(
     Ok(())
 }
 
-/// The settle time after a hover's mouse move, so the window draws its hover style before the
-/// next request reads it (issue #77: hover background and the tabs' close control).
-const HOVER_SETTLE: Duration = Duration::from_millis(60);
+/// Moves the mouse to the position and presses the left button there, without releasing it
+/// (issue #77 C1: a test needs to change what is under a held press, for example removing
+/// another workspace through codctl, before the matching `mouse_up`).
+#[cfg(unix)]
+pub(crate) async fn mouse_down(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    for event in [
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }),
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+    ] {
+        let window = cx
+            .update(|cx| super::workspace_window(cx, &memory.borrow()))
+            .context("Cod has no workspace window")?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(event, cx);
+        })
+        .context("the workspace window closed")?;
+    }
+    Ok(())
+}
+
+/// Releases the left button at the position, the other half of `mouse_down`.
+#[cfg(unix)]
+pub(crate) async fn mouse_up(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    let window = cx
+        .update(|cx| super::workspace_window(cx, &memory.borrow()))
+        .context("Cod has no workspace window")?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    })
+    .context("the workspace window closed")?;
+    Ok(())
+}
 
 /// Moves the mouse to the position without pressing a button, the way a person rests the pointer
 /// over a tab before clicking it.
@@ -227,7 +286,10 @@ pub(crate) async fn hover(
         window.dispatch_event(event, cx);
     })
     .context("the workspace window closed")?;
-    cx.background_executor().timer(HOVER_SETTLE).await;
+    // #77 C5: waits for the window to actually draw the hover style, the same frame-completion
+    // wait `settle_frames` already gives key presses, instead of a fixed delay that does not
+    // establish the frame reached the compositor before a pixel-sampling assertion runs.
+    super::settle_frames(memory, cx).await;
     Ok(())
 }
 

@@ -11,13 +11,13 @@ use std::{
 use db::kvp::KeyValueStore;
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Global, Task, TaskExt as _, WeakEntity, Window, actions,
+    Global, PromptLevel, Task, TaskExt as _, WeakEntity, Window, actions,
 };
 use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt as _;
 
-use super::{HeldWorkspace, MultiWorkspace};
+use super::{CodStatus, HeldWorkspace, MultiWorkspace, cod_workspace_status};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
 /// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
@@ -37,6 +37,43 @@ pub type CodRemoteMemberOpen = std::sync::Arc<
 struct CodRemoteMemberOpener(CodRemoteMemberOpen);
 
 impl Global for CodRemoteMemberOpener {}
+
+/// Issue #77 C3: the last Cod window the platform reported active, tracked by an activation
+/// observer each `MultiWorkspace` window registers at creation (`MultiWorkspace::new`) and
+/// cleared when that window releases. Read through `cod_last_focused_window`, which also checks
+/// the window is still open, so a shared action (for example "zed: show welcome") can reach the
+/// window a person was last actually looking at instead of enumerating `cx.windows()` in
+/// creation order, which is not focus history and is not reliable the moment after a command
+/// palette entry closes and before the platform reports any window active again.
+#[derive(Default)]
+struct CodLastFocusedWindow(Option<gpui::WindowHandle<MultiWorkspace>>);
+
+impl Global for CodLastFocusedWindow {}
+
+/// Records `window` as the last focused Cod window; called only when the platform actually
+/// reports it active, from the activation observer `MultiWorkspace::new` registers.
+pub fn cod_set_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    cx.set_global(CodLastFocusedWindow(Some(window)));
+}
+
+/// Clears the record when `window` releases, so a closed window is never handed back.
+pub fn cod_clear_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    if let Some(last) = cx.try_global::<CodLastFocusedWindow>()
+        && last.0 == Some(window)
+    {
+        cx.set_global(CodLastFocusedWindow(None));
+    }
+}
+
+/// The last focused Cod window, if the platform has reported one active and it is still open
+/// (not yet closed or in the middle of closing).
+pub fn cod_last_focused_window(cx: &App) -> Option<gpui::WindowHandle<MultiWorkspace>> {
+    let window = cx.try_global::<CodLastFocusedWindow>()?.0?;
+    cx.windows()
+        .into_iter()
+        .any(|open| open == window.into())
+        .then_some(window)
+}
 
 /// Cod (#24): registers how a pending remote member is opened (see `CodRemoteMemberOpen`).
 pub fn cod_set_remote_member_opener(open: CodRemoteMemberOpen, cx: &mut App) {
@@ -902,6 +939,39 @@ impl MultiWorkspace {
         };
         let app_state = doomed.read(cx).app_state().clone();
         cx.spawn_in(window, async move |this, cx| {
+            // #77 C2: closing a workspace detaches it, which runs
+            // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs:1752, "the
+            // workspace's agent chats go with it") and permanently deletes its chat history as
+            // part of that, an existing behavior this story does not change. That would silently
+            // stop an agent session that is still generating or waiting for the user's
+            // permission, with no way back. Ask first, the same prompt style as the
+            // unsaved-buffer one just below. An idle chat (done, errored, or nothing happening)
+            // does not prompt. This is the one shared path CloseWorkspace and a tab's own close
+            // button both use; codctl's own `workspace close` does not go through it (a separate
+            // implementation, codctl_server.rs::close_workspace) and is unchanged: without
+            // --force it still only asks about unsaved files, never about a running or waiting
+            // session.
+            let id = cx.update(|_window, cx| doomed.read(cx).database_id())?;
+            let status = match id {
+                Some(id) => Some(cx.update(|_window, cx| cod_workspace_status(id, cx))?),
+                None => None,
+            };
+            if let Some(status) = status
+                && matches!(status, CodStatus::Working | CodStatus::NeedsInput)
+            {
+                let answer = doomed.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        "An agent in this workspace is still working. Close the workspace and stop it?",
+                        None,
+                        &["Close", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if !matches!(answer.await, Ok(0)) {
+                    return anyhow::Ok(());
+                }
+            }
             let consent = doomed
                 .update_in(cx, |workspace, window, cx| {
                     workspace.save_all_internal(SaveIntent::Close, false, window, cx)
