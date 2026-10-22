@@ -207,6 +207,19 @@ pub fn render_cod_workspace_tabs(
     let multi_workspace = multi_workspace.read(cx);
     let active = multi_workspace.workspace().clone();
     let members = multi_workspace.cod_shown_members(cx);
+    // #77 C4: capping the row's own box (with min_w_0 removed for F1, or with an absolute
+    // max_w measured from the window) did not make the tabs inside it actually shrink when the
+    // title bar is genuinely too narrow for all of them at COD_TAB_MAX_WIDTH each (measured: no
+    // combination tried changed the overflow at all); each tab's own `max_w` is what reliably
+    // works (it already does, for the constant 280 px cap), so when an equal share of the
+    // title bar's measured width for every shown tab is less than that, each tab's own cap
+    // shrinks to that share instead, forcing the real constraint without depending on the row's
+    // own shrink behavior at all.
+    let tab_max_width = {
+        let available = (window.viewport_size().width - px(96.)).max(px(0.));
+        let fair_share = px(f32::from(available) / members.len().max(1) as f32);
+        fair_share.min(px(COD_TAB_MAX_WIDTH))
+    };
     // #77 F2: the same ghost tokens Zed's own title bar buttons use (a toggled IconButton), so
     // every theme stays coherent: ghost_element_selected for the active tab, ghost_element_hover
     // on hover, no background (the title bar shows through) otherwise, and no separate border
@@ -367,7 +380,7 @@ pub fn render_cod_workspace_tabs(
             .group("")
             .h_full()
             .min_w_0()
-            .max_w(px(COD_TAB_MAX_WIDTH))
+            .max_w(tab_max_width)
             .px_2()
             .gap_1()
             .text_color(text_color)
@@ -422,23 +435,16 @@ pub fn render_cod_workspace_tabs(
         weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
             .ok();
     };
-    // #77 F1/C4: no `min_w_0`/`overflow_x_hidden` here: each tab already shrinks on its own (its
-    // own `min_w_0` and `max_w`), and this row should otherwise report its true natural width
-    // when there is room for it. Measured: `min_w_0` on this row, or on the left group that holds
-    // it (title_bar.rs), does let the row shrink in a genuinely too-narrow title bar, but the
-    // layout engine conflates that with the "how much do I want" measurement that must stay
-    // natural for the ample-space case, regressing it back to its original bug. `max_w` here is
-    // instead computed from the window's own measured width directly, not the ancestor chain's
-    // possibly-wrong "available space": a hard, absolute cap that does not have that conflict.
-    // The margin subtracted is this title bar's own left padding and window controls/menu
-    // (roughly 32-40 px, measured); generous rather than exact, since overshooting it by a little
-    // only means the row could in principle still be a little too wide for extreme cases this
-    // margin does not fully account for (many tabs plus a wide collaborator list or call
-    // controls on the right), not that it stops capping at all.
-    let bar_max_width = (window.viewport_size().width - px(96.)).max(px(0.));
+    // #77 F1/C4: no `min_w_0`/`overflow_x_hidden` here: this row should report its true natural
+    // width when there is room for it (F1). Measured: capping this row's own box, whether with
+    // `min_w_0` (which also regressed F1's ample-space fix) or an absolute `max_w` computed from
+    // the window, did not make the tabs inside it actually shrink when the title bar is
+    // genuinely too narrow for all of them (the overflow measured exactly the same regardless).
+    // Each tab's own `max_w` is what reliably works (`tab_max_width` above, computed per tab
+    // from the window's own measured width divided evenly among them), so the row itself is left
+    // alone and the real constraint lives there instead.
     h_flex()
         .h_full()
-        .max_w(bar_max_width)
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
         .on_children_prepainted(move |bounds, _window, _cx| {

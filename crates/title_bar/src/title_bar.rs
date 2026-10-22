@@ -313,12 +313,8 @@ impl Render for TitleBar {
             // #77 F1: no `min_w_0` here (see cod_workspace_tabs.rs): this group (the tabs, or
             // Zed's own project/branch items on a non-Cod build) should report its true natural
             // width to the title bar's three-group row, and only the tabs themselves shrink once
-            // the bar runs out of room for them. Measured: `min_w_0` here does let the row shrink
-            // in a genuinely too-narrow bar, but it also regresses the ample-space case back to
-            // its original bug (a short, lone tab reads cut again even with most of the bar
-            // empty); the layout engine conflates the two. cod_workspace_tabs.rs's own row
-            // instead measures the window's own width directly for its `max_w`, which does not
-            // have that conflict.
+            // the bar runs out of room for them (each tab's own `max_w`, computed per tab from
+            // the window's own measured width when the bar is genuinely too narrow, C4).
             h_flex()
                 .h_full()
                 .gap_0p5()
