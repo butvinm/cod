@@ -3438,6 +3438,7 @@ dependencies = [
  "libc",
  "log",
  "markdown_preview",
+ "onboarding",
  "open_path_prompt",
  "picker",
  "project_panel",
