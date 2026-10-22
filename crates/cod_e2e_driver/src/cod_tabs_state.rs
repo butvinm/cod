@@ -101,8 +101,8 @@ pub(crate) fn bounds_json(bounds: Option<Bounds<Pixels>>) -> Value {
 }
 
 /// The title bar of the active workspace as it was last drawn: `{"tabs": [{"name", "active",
-/// "dot", "pulsing", "tooltip", "truncated", "bounds"}], "add_button": {"bounds"}, "items": [...]}`,
-/// or null when the workspace has no Cod title bar.
+/// "dot", "pulsing", "tooltip", "truncated", "visible", "bounds", "close_bounds"}], "add_button":
+/// {"bounds"}, "items": [...]}`, or null when the workspace has no Cod title bar.
 pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value {
     let Some(title_bar) = workspace
         .read(cx)
@@ -127,6 +127,8 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
                 "pulsing": tab.pulsing,
                 "tooltip": tab.tooltip,
                 "truncated": tab.truncated(),
+                // #81: the label as drawn, with an ellipsis where it was cut.
+                "visible": tab.visible,
                 "bounds": bounds_json(tab.bounds),
                 // #77 F3: None for a pending (not yet loaded) member, which has no close button.
                 "close_bounds": bounds_json(tab.close_bounds),

@@ -44,6 +44,10 @@ pub struct CodTabInfo {
     /// it got. A tab is cut both at the maximum width and when the title bar is too narrow for
     /// all tabs at their full width.
     pub cut: bool,
+    /// The label as the last frame drew it (issue #81): the "[ID]", the part of the rest of the
+    /// name that fit (ending in an ellipsis when cut) and the number of a numbered default name,
+    /// joined by spaces. Empty before the tab was drawn.
+    pub visible: String,
     /// Where the tab's close button was drawn (issue #77 F3), None when the tab has none (a
     /// pending, not yet loaded, member). Its space is always reserved on a loaded tab, so this is
     /// set regardless of hover or active state; whether it is currently visible to a person is a
@@ -166,6 +170,7 @@ pub fn render_cod_workspace_tabs(
             tooltip: name.clone(),
             bounds: None,
             cut: false,
+            visible: String::new(),
             close_bounds: None,
         });
 
@@ -173,9 +178,13 @@ pub fn render_cod_workspace_tabs(
         let text_color = if is_active { active_text } else { inactive_text };
         let weak = weak.clone();
         // The dot, the "[ID]" and the rest of the name. After layout the rest is measured
-        // against the room it got, to report whether the name was cut.
+        // against the room it got, to report whether the name was cut and what was drawn.
         let rest_text: SharedString = rest.to_string().into();
+        let id_text = id.map(str::to_string);
         let measured_layout = layout.clone();
+        let dot = status_dot(status, index, &layout);
+        // The place of the rest among the drawn children: after the dot and the "[ID]".
+        let rest_index = usize::from(dot.is_some()) + usize::from(id.is_some());
         // #77 F1: `content` has `min_w_0` so it (and the label in it) can shrink to the tab's
         // cap. The tabs row and the group that holds it (`title_bar.rs`) must not: with it, the
         // title bar's three-group layout measured them narrower than their labels and cut
@@ -183,7 +192,7 @@ pub fn render_cod_workspace_tabs(
         let content = h_flex()
             .min_w_0()
             .gap_1()
-            .children(status_dot(status, index, &layout))
+            .children(dot)
             .when_some(id, |content, id| {
                 content.child(
                     div()
@@ -201,27 +210,44 @@ pub fn render_cod_workspace_tabs(
                 )
             })
             .on_children_prepainted(move |bounds, window, cx| {
-                let Some(room) = bounds.last().filter(|_| !rest_text.is_empty()) else {
-                    return;
-                };
-                // The label's font: the UI font at the default label size.
-                let font = theme::theme_settings(cx).ui_font(cx).clone();
-                let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
-                let text_width = window
-                    .text_system()
-                    .shape_line(
-                        rest_text.clone(),
-                        font_size,
-                        &[gpui::TextRun {
-                            len: rest_text.len(),
-                            font,
-                            ..Default::default()
-                        }],
-                        None,
-                    )
-                    .width();
+                let mut visible: Vec<String> = id_text.iter().cloned().collect();
+                let mut cut = false;
+                if let Some(room) = bounds.get(rest_index).filter(|_| !rest_text.is_empty()) {
+                    // The label's font: the UI font at the default label size.
+                    let font = theme::theme_settings(cx).ui_font(cx).clone();
+                    let font_size = TextSize::Default.rems(cx).to_pixels(window.rem_size());
+                    let runs = [gpui::TextRun {
+                        len: rest_text.len(),
+                        font: font.clone(),
+                        ..Default::default()
+                    }];
+                    let text_width = window
+                        .text_system()
+                        .shape_line(rest_text.clone(), font_size, &runs, None)
+                        .width();
+                    cut = is_cut(text_width, room.size.width);
+                    // What the truncating label draws: the whole text when it fits, else
+                    // gpui's own end truncation with an ellipsis (gpui's text element).
+                    let drawn = if text_width <= room.size.width {
+                        rest_text.clone()
+                    } else {
+                        window
+                            .text_system()
+                            .line_wrapper(font, font_size)
+                            .truncate_line(
+                                rest_text.clone(),
+                                room.size.width,
+                                "\u{2026}",
+                                &runs,
+                                gpui::TruncateFrom::End,
+                            )
+                            .0
+                    };
+                    visible.push(drawn.to_string());
+                }
                 if let Some(tab) = measured_layout.borrow_mut().tabs.get_mut(index) {
-                    tab.cut = is_cut(text_width, room.size.width);
+                    tab.cut = cut;
+                    tab.visible = visible.join(" ");
                 }
             });
         // #77 F3: a close control, after the name, visible on the active tab and on hover; its

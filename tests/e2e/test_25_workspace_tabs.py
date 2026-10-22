@@ -968,6 +968,17 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             if not any(tab["truncated"] for tab in tabs):
                 raise AssertionError("expected at least one of six tabs in a 640 px bar to be cut")
 
+        # Issue #81 (QA #92): cut names must still tell the workspaces apart. The number of a
+        # default name stays drawn after the cut ("New w... 2"), like the "[ID]" of a named one.
+        with self.step("every drawn label is different, and each numbered one ends with its number"):
+            visible = [tab["visible"] for tab in tabs]
+            if len(set(visible)) != len(visible):
+                raise AssertionError(f"expected six different drawn labels, actual {visible}")
+            for tab in tabs[1:]:
+                number = tab["name"].rsplit(" ", 1)[-1]
+                if not tab["visible"].endswith(f" {number}"):
+                    raise AssertionError(f"expected the drawn label of {tab['name']!r} to end with its number, actual {tab['visible']!r}")
+
 
 class FirstUseWelcomeTest(CodStatusFixtures, CodTestCase):
     """Issue #77 AC(f): a fresh profile's first workspace shows Cod's own welcome text, never "Zed"."""
