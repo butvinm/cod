@@ -10011,6 +10011,14 @@ impl Render for Workspace {
                         .tab_group()
                         .role(gpui::Role::Toolbar)
                         .aria_label("Title bar")
+                        .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| {
+                            window.focus_next(cx);
+                            cx.notify();
+                        }))
+                        .on_action(cx.listener(|_, _: &menu::SelectPrevious, window, cx| {
+                            window.focus_prev(cx);
+                            cx.notify();
+                        }))
                         .on_key_down(cx.listener(
                             |workspace, event: &gpui::KeyDownEvent, window, cx| {
                                 if event.keystroke.modifiers.modified() {
