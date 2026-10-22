@@ -921,17 +921,25 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         """Six default workspaces, each able to grow up to COD_TAB_MAX_WIDTH, in a 640 px title
         bar: every tab, its close button and "+" must stay inside it, and a name that does not
         fit is cut (truncated), not left overflowing past the window edge or blank."""
-        with self.step("narrow this run's output to 640x600 for this test only"):
-            self.narrow_the_output(640, 600)
+        self.check_a_full_bar_of_default_tabs(640, 600, 6)
 
-        with self.step("start Cod with a fresh profile: its window is 640 px wide"):
+    def test_ac7_twelve_default_tabs_in_a_1280_px_bar_stay_inside_and_distinct(self) -> None:
+        """Issue #81 (QA #92) at the stakeholder's 1280 px width: twelve default workspaces fill the bar, and every drawn label is still different."""
+        self.check_a_full_bar_of_default_tabs(1280, 800, 12)
+
+    def check_a_full_bar_of_default_tabs(self, width: int, height: int, count: int) -> None:
+        """Opens `count` default workspaces in a `width` px window and checks that every tab, its close button and "+" stay inside the bar, that a name is cut, and that the drawn labels differ."""
+        with self.step(f"set this run's output to {width}x{height} for this test only"):
+            self.narrow_the_output(width, height)
+
+        with self.step(f"start Cod with a fresh profile: its window is {width} px wide"):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
             bar_width = self.cod_window_width()
-            self.expect_equal("Cod's window width", 640.0, bar_width)
+            self.expect_equal("Cod's window width", float(width), bar_width)
 
-        with self.step('open five more default workspaces with "+", which stays inside the window for every click'):
-            for expected_count in range(2, 7):
+        with self.step(f'open {count - 1} more default workspaces with "+", which stays inside the window for every click'):
+            for expected_count in range(2, count + 1):
                 add = title_bar(state)["add_button"]["bounds"]
                 if drawn(add) and add["x"] + add["width"] > bar_width + 0.5:
                     raise AssertionError(
@@ -947,10 +955,10 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     f"{expected_count} workspaces and tabs",
                 )
 
-        with self.step("every tab, its close button and + stay inside the 640 px title bar"):
+        with self.step(f"every tab, its close button and + stay inside the {width} px title bar"):
             bar = title_bar(state)
             tabs = bar["tabs"]
-            self.expect_equal("six tabs drawn", 6, len(tabs))
+            self.expect_equal("tabs drawn", count, len(tabs))
             for index, tab in enumerate(tabs):
                 if not drawn(tab["bounds"]) or tab["bounds"]["width"] <= 0:
                     raise AssertionError(f"expected tab {index} drawn with a positive width, actual {tab['bounds']!r}")
@@ -962,6 +970,9 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     close_right = close["x"] + close["width"]
                     if close_right > bar_width + 0.5:
                         raise AssertionError(f"tab {index}'s close button right edge {close_right} is past the title bar")
+                    # Issue #81: the number drawn after a cut name must not push the close button out of its own tab.
+                    if close_right > right + 0.5:
+                        raise AssertionError(f"tab {index}'s close button right edge {close_right} is past its tab's right edge {right}")
             add = bar["add_button"]["bounds"]
             add_right = add["x"] + add["width"]
             if add_right > bar_width + 0.5:
@@ -969,14 +980,14 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
         with self.step("at least one name that does not fit is marked cut"):
             if not any(tab["truncated"] for tab in tabs):
-                raise AssertionError("expected at least one of six tabs in a 640 px bar to be cut")
+                raise AssertionError(f"expected at least one of {count} tabs in a {width} px bar to be cut")
 
         # Issue #81 (QA #92): cut names must still tell the workspaces apart. The number of a
         # default name stays drawn after the cut ("New w... 2"), like the "[ID]" of a named one.
         with self.step("every drawn label is different, and each numbered one ends with its number"):
             visible = [tab["visible"] for tab in tabs]
             if len(set(visible)) != len(visible):
-                raise AssertionError(f"expected six different drawn labels, actual {visible}")
+                raise AssertionError(f"expected {count} different drawn labels, actual {visible}")
             for tab in tabs[1:]:
                 number = tab["name"].rsplit(" ", 1)[-1]
                 if not tab["visible"].endswith(f" {number}"):

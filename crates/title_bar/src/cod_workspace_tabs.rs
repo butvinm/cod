@@ -3,7 +3,9 @@
 //! workspace. Clicking a tab shows its workspace (a pending one loads first).
 //!
 //! Names follow "[ISSUE-ID] title" (D27): the leading "[ID]" is always shown whole and only the
-//! rest is cut with "...". The full name is the tab's tooltip.
+//! rest is cut with "...". The number of a numbered default name ("New workspace 2") is likewise
+//! always shown whole after the cut part (#81), so crowded default tabs stay distinguishable. The
+//! full name is the tab's tooltip.
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -158,6 +160,7 @@ pub fn render_cod_workspace_tabs(
     // workspace 3", and so on (`MultiWorkspace::cod_shown_names`).
     for (index, (member, shown)) in members.into_iter().enumerate() {
         let name = shown.name;
+        let number_text = shown.number.map(|number| number.to_string());
         let is_active = matches!(&member, CodMember::Live(workspace) if *workspace == active);
         let status = MultiWorkspace::cod_member_id(&member, cx)
             .map(|id| workspace::cod_workspace_status(id, cx))
@@ -175,12 +178,23 @@ pub fn render_cod_workspace_tabs(
         });
 
         let (id, rest) = split_workspace_name(&name);
+        // #81 (QA #92): the number of a numbered default name is drawn by itself after the rest,
+        // never cut, so six "New workspace N" tabs in a full bar read "New w... 2", "New w... 3"
+        // and so on rather than six identical "New w...". The first default one has no number.
+        let rest = match &number_text {
+            Some(number) => rest
+                .strip_suffix(number.as_str())
+                .map(str::trim_end)
+                .unwrap_or(rest),
+            None => rest,
+        };
         let text_color = if is_active { active_text } else { inactive_text };
         let weak = weak.clone();
-        // The dot, the "[ID]" and the rest of the name. After layout the rest is measured
-        // against the room it got, to report whether the name was cut and what was drawn.
+        // The dot, the "[ID]", the rest of the name and the number. After layout the rest is
+        // measured against the room it got, to report whether the name was cut and what was drawn.
         let rest_text: SharedString = rest.to_string().into();
         let id_text = id.map(str::to_string);
+        let drawn_number = number_text.clone();
         let measured_layout = layout.clone();
         let dot = status_dot(status, index, &layout);
         // The place of the rest among the drawn children: after the dot and the "[ID]".
@@ -207,6 +221,13 @@ pub fn render_cod_workspace_tabs(
                             .color(Color::Custom(text_color))
                             .truncate(),
                     ),
+                )
+            })
+            .when_some(number_text, |content, number| {
+                content.child(
+                    div()
+                        .flex_none()
+                        .child(Label::new(number).color(Color::Custom(text_color))),
                 )
             })
             .on_children_prepainted(move |bounds, window, cx| {
@@ -245,6 +266,7 @@ pub fn render_cod_workspace_tabs(
                     };
                     visible.push(drawn.to_string());
                 }
+                visible.extend(drawn_number.iter().cloned());
                 if let Some(tab) = measured_layout.borrow_mut().tabs.get_mut(index) {
                     tab.cut = cut;
                     tab.visible = visible.join(" ");
