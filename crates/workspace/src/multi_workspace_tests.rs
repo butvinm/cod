@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use super::*;
 use crate::item::test::TestItem;
+use crate::multi_workspace::{cod_clear_last_focused_window, cod_set_last_focused_window};
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
@@ -1940,44 +1941,101 @@ async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &
 
     let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
     let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
     let workspace_b = window_b
         .read_with(cx, |mw, _| mw.workspace().clone())
         .unwrap();
+    let windows_before = cx.update(|cx| cx.windows().len());
 
-    // A was focused, then B: B is the one "with_active_or_new_workspace" must use.
-    cx.update(|cx| cod_set_last_focused_window(window_a, cx));
+    // B was focused, then the OLDER window A. The newest-window fallback would pick B, so only the last-focused record can make the action reach A.
     cx.update(|cx| cod_set_last_focused_window(window_b, cx));
+    cx.update(|cx| cod_set_last_focused_window(window_a, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the last-focused older window A, not the newest window B"
+    );
 
+    // Clearing B's record (as B's window releasing would) while A is the current record must not clear A's.
+    cx.update(|cx| cod_clear_last_focused_window(window_b, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "clearing a different window's record must not clear the current one"
+    );
+
+    // Once A's own record is cleared (A releasing), nothing is recorded and the newest open window is still a safer target than a new one.
+    cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_b,
+        "with no record the action falls back to the newest open window"
+    );
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "no new window may be opened while a Cod window is open"
+    );
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_follows_real_window_activation(
+    cx: &mut TestAppContext,
+) {
+    // Issue #77 C3, end to end through the activation observer `MultiWorkspace::new` registers: the platform reports B active and then the older A active, then focus leaves every window (as when a command palette entry closes). The action must reach A.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+
+    window_b
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    window_a
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    VisualTestContext::from_window(window_a.into(), cx).deactivate_window();
+
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the window the platform last reported active (A)"
+    );
+}
+
+/// Runs `with_active_or_new_workspace` while no window is active and returns the workspace the action reached.
+fn cod_workspace_reached_without_active_window(cx: &mut TestAppContext) -> Entity<Workspace> {
+    assert_eq!(
+        cx.update(|cx| cx.active_window()),
+        None,
+        "precondition: no window is active, so the fallbacks are what is tested"
+    );
     let seen: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
     cx.update(|cx| {
         let seen = seen.clone();
-        with_active_or_new_workspace(cx, move |workspace, _window, cx| {
-            seen.borrow_mut().replace(cx.entity().clone());
-            let _ = workspace;
-        });
-    });
-    cx.run_until_parked();
-
-    assert_eq!(
-        seen.borrow().as_ref(),
-        Some(&workspace_b),
-        "expected the action to reach the last-focused window's workspace (B), not A or a new window"
-    );
-
-    // Clearing A's record (as its window releasing would) while B is the current record must
-    // not clear B's.
-    cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
-    let seen_again: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
-    cx.update(|cx| {
-        let seen_again = seen_again.clone();
         with_active_or_new_workspace(cx, move |_workspace, _window, cx| {
-            seen_again.borrow_mut().replace(cx.entity().clone());
+            seen.borrow_mut().replace(cx.entity().clone());
         });
     });
     cx.run_until_parked();
-    assert_eq!(
-        seen_again.borrow().as_ref(),
-        Some(&workspace_b),
-        "clearing a different window's record must not clear the current one"
-    );
+    seen.borrow_mut()
+        .take()
+        .expect("the action reached a workspace")
 }

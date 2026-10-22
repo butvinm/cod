@@ -33,9 +33,10 @@ pub use cod_status::{
 mod cod_workspaces;
 pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_clear_last_focused_window, cod_last_focused_window,
-    cod_set_last_focused_window, cod_workspace_name, cod_workspace_name_by_id,
+    RenameWorkspaceModal, cod_last_focused_window, cod_workspace_name, cod_workspace_name_by_id,
 };
+#[cfg(test)]
+pub(crate) use cod_workspaces::{cod_clear_last_focused_window, cod_set_last_focused_window};
 pub use cod_workspaces::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
