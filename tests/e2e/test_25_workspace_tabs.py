@@ -42,8 +42,12 @@ DOC_NAME = "[DOC-208] (docs-site) Move the API section"
 OPS_NAME = "[OPS-77] (infra) Upgrade Postgres to 17"
 NAMES = [PAY_NAME, DOC_NAME, OPS_NAME]
 
-# The name of a tab whose workspace has no name and no folder.
+# The name of a tab whose workspace has no name and no folder: the first one of these shown is
+# just "New workspace"; the second and later ones are numbered "New workspace 2", "New workspace
+# 3", ... in tab order, so a user can tell freshly-opened workspaces apart (#77).
 UNNAMED = "New workspace"
+UNNAMED_2 = "New workspace 2"
+UNNAMED_3 = "New workspace 3"
 
 # Issue #77 (follow-up of #25): the stakeholder's first-use screenshot was 1280x800, the default
 # dark theme, sway scale 1. Run the width-sensitive tests below with COD_E2E_OUTPUT_MODE=1280x800
@@ -393,19 +397,52 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
     def test_ac7_two_default_workspaces_are_not_cut(self) -> None:
         """The stakeholder's screenshot (1280x800): two "New workspace" tabs both read "New work..."
         although about 1000 px of the 1280 px title bar was empty. Run with
-        COD_E2E_OUTPUT_MODE=1280x800 for the exact reported width."""
+        COD_E2E_OUTPUT_MODE=1280x800 for the exact reported width. Also #77's numbering: a user
+        must be able to tell freshly-opened workspaces apart, so the second and third unnamed,
+        folderless workspaces are "New workspace 2" and "New workspace 3", not all "New
+        workspace"; the title bar, the overview (#26) and the tooltip must all agree."""
         with self.step("start Cod with a fresh profile (no folder): one default workspace"):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
 
-        with self.step("open a second workspace with +: two default-named tabs"):
+        with self.step("open a second workspace with +: distinct default names, neither tab cut"):
             self.click_add_button(state)
-            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True]})
-
-        with self.step('check neither tab is cut: both read "New workspace" in full'):
+            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED_2], "active": [False, True]})
             tabs = title_bar(state)["tabs"]
             for index, tab in enumerate(tabs):
                 self.expect_equal(f"tab {index} truncated", False, tab["truncated"])
+                self.expect_equal(f"tab {index} tooltip matches its name", tab["name"], tab["tooltip"])
+
+        with self.step("open a third workspace with +: three distinct default names, none cut"):
+            self.click_add_button(state)
+            state = self.wait_for_tabs(
+                "the third tab", {"names": [UNNAMED, UNNAMED_2, UNNAMED_3], "active": [False, False, True]}
+            )
+            tabs = title_bar(state)["tabs"]
+            for index, tab in enumerate(tabs):
+                self.expect_equal(f"tab {index} truncated", False, tab["truncated"])
+
+        with self.step("the overview (#26) lists the same three distinct names"):
+            self.keys("ctrl-alt-o")
+            overview_state = self.wait_for(
+                lambda state: state["overview"] is not None and len(state["overview"]["rows"]) > 0, SHOW_TIMEOUT, "the overview"
+            )
+            workspace_rows = [row["title"] for row in overview_state["overview"]["rows"] if row["kind"] == "workspace"]
+            self.expect_equal("overview workspace names", sorted([UNNAMED, UNNAMED_2, UNNAMED_3]), sorted(workspace_rows))
+            self.keys("escape")
+
+        with self.step("renaming the first workspace takes it out of the numbering; the others keep their rank"):
+            self.wait_for(lambda state: state["overview"] is None, SHOW_TIMEOUT, "the overview to close")
+            self.click_tab(self.state(), 0)
+            self.wait_for_tabs("the first tab active", {"active": [True, False, False]})
+            self.rename_workspace("Renamed")
+            state = self.wait_for_tabs("renamed, the others unchanged", {"names": ["Renamed", UNNAMED_2, UNNAMED_3]})
+
+        with self.step("a new fourth workspace becomes the next unnamed rank, not reusing a freed one"):
+            self.click_add_button(state)
+            self.wait_for_tabs(
+                "the fourth tab", {"names": ["Renamed", UNNAMED_2, UNNAMED_3, "New workspace 4"], "active": one_hot(4, 3)}
+            )
 
     # Issue #77 AC(b): a long name ellipsizes only as needed and stays distinguishable.
 
@@ -451,7 +488,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
             self.click_add_button(state)
-            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True]})
+            state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED_2], "active": [False, True]})
 
         shot = self.workdir / "colors.ppm"
         with self.step("screenshot the title bar, the inactive tab and the active tab"):
@@ -544,7 +581,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
             self.click_add_button(state)
             state = self.wait_for_tabs(
-                "the second tab", {"names": [UNNAMED, UNNAMED], "active": [False, True], "workspace_count": 2}
+                "the second tab", {"names": [UNNAMED, UNNAMED_2], "active": [False, True], "workspace_count": 2}
             )
 
         with self.step("both loaded tabs have a close button (its space is always reserved)"):

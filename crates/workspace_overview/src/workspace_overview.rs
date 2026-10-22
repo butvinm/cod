@@ -24,7 +24,7 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use project_panel::ProjectPanel;
-use title_bar::cod_workspace_tabs::{split_workspace_name, tab_display_name};
+use title_bar::cod_workspace_tabs::{is_unnamed_default, split_workspace_name, tab_display_name};
 use ui::{HighlightedLabel, Indicator, ListItem, ListItemSpacing, prelude::*};
 use util::paths::PathExt as _;
 use workspace::{
@@ -297,28 +297,19 @@ fn gather(
     let multi_workspace = multi_workspace.read(cx);
     let store = CodStatusStore::try_global(cx);
     let members = multi_workspace.cod_shown_members(cx);
+    // #77: counts the unnamed, folderless workspaces seen so far, in tab order, the same way
+    // cod_workspace_tabs.rs does, so the overview agrees with the title bar's own numbering.
+    let mut unnamed_count = 0usize;
     let groups = members
         .iter()
         .map(|member| {
-            let (name, folders) = match member {
-                CodMember::Live(workspace) => {
-                    let workspace = workspace.read(cx);
-                    let folders: Vec<PathBuf> = workspace
-                        .visible_worktrees(cx)
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                        .collect();
-                    (workspace::cod_workspace_name(workspace, cx), folders)
-                }
-                CodMember::Pending(id) => (
-                    workspace::cod_workspace_name_by_id(*id, cx),
-                    multi_workspace
-                        .cod_pending_paths(*id)
-                        .unwrap_or_default()
-                        .to_vec(),
-                ),
-            };
+            let (name, folders) =
+                title_bar::cod_workspace_tabs::member_name_and_folders(member, multi_workspace, cx);
             let folder_paths: Vec<&Path> = folders.iter().map(|folder| folder.as_path()).collect();
-            let name = tab_display_name(name, &folder_paths);
+            if is_unnamed_default(name.as_deref(), &folder_paths) {
+                unnamed_count += 1;
+            }
+            let name = tab_display_name(name, &folder_paths, unnamed_count);
             let id = MultiWorkspace::cod_member_id(member, cx);
             let entries = match (id, &store) {
                 (Some(id), Some(store)) => store.read(cx).entries(id).to_vec(),

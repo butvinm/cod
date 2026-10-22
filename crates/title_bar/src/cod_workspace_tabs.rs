@@ -80,45 +80,81 @@ pub fn split_workspace_name(name: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// The name a tab shows: the user's name, else the folder names joined by ", ", else
-/// "New workspace".
-pub fn tab_display_name(name: Option<String>, folders: &[&Path]) -> String {
+/// Whether a workspace with this name and these folders falls back to the numbered "New
+/// workspace" name (issue #77: a user must be able to tell two freshly-opened workspaces
+/// apart). A workspace the user named, or one with a folder, is never in the numbering: renaming
+/// it or adding a folder takes it out, and a name the user typed is never changed.
+pub fn is_unnamed_default(name: Option<&str>, folders: &[&Path]) -> bool {
+    name.map(str::trim).unwrap_or("").is_empty() && folders.is_empty()
+}
+
+/// The name a tab shows: the user's name, else the folder names joined by ", ", else "New
+/// workspace" (issue #77: "New workspace 2", "New workspace 3", ... when several workspaces are
+/// all unnamed and folderless, so they can be told apart; `unnamed_rank` is this workspace's
+/// 1-based position among those, in tab order, found with `is_unnamed_default` and a running
+/// count over the shown members, oldest (leftmost tab) first. Ignored when the workspace is
+/// named or has a folder).
+pub fn tab_display_name(name: Option<String>, folders: &[&Path], unnamed_rank: usize) -> String {
     if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
         return name;
     }
-    let folders: Vec<String> = folders
+    let folder_names: Vec<String> = folders
         .iter()
         .filter_map(|folder| folder.file_name())
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
-    if folders.is_empty() {
-        COD_UNNAMED_WORKSPACE.to_string()
+    if folder_names.is_empty() {
+        if unnamed_rank <= 1 {
+            COD_UNNAMED_WORKSPACE.to_string()
+        } else {
+            format!("{COD_UNNAMED_WORKSPACE} {unnamed_rank}")
+        }
     } else {
-        folders.join(", ")
+        folder_names.join(", ")
     }
 }
 
-fn member_name(member: &CodMember, multi_workspace: &MultiWorkspace, cx: &App) -> String {
+/// The raw stored name and folders of a member, before `tab_display_name` turns them into what a
+/// tab shows.
+pub fn member_name_and_folders(
+    member: &CodMember,
+    multi_workspace: &MultiWorkspace,
+    cx: &App,
+) -> (Option<String>, Vec<std::path::PathBuf>) {
     match member {
         CodMember::Live(workspace) => {
             let workspace = workspace.read(cx);
-            let folders: Vec<std::sync::Arc<Path>> = workspace
+            let folders: Vec<std::path::PathBuf> = workspace
                 .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path())
+                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                 .collect();
-            let folders: Vec<&Path> = folders.iter().map(|folder| folder.as_ref()).collect();
-            tab_display_name(workspace::cod_workspace_name(workspace, cx), &folders)
+            (workspace::cod_workspace_name(workspace, cx), folders)
         }
         CodMember::Pending(id) => {
-            let folders: Vec<&Path> = multi_workspace
+            let folders = multi_workspace
                 .cod_pending_paths(*id)
                 .unwrap_or_default()
-                .iter()
-                .map(|path| path.as_path())
-                .collect();
-            tab_display_name(workspace::cod_workspace_name_by_id(*id, cx), &folders)
+                .to_vec();
+            (workspace::cod_workspace_name_by_id(*id, cx), folders)
         }
     }
+}
+
+/// The name a tab shows for `member`, numbering it among the unnamed, folderless workspaces
+/// `unnamed_count` has counted so far (in tab order); bumps `unnamed_count` when `member` is one
+/// of them, so the next call sees the right rank.
+fn member_name(
+    member: &CodMember,
+    multi_workspace: &MultiWorkspace,
+    cx: &App,
+    unnamed_count: &mut usize,
+) -> String {
+    let (name, folders) = member_name_and_folders(member, multi_workspace, cx);
+    let folder_refs: Vec<&Path> = folders.iter().map(|folder| folder.as_ref()).collect();
+    if is_unnamed_default(name.as_deref(), &folder_refs) {
+        *unnamed_count += 1;
+    }
+    tab_display_name(name, &folder_refs, *unnamed_count)
 }
 
 /// Builds the status dot, if the status calls for one, and wires it so the end-to-end driver
@@ -181,8 +217,11 @@ pub fn render_cod_workspace_tabs(
 
     let mut infos = Vec::with_capacity(members.len());
     let mut tabs: Vec<AnyElement> = Vec::with_capacity(members.len() + 1);
+    // #77: counts the unnamed, folderless workspaces seen so far, in tab order, so the second
+    // and later ones read "New workspace 2", "New workspace 3", and so on.
+    let mut unnamed_count = 0usize;
     for (index, member) in members.into_iter().enumerate() {
-        let name = member_name(&member, multi_workspace, cx);
+        let name = member_name(&member, multi_workspace, cx, &mut unnamed_count);
         let is_active = matches!(&member, CodMember::Live(workspace) if *workspace == active);
         let status = MultiWorkspace::cod_member_id(&member, cx)
             .map(|id| workspace::cod_workspace_status(id, cx))
@@ -419,14 +458,33 @@ mod tests {
     #[test]
     fn unnamed_tabs_fall_back_to_folders_then_new_workspace() {
         assert_eq!(
-            tab_display_name(Some("[DOC-208] Move".into()), &[Path::new("/w/docs")]),
+            tab_display_name(Some("[DOC-208] Move".into()), &[Path::new("/w/docs")], 1),
             "[DOC-208] Move"
         );
         assert_eq!(
-            tab_display_name(None, &[Path::new("/w/billing-api"), Path::new("/w/infra")]),
+            tab_display_name(None, &[Path::new("/w/billing-api"), Path::new("/w/infra")], 1),
             "billing-api, infra"
         );
-        assert_eq!(tab_display_name(Some("  ".into()), &[]), COD_UNNAMED_WORKSPACE);
-        assert_eq!(tab_display_name(None, &[]), COD_UNNAMED_WORKSPACE);
+        assert_eq!(tab_display_name(Some("  ".into()), &[], 1), COD_UNNAMED_WORKSPACE);
+        assert_eq!(tab_display_name(None, &[], 1), COD_UNNAMED_WORKSPACE);
+    }
+
+    #[test]
+    fn several_unnamed_folderless_tabs_are_numbered_from_the_second_one() {
+        // #77: a user must be able to tell two freshly-opened workspaces apart.
+        assert_eq!(tab_display_name(None, &[], 1), "New workspace");
+        assert_eq!(tab_display_name(None, &[], 2), "New workspace 2");
+        assert_eq!(tab_display_name(None, &[], 3), "New workspace 3");
+        // A name or a folder takes a workspace out of the numbering, whatever rank it is passed.
+        assert_eq!(tab_display_name(Some("Renamed".into()), &[], 5), "Renamed");
+        assert_eq!(tab_display_name(None, &[Path::new("/w/docs")], 5), "docs");
+    }
+
+    #[test]
+    fn is_unnamed_default_matches_what_tab_display_name_numbers() {
+        assert!(is_unnamed_default(None, &[]));
+        assert!(is_unnamed_default(Some("  "), &[]));
+        assert!(!is_unnamed_default(Some("Renamed"), &[]));
+        assert!(!is_unnamed_default(None, &[Path::new("/w/docs")]));
     }
 }
