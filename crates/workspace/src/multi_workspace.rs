@@ -25,6 +25,11 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+mod cod_names;
+pub use cod_names::{
+    COD_UNNAMED_WORKSPACE, CodShownName, is_unnamed_default, member_name_and_folders,
+    tab_display_name,
+};
 mod cod_status;
 pub use cod_status::{
     CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, cod_rollup,

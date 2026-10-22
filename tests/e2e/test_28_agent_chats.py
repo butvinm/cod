@@ -530,42 +530,57 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
         with self.step("add a second, idle workspace so closing the first does not leave an empty replacement"):
             before = self.state()
             self.run_command(NEW_WORKSPACE)
-            self.wait_for(
-                lambda state: state["workspace_count"] == before["workspace_count"] + 1 and state["modal"] is None,
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] == 1
+                and state["modal"] is None,
                 30,
-                "the second workspace",
+                "the second workspace, shown",
             )
-            self.click_tab(self.state(), 0)
-            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
+            shown_id = state["workspaces"][1]["id"]
 
-        close_bounds = title_bar(state)["tabs"][0]["close_bounds"]
-        if not drawn(close_bounds):
-            raise AssertionError(f"expected the working workspace's tab to have a close button, actual {close_bounds!r}")
-
-        with self.step("click close: the confirmation shows"):
+        # Issue #81: the working workspace is a background tab here, so the prompt must say which
+        # workspace it is about, and Enter (the highlighted answer) must not stop the agent.
+        with self.step("hover the background working tab and click its close button: the confirmation names it"):
+            self.hover_tab(state, 0)
+            state = self.state()
+            close_bounds = title_bar(state)["tabs"][0]["close_bounds"]
+            if not drawn(close_bounds):
+                raise AssertionError(f"expected the working workspace's tab to have a close button, actual {close_bounds!r}")
             self.click_close_button(state, 0)
             state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the agent-working confirmation")
             self.expect_equal(
                 "confirmation message",
-                "An agent in this workspace is still working. Close the workspace and stop it?",
+                "An agent in `billing-api` is still working. Close the workspace and stop it?",
                 state["prompt"]["message"],
             )
-            self.expect_equal("confirmation answers", ["Close", "Cancel"], state["prompt"]["answers"])
+            self.expect_equal("confirmation answers", ["Cancel", "Close"], state["prompt"]["answers"])
+            self.expect_equal("highlighted answer (the one Enter picks)", "Cancel", state["prompt"]["answers"][state["prompt"]["highlighted"]])
 
-        with self.step("Cancel: the workspace and the running session are kept"):
-            self.keys("escape")
+        with self.step("Enter: Cancel, the workspace and the running session are kept, the shown workspace stays"):
+            self.keys("enter")
             self.wait_for(lambda state: state["prompt"] is None, 10, "the prompt to close")
             state = self.wait_for(
                 lambda state: state["workspace_count"] == 2 and state["workspaces"][0]["status"] == "working",
                 10,
                 "both workspaces kept, the first still working",
             )
+            self.expect_equal("the shown workspace, by id", shown_id, state["workspaces"][state["active_workspace"]]["id"])
 
-        with self.step("click close again and choose Close: the workspace (and its session) closes"):
+        with self.step("show the working workspace, click its close button, choose Close: it (and its session) closes"):
+            self.click_tab(state, 0)
+            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
             self.click_close_button(state, 0)
-            self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
+            self.keys("right")
+            self.wait_for(
+                lambda state: state["prompt"] is not None and state["prompt"]["answers"][state["prompt"]["highlighted"]] == "Close",
+                10,
+                "Close highlighted",
+            )
             self.keys("enter")
-            self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
+            state = self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
+            self.expect_equal("the remaining workspace, by id", shown_id, state["workspaces"][0]["id"])
 
     # Issue #81 (review B1): the confirmation is decided by the sessions, not by the workspace's
     # rolled-up status, where an entry in error (a page that failed to load, an earlier failed

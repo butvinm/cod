@@ -5,19 +5,21 @@
 //! Names follow "[ISSUE-ID] title" (D27): the leading "[ID]" is always shown whole and only the
 //! rest is cut with "...". The full name is the tab's tooltip.
 
-use std::{cell::RefCell, path::Path, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use gpui::{
     Animation, AnimationExt as _, Bounds, Entity, MouseButton, WeakEntity, pulsating_between,
 };
 use ui::{IconButtonShape, Indicator, Tooltip, prelude::*};
 use workspace::{CodMember, CodStatus, MultiWorkspace, NewWorkspace};
+// The names moved to the workspace crate (#81) so a close prompt names a workspace the way its
+// tab does; kept reachable here for the overview.
+pub use workspace::{
+    COD_UNNAMED_WORKSPACE, is_unnamed_default, member_name_and_folders, tab_display_name,
+};
 
 /// The widest a tab gets, in logical pixels (#25 open question 1).
 pub const COD_TAB_MAX_WIDTH: f32 = 280.;
-
-/// The name of a workspace without a name and without folders.
-pub const COD_UNNAMED_WORKSPACE: &str = "New workspace";
 
 /// One tab as it was last drawn, for the end-to-end driver.
 #[derive(Clone, Debug, Default)]
@@ -80,83 +82,6 @@ pub fn split_workspace_name(name: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Whether a workspace with this name and these folders falls back to the numbered "New
-/// workspace" name (issue #77: a user must be able to tell two freshly-opened workspaces
-/// apart). A workspace the user named, or one with a folder, is never in the numbering: renaming
-/// it or adding a folder takes it out, and a name the user typed is never changed.
-pub fn is_unnamed_default(name: Option<&str>, folders: &[&Path]) -> bool {
-    name.map(str::trim).unwrap_or("").is_empty() && folders.is_empty()
-}
-
-/// The name a tab shows: the user's name, else the folder names joined by ", ", else "New
-/// workspace" (issue #77: "New workspace 2", "New workspace 3", ... when several workspaces are
-/// all unnamed and folderless, so they can be told apart; `unnamed_rank` is this workspace's
-/// 1-based position among those, in tab order, found with `is_unnamed_default` and a running
-/// count over the shown members, oldest (leftmost tab) first. Ignored when the workspace is
-/// named or has a folder).
-pub fn tab_display_name(name: Option<String>, folders: &[&Path], unnamed_rank: usize) -> String {
-    if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
-        return name;
-    }
-    let folder_names: Vec<String> = folders
-        .iter()
-        .filter_map(|folder| folder.file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .collect();
-    if folder_names.is_empty() {
-        if unnamed_rank <= 1 {
-            COD_UNNAMED_WORKSPACE.to_string()
-        } else {
-            format!("{COD_UNNAMED_WORKSPACE} {unnamed_rank}")
-        }
-    } else {
-        folder_names.join(", ")
-    }
-}
-
-/// The raw stored name and folders of a member, before `tab_display_name` turns them into what a
-/// tab shows.
-pub fn member_name_and_folders(
-    member: &CodMember,
-    multi_workspace: &MultiWorkspace,
-    cx: &App,
-) -> (Option<String>, Vec<std::path::PathBuf>) {
-    match member {
-        CodMember::Live(workspace) => {
-            let workspace = workspace.read(cx);
-            let folders: Vec<std::path::PathBuf> = workspace
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                .collect();
-            (workspace::cod_workspace_name(workspace, cx), folders)
-        }
-        CodMember::Pending(id) => {
-            let folders = multi_workspace
-                .cod_pending_paths(*id)
-                .unwrap_or_default()
-                .to_vec();
-            (workspace::cod_workspace_name_by_id(*id, cx), folders)
-        }
-    }
-}
-
-/// The name a tab shows for `member`, numbering it among the unnamed, folderless workspaces
-/// `unnamed_count` has counted so far (in tab order); bumps `unnamed_count` when `member` is one
-/// of them, so the next call sees the right rank.
-fn member_name(
-    member: &CodMember,
-    multi_workspace: &MultiWorkspace,
-    cx: &App,
-    unnamed_count: &mut usize,
-) -> String {
-    let (name, folders) = member_name_and_folders(member, multi_workspace, cx);
-    let folder_refs: Vec<&Path> = folders.iter().map(|folder| folder.as_ref()).collect();
-    if is_unnamed_default(name.as_deref(), &folder_refs) {
-        *unnamed_count += 1;
-    }
-    tab_display_name(name, &folder_refs, *unnamed_count)
-}
-
 /// Builds the status dot, if the status calls for one, and wires it so the end-to-end driver
 /// reads back what was actually drawn rather than the status that was computed for it: the
 /// color is written into `layout` only from the dot's own prepaint callback, and the pulsing
@@ -206,7 +131,7 @@ pub fn render_cod_workspace_tabs(
     let weak: WeakEntity<MultiWorkspace> = multi_workspace.downgrade();
     let multi_workspace = multi_workspace.read(cx);
     let active = multi_workspace.workspace().clone();
-    let members = multi_workspace.cod_shown_members(cx);
+    let members = multi_workspace.cod_shown_names(cx);
     // #77 C4: capping the row's own box (with min_w_0 removed for F1, or with an absolute
     // max_w measured from the window) did not make the tabs inside it actually shrink when the
     // title bar is genuinely too narrow for all of them at COD_TAB_MAX_WIDTH each; each tab's
@@ -232,11 +157,10 @@ pub fn render_cod_workspace_tabs(
 
     let mut infos = Vec::with_capacity(members.len());
     let mut tabs: Vec<AnyElement> = Vec::with_capacity(members.len() + 1);
-    // #77: counts the unnamed, folderless workspaces seen so far, in tab order, so the second
-    // and later ones read "New workspace 2", "New workspace 3", and so on.
-    let mut unnamed_count = 0usize;
-    for (index, member) in members.into_iter().enumerate() {
-        let name = member_name(&member, multi_workspace, cx, &mut unnamed_count);
+    // #77: the second and later unnamed, folderless workspaces read "New workspace 2", "New
+    // workspace 3", and so on (`MultiWorkspace::cod_shown_names`).
+    for (index, (member, shown)) in members.into_iter().enumerate() {
+        let name = shown.name;
         let is_active = matches!(&member, CodMember::Live(workspace) if *workspace == active);
         let status = MultiWorkspace::cod_member_id(&member, cx)
             .map(|id| workspace::cod_workspace_status(id, cx))
@@ -462,6 +386,8 @@ pub fn render_cod_workspace_tabs(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]

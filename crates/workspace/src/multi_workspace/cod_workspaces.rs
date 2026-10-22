@@ -17,7 +17,9 @@ use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt as _;
 
-use super::{HeldWorkspace, MultiWorkspace, cod_status::cod_has_running_session};
+use super::{
+    COD_UNNAMED_WORKSPACE, HeldWorkspace, MultiWorkspace, cod_status::cod_has_running_session,
+};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
 /// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
@@ -956,16 +958,26 @@ impl MultiWorkspace {
                 None => false,
             };
             if running {
+                // Issue #81: the prompt can be for a background tab, so it names the workspace
+                // the way its tab does. Cancel comes first because Zed's prompts highlight the
+                // first answer and Enter picks it: Enter must not stop the agent and delete its
+                // chat.
+                let name = this
+                    .update(cx, |this, cx| this.cod_shown_name(&doomed, cx))?
+                    .unwrap_or_else(|| COD_UNNAMED_WORKSPACE.to_string());
+                let message = format!(
+                    "An agent in `{name}` is still working. Close the workspace and stop it?"
+                );
                 let answer = doomed.update_in(cx, |_, window, cx| {
                     window.prompt(
                         PromptLevel::Warning,
-                        "An agent in this workspace is still working. Close the workspace and stop it?",
+                        &message,
                         None,
-                        &["Close", "Cancel"],
+                        &["Cancel", "Close"],
                         cx,
                     )
                 })?;
-                if !matches!(answer.await, Ok(0)) {
+                if !matches!(answer.await, Ok(1)) {
                     return anyhow::Ok(());
                 }
             }
