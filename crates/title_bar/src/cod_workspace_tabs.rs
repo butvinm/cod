@@ -35,7 +35,6 @@ pub struct CodTabsState {
     scroll: ScrollHandle,
     focus: HashMap<ElementId, (FocusHandle, FocusHandle)>,
     revealed: Option<(ElementId, Pixels, usize)>,
-    focused: Option<ElementId>,
     viewport_width: Rc<Cell<Option<Pixels>>>,
 }
 
@@ -195,19 +194,9 @@ pub fn render_cod_workspace_tabs(
             .or_insert_with(|| (cx.focus_handle(), cx.focus_handle()));
         let tab_focus = tab_focus.clone();
         let close_focus = close_focus.clone();
-        let has_focus = tab_focus.contains_focused(window, cx);
+        let has_focus = tab_focus.contains_focused(window, cx) || close_focus.is_focused(window);
         if has_focus {
-            focused = Some(tab_id.clone());
-            if state.focused.as_ref() != Some(&tab_id) {
-                state.scroll.scroll_to_item(index);
-            }
-        }
-        if is_active {
-            let reveal = (tab_id.clone(), window.viewport_size().width, member_count);
-            if state.revealed.as_ref() != Some(&reveal) {
-                state.scroll.scroll_to_item(index);
-                state.revealed = Some(reveal);
-            }
+            focused = Some(index);
         }
         let status = MultiWorkspace::cod_member_id(&member, cx)
             .map(|id| workspace::cod_workspace_status(id, cx))
@@ -483,7 +472,18 @@ pub fn render_cod_workspace_tabs(
     state
         .focus
         .retain(|identity, _| identities.contains(identity));
-    state.focused = focused;
+    // A background tab being operated from the keyboard must stay visible even when the
+    // active workspace is elsewhere. Use this same target for both resize passes.
+    let reveal_index = focused.or(active_index);
+    if let Some(index) = reveal_index
+        && let Some(identity) = identities.get(index)
+    {
+        let reveal = (identity.clone(), window.viewport_size().width, member_count);
+        if state.revealed.as_ref() != Some(&reveal) {
+            state.scroll.scroll_to_item(index);
+            state.revealed = Some(reveal);
+        }
+    }
     *layout.borrow_mut() = CodTabsLayout {
         tabs: infos,
         tabs_viewport: None,
@@ -514,11 +514,11 @@ pub fn render_cod_workspace_tabs(
             layout.add_button = bounds.get(1).copied();
             if let Some(viewport) = layout.tabs_viewport
                 && viewport_width.replace(Some(viewport.size.width)) != Some(viewport.size.width)
-                && let Some(active_index) = active_index
+                && let Some(reveal_index) = reveal_index
             {
                 // The scroll handle learns the resized viewport during prepaint, after its
                 // reveal pass. Repeat once with those actual bounds instead of the old width.
-                resized_scroll.scroll_to_item(active_index);
+                resized_scroll.scroll_to_item(reveal_index);
                 window.refresh();
             }
         })
