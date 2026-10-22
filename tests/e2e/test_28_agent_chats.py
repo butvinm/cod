@@ -507,18 +507,24 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
     # Issue #77 C2: closing a workspace through its tab's close button (or CloseWorkspace)
     # while an agent in it is still generating or waiting for permission must ask first.
 
-    def test_ac7_closing_a_workspace_with_a_working_agent_asks_first(self) -> None:
+    def start_a_working_chat(self) -> None:
+        """Starts Cod on billing-api with a fake agent that streams, then waits, and sends it a prompt: the chat in the first workspace is working."""
         with self.step("start Cod on billing-api with a fake agent that streams, then waits"):
             self.start_fake_agent_cod(
                 persistent=False,
                 turns=[{"steps": [{"chunk": "Reading src/invoice.rs."}, {"wait": "streamed"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]}],
             )
 
-        with self.step("send a prompt: the chat (and the workspace) is working"):
+        with self.step("send a prompt: the chat is working"):
             self.open_chat([])
             self.type("Fix the rounding.")
             self.keys("enter")
             self.wait_for_values("chat status", {"status": "working"}, lambda state: {"status": chat(state).get("status")}, 10)
+
+    def test_ac7_closing_a_workspace_with_a_working_agent_asks_first(self) -> None:
+        self.start_a_working_chat()
+
+        with self.step("the workspace itself is working"):
             state = self.wait_for(lambda state: state["workspaces"][0]["status"] == "working", 10, "the workspace itself working")
 
         with self.step("add a second, idle workspace so closing the first does not leave an empty replacement"):
@@ -560,6 +566,42 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
             self.keys("enter")
             self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
+
+    # Issue #81 (review B1): the confirmation is decided by the sessions, not by the workspace's
+    # rolled-up status, where an entry in error (a page that failed to load, an earlier failed
+    # chat) outranks working.
+
+    def test_ac7_a_working_agent_next_to_a_failed_page_still_asks_first(self) -> None:
+        self.start_a_working_chat()
+
+        with self.step("a page of the same workspace failed to load: the workspace rolls up to error"):
+            self.set_entry(0, "page-localhost", "error", title="localhost:3000", kind="page", context="localhost:3000")
+            self.wait_for(lambda state: state["workspaces"][0]["status"] == "error", 10, "the workspace rolled up to error")
+            self.expect_equal("the chat itself", "working", chat(self.state()).get("status"))
+
+        with self.step("add a second, idle workspace and show the first again"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1 and state["modal"] is None,
+                30,
+                "the second workspace",
+            )
+            self.click_tab(self.state(), 0)
+            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
+
+        with self.step("click close: the agent-working confirmation shows although the workspace reads error"):
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the agent-working confirmation")
+            message = state["prompt"]["message"] or ""
+            if not message.startswith("An agent in"):
+                raise AssertionError(f"expected the agent-working confirmation, actual prompt {state['prompt']!r}")
+
+        with self.step("Cancel: the workspace and the running session are kept"):
+            self.keys("escape")
+            self.wait_for(lambda state: state["prompt"] is None, 10, "the prompt to close")
+            state = self.wait_for(lambda state: state["workspace_count"] == 2, 10, "both workspaces kept")
+            self.expect_equal("the chat after Cancel", "working", chat(state).get("status"))
 
     def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
         with self.step("start Cod on billing-api with the fake agent"):

@@ -17,7 +17,7 @@ use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt as _;
 
-use super::{CodStatus, HeldWorkspace, MultiWorkspace, cod_workspace_status};
+use super::{HeldWorkspace, MultiWorkspace, cod_status::cod_has_running_session};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
 /// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
@@ -940,25 +940,22 @@ impl MultiWorkspace {
         let app_state = doomed.read(cx).app_state().clone();
         cx.spawn_in(window, async move |this, cx| {
             // #77 C2: closing a workspace detaches it, which runs
-            // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs:1752, "the
-            // workspace's agent chats go with it") and permanently deletes its chat history as
-            // part of that, an existing behavior this story does not change. That would silently
-            // stop an agent session that is still generating or waiting for the user's
+            // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs, "the workspace's
+            // agent chats go with it") and permanently deletes its chat history. That would
+            // silently stop an agent session that is still generating or waiting for the user's
             // permission, with no way back. Ask first, the same prompt style as the
-            // unsaved-buffer one just below. An idle chat (done, errored, or nothing happening)
+            // unsaved-buffer one just below. Issue #81: decided from the session entries, not
+            // the rolled-up status, where any entry in Error (a failed page, an earlier failed
+            // chat) outranks Working. A workspace whose sessions are all done, failed or idle
             // does not prompt. This is the one shared path CloseWorkspace and a tab's own close
-            // button both use; codctl's own `workspace close` does not go through it (a separate
-            // implementation, codctl_server.rs::close_workspace) and is unchanged: without
-            // --force it still only asks about unsaved files, never about a running or waiting
-            // session.
+            // button both use; codctl's own `workspace close` (codctl_server.rs) does not go
+            // through it: without --force it only asks about unsaved files.
             let id = cx.update(|_window, cx| doomed.read(cx).database_id())?;
-            let status = match id {
-                Some(id) => Some(cx.update(|_window, cx| cod_workspace_status(id, cx))?),
-                None => None,
+            let running = match id {
+                Some(id) => cx.update(|_window, cx| cod_has_running_session(id, cx))?,
+                None => false,
             };
-            if let Some(status) = status
-                && matches!(status, CodStatus::Working | CodStatus::NeedsInput)
-            {
+            if running {
                 let answer = doomed.update_in(cx, |_, window, cx| {
                     window.prompt(
                         PromptLevel::Warning,

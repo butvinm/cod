@@ -185,6 +185,16 @@ impl CodStatusStore {
             .map(|entries| entries.as_slice())
             .unwrap_or_default()
     }
+
+    /// Whether an agent session of the workspace is still working or waits for the user's
+    /// permission, whatever its other entries are. The rolled-up status cannot tell: an entry in
+    /// Error outranks Working there.
+    pub fn has_running_session(&self, workspace: WorkspaceId) -> bool {
+        self.entries(workspace).iter().any(|entry| {
+            entry.kind == CodEntryKind::Session
+                && matches!(entry.status, CodStatus::Working | CodStatus::NeedsInput)
+        })
+    }
 }
 
 /// The most urgent status of the workspace with this id; idle when nothing is known.
@@ -192,6 +202,13 @@ pub fn cod_workspace_status(workspace: WorkspaceId, cx: &App) -> CodStatus {
     CodStatusStore::try_global(cx)
         .map(|store| store.read(cx).workspace_status(workspace))
         .unwrap_or(CodStatus::Idle)
+}
+
+/// Whether an agent session of the workspace with this id is still working or waits for the
+/// user (issue #81: closing the workspace would stop it).
+pub(super) fn cod_has_running_session(workspace: WorkspaceId, cx: &App) -> bool {
+    CodStatusStore::try_global(cx)
+        .is_some_and(|store| store.read(cx).has_running_session(workspace))
 }
 
 /// Drops the entries of a workspace that left its window for good (no-op before the store
@@ -290,5 +307,40 @@ mod tests {
         store.read_with(cx, |store, _| {
             assert!(store.entries(first).is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn a_running_session_is_found_next_to_an_error(cx: &mut gpui::TestAppContext) {
+        // Issue #81: Error outranks Working in the rollup, so a working chat next to a failed
+        // page (or an earlier failed chat) must still count as running.
+        let workspace = WorkspaceId::from_i64(1);
+        let entry = |key: &str, kind: CodEntryKind, status: CodStatus| CodEntry {
+            key: SharedString::from(key.to_string()),
+            kind,
+            title: SharedString::from(key.to_string()),
+            status,
+            context: SharedString::default(),
+            updated_at: SystemTime::UNIX_EPOCH,
+            open: None,
+        };
+        let store = cx.update(CodStatusStore::global);
+        store.update(cx, |store, cx| {
+            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::Working), cx);
+            store.set_entry(workspace, entry("page", CodEntryKind::Page, CodStatus::Error), cx);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.workspace_status(workspace), CodStatus::Error);
+            assert!(store.has_running_session(workspace));
+        });
+        store.update(cx, |store, cx| {
+            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::NeedsInput), cx);
+        });
+        store.read_with(cx, |store, _| assert!(store.has_running_session(workspace)));
+        store.update(cx, |store, cx| {
+            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::Done), cx);
+            // A loading page is not an agent session: closing does not stop an agent.
+            store.set_entry(workspace, entry("page", CodEntryKind::Page, CodStatus::Working), cx);
+        });
+        store.read_with(cx, |store, _| assert!(!store.has_running_session(workspace)));
     }
 }
