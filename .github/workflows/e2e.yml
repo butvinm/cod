@@ -171,6 +171,43 @@ jobs:
           CARGO_BUILD_JOBS: "8"
         run: script/e2e
 
+      # Reuse this successful build for downloaded-package QA without publishing a release.
+      # Packaging matches linux-release.yml; the existing CEF asset is read, never modified.
+      - name: Package the tested Linux candidate
+        if: steps.changes.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          mkdir -p candidate-artifacts/cef-asset candidate-package/cod
+          gh release download "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset.sha256" --dir candidate-artifacts/cef-asset
+          checksum=$(cat "candidate-artifacts/cef-asset/$asset.sha256")
+          [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
+          cp target/release-fast/zed candidate-package/cod/cod
+          cp target/release-fast/cod-browser candidate-package/cod/cod-browser
+          cp target/release-fast/codctl candidate-package/cod/codctl
+          strip candidate-package/cod/cod candidate-package/cod/cod-browser candidate-package/cod/codctl
+          cp script/cod-xwayland.sh script/cod-wayland.sh LICENSE-GPL LICENSE-APACHE README.md candidate-package/cod/
+          script/cod-linux-desktop-files candidate-package/cod
+          printf 'version=%s\nurl=%s/%s/releases/download/cef-%s/%s\nsha256=%s\n' \
+            "$CEF_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CEF_VERSION" "$asset" "$checksum" \
+            > candidate-package/cod/cef-manifest
+          git rev-parse HEAD > candidate-package/cod/cod-commit.txt
+          git rev-parse 'HEAD^{tree}' > candidate-package/cod/cod-tree.txt
+          tar -C candidate-package -cf - cod | xz -6 -T0 > candidate-artifacts/cod-linux-x86_64.tar.xz
+          (cd candidate-artifacts && sha256sum cod-linux-x86_64.tar.xz > cod-linux-x86_64.tar.xz.sha256)
+          cp candidate-package/cod/cod-commit.txt candidate-package/cod/cod-tree.txt candidate-artifacts/
+
+      - name: Upload the tested Linux package
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-linux-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate-artifacts
+          retention-days: 14
+          if-no-files-found: error
+
       # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.
       - name: Upload artifacts
         if: always() && steps.changes.outputs.code == 'true'
