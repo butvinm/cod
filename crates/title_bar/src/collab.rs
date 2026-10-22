@@ -155,7 +155,10 @@ impl TitleBar {
 
         h_flex()
             .id("collaborator-list")
-            .w_full()
+            // Fill only the space left by workspace tabs and window controls. A full-width
+            // basis makes even an empty list compete with and shrink the workspace tabs.
+            .flex_1()
+            .min_w_0()
             .gap_1()
             .overflow_x_scroll()
             .when_some(
