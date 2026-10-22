@@ -19,7 +19,6 @@ from typing import Any
 from cod_e2e import COMMAND_TIMEOUT, CodTestCase, processes_with_marker, sway_socket
 from cod_status_fixtures import (
     REMOVED_ITEMS,
-    TAB_MAX_WIDTH,
     CodStatusFixtures,
     active_tabs,
     bounds_pixel,
@@ -68,13 +67,13 @@ UNNAMED_3 = "New workspace 3"
 # right pixel coordinates too.
 FIRST_USE_OUTPUT_SCALE = output_scale()
 
-# Issue #77 AC(c): colors are checked relative to each other in the same screenshot, not against
-# a hardcoded theme hex. A headless sway with no desktop portal reports no system appearance, and
-# this reproduction measured the fixture's own default settling on a light-looking title bar
-# (#ebebec) rather than the stakeholder's dark one, so a hardcoded absolute color would be
-# fragile; the actual defect (a border color unrelated to the tab's own fill, measured exactly as
-# the theme's plain `border` token: One Light #c9c9ca next to a #fafafa fill) does not depend on
-# which theme is active, light or dark.
+# Issue #93's approved compact layout replaces the older 280 px cap in the shared fixture.
+# Keep these acceptance values independent of the implementation's constants.
+TAB_MIN_WIDTH = 114.0
+TAB_MAX_WIDTH = 242.0
+TAB_HEIGHT = 32.0
+
+# Compare painted surfaces in the same image so the checks work in either native theme.
 # Generous: real compositing (pixman software rendering, PPM round-tripping) is not bit-exact.
 COLOR_TOLERANCE = 12.0
 
@@ -116,6 +115,18 @@ def tabs_view(state: dict[str, Any]) -> dict[str, Any]:
 
 def one_hot(count: int, index: int) -> list[bool]:
     return [position == index for position in range(count)]
+
+
+def contains_bounds(outer: dict[str, Any], inner: dict[str, Any]) -> bool:
+    """Full containment, not merely positive content bounds outside a clipped viewport."""
+    return drawn(outer) and drawn(inner) and all(
+        (
+            inner["x"] >= outer["x"] - 0.5,
+            inner["y"] >= outer["y"] - 0.5,
+            inner["x"] + inner["width"] <= outer["x"] + outer["width"] + 0.5,
+            inner["y"] + inner["height"] <= outer["y"] + outer["height"] + 0.5,
+        )
+    )
 
 
 def sway_ipc(*args: str) -> Any:
@@ -491,9 +502,9 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
     def test_ac7_long_names_use_their_full_max_width_and_stay_distinguishable(self) -> None:
         """Two long names without an "[ID]" prefix, differing only near the end (the part ellipsis
-        would cut first): if #77's layout bug squeezes both tabs far under their own 280 px max
+        would cut first): if #77's layout bug squeezes both tabs far under their own 242 px max
         width, they lose that distinguishing tail and look identical. 1280 px comfortably fits two
-        280 px tabs (560 px), so both should reach the max width, not something much smaller."""
+        242 px tabs (484 px), so both should reach the max width, not something much smaller."""
         long_a = "Fix invoice rounding for every annual plan in the EU region"
         long_b = "Fix invoice rounding for every annual plan in the US region"
 
@@ -511,27 +522,30 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step(f"check neither tab is squeezed under its own {TAB_MAX_WIDTH} px max width"):
             for index, tab in enumerate(tabs):
                 width = tab["bounds"]["width"]
-                if width < TAB_MAX_WIDTH - 1:
+                if abs(width - TAB_MAX_WIDTH) > 1:
                     raise AssertionError(
                         f"expected tab {index} at its max width {TAB_MAX_WIDTH} px (two long tabs fit the "
                         f"title bar), actual {width} px; a narrower tab has less of its name showing and "
                         "both tabs can look the same"
                     )
 
-    # Issue #77 AC(c): tab colors match chosen ghost tokens, with no extra border color.
+    # Issue #93 replaces the ghost selected surface with a native selected fill and contour.
 
-    def test_ac7_tab_colors_match_the_ghost_tokens_with_no_extra_border(self) -> None:
+    def test_ac7_tabs_have_a_selected_surface_contour_and_subtle_separators(self) -> None:
         """Colors are compared to each other in the same screenshot (see the constants above): an
         inactive tab should look like the title bar itself, a hovered tab should pick up a visible
-        highlight, the active tab should stand out from the bar, and no tab should carry a border
-        in a color different from its own fill. Samples are taken near the top of each tab, away
+        highlight, the active tab should stand out from the bar with a quiet contour, and adjacent
+        inactive tabs should have a short separator. Samples are taken near the top of each tab, away
         from the label's own glyphs (sampling mid-height landed on anti-aliased text pixels, not
         the background, in this reproduction)."""
-        with self.step("start Cod: one default workspace, add a second (first stays inactive)"):
+        with self.step("start Cod with two inactive tabs followed by the active one"):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
             self.click_add_button(state)
             state = self.wait_for_tabs("the second tab", {"names": [UNNAMED, UNNAMED_2], "active": [False, True]})
+            self.click_add_button(state)
+            state = self.wait_for_tabs("the third tab", {"names": [UNNAMED, UNNAMED_2, UNNAMED_3], "active": [False, False, True]})
+            self.hover_at(400, 100)
 
         shot = self.workdir / "colors.ppm"
         with self.step("screenshot the title bar, the inactive tab and the active tab"):
@@ -543,11 +557,18 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             # Clearly right of the "+" button: the title bar's own background, nothing else drawn there.
             bar_bg = logical_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, add_button["x"] + add_button["width"] + 40, bar_y)
             inactive_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["bounds"], dy=0.15)
-            active_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"], dy=0.15)
-            # One logical pixel inside the left edge, where border_x_1 draws a border if the tab has one.
+            active_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[2]["bounds"], dy=0.15)
+            # Below the rounded corner, on the selected tab's one-pixel left contour.
             active_edge = logical_pixel(
-                width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"]["x"], tabs[1]["bounds"]["y"] + 2
+                width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[2]["bounds"]["x"], tabs[2]["bounds"]["y"] + 8
             )
+            # The transparent tab border can move the inner separator by one logical pixel.
+            separator_samples = [
+                logical_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE,
+                              tabs[0]["bounds"]["x"] + tabs[0]["bounds"]["width"] - inset,
+                              tabs[0]["bounds"]["y"] + 12)
+                for inset in (1, 2)
+            ]
 
         with self.step("check the inactive tab looks like the title bar itself"):
             if color_distance(inactive_bg, bar_bg) > COLOR_TOLERANCE:
@@ -562,12 +583,13 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     f"actual the same {hex_color(active_bg)}"
                 )
 
-        with self.step("check the active tab has no separate border color"):
-            if color_distance(active_edge, active_bg) > COLOR_TOLERANCE:
+        with self.step("check the selected contour and inactive separator are visible"):
+            if color_distance(active_edge, active_bg) <= COLOR_TOLERANCE:
                 raise AssertionError(
-                    f"expected the active tab's edge the same color as its own fill {hex_color(active_bg)}, "
-                    f"actual {hex_color(active_edge)} (a border in a different grey)"
+                    f"expected the selected contour to differ from its fill {hex_color(active_bg)}, actual {hex_color(active_edge)}"
                 )
+            if max(color_distance(sample, inactive_bg) for sample in separator_samples) <= COLOR_TOLERANCE:
+                raise AssertionError("expected a separator between adjacent inactive tabs")
 
         with self.step("hover the inactive tab and check it now shows a visible highlight"):
             self.hover_tab(state, 0)
@@ -589,6 +611,9 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
             self.set_entry(0, "s1", "working", title="Codex: review migration")
             state = self.wait_for_tabs("the dot", {"dots": ["blue"]})
+            # Issue #93 shows the close icon on hover/focus, including on the active tab.
+            self.hover_tab(state, 0)
+            state = self.state()
 
         shot = self.workdir / "align.ppm"
         with self.step("check the drawn dot, label, close icon and + icon each sit within 1 px of the tab's vertical center and of each other"):
@@ -602,7 +627,10 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             bounds = tab["bounds"]
             tab_center = bounds["y"] + bounds["height"] / 2
             close_left = round(tab["close_bounds"]["x"] * scale)
-            content = {x: rows for x, rows in ink_columns(width, height, pixels, scale, bounds).items() if x < close_left}
+            # Exclude the selected contour from glyph measurement now that #93 adds it.
+            content_bounds = dict(bounds, x=bounds["x"] + 3, y=bounds["y"] + 3,
+                                  width=bounds["width"] - 6, height=bounds["height"] - 6)
+            content = {x: rows for x, rows in ink_columns(width, height, pixels, scale, content_bounds).items() if x < close_left}
             runs = ink_runs(content, gap=round(3 * scale))
             if len(runs) < 2:
                 raise AssertionError(f"expected a dot and then a label in the tab, actual ink runs {runs!r}")
@@ -652,9 +680,9 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             if abs(add_center - bar_center) > 1.0:
                 raise AssertionError(f'expected the "+" button centered within 1 px of {bar_center:.1f}, actual {add_center:.1f}')
 
-    # Issue #77 AC(e)/F3: a hovered or active tab shows a close control that closes that workspace.
+    # Issue #93: hover/focus reveals the reserved close control without moving the label.
 
-    def test_ac7_close_button_shows_on_active_and_hover_and_closes_the_tab(self) -> None:
+    def test_ac7_close_button_shows_on_hover_without_jitter_and_closes_the_tab(self) -> None:
         with self.step("start Cod: one default workspace, add a second"):
             self.start_cod(None)
             state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
@@ -670,17 +698,16 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     raise AssertionError(f"expected tab {index} to have a close button, actual {tab['close_bounds']!r}")
 
         shot = self.workdir / "close.ppm"
-        with self.step("the active tab's close icon is visible without hovering; the inactive one is not"):
+        with self.step("neither unfocused tab shows its close icon before hover, including the active tab"):
+            self.hover_at(400, 100)
             screenshot_ppm(shot)
             width, height, pixels = read_ppm(shot)
-            active_close = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["close_bounds"])
-            active_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[1]["bounds"], dy=0.15)
-            if color_distance(active_close, active_bg) <= COLOR_TOLERANCE:
-                raise AssertionError("expected the active tab's close icon visible (a color different from its own background)")
-            inactive_close = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["close_bounds"])
-            inactive_bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tabs[0]["bounds"], dy=0.15)
-            if color_distance(inactive_close, inactive_bg) > COLOR_TOLERANCE:
-                raise AssertionError("expected the inactive tab's close icon not visible before hovering it")
+            for index, tab in enumerate(tabs):
+                self.expect_equal(f"tab {index} keyboard focus", False, tab["focused"] or tab["close_focused"])
+                icon = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["close_bounds"])
+                bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["bounds"], dy=0.15)
+                if color_distance(icon, bg) > COLOR_TOLERANCE:
+                    raise AssertionError(f"expected tab {index}'s close icon hidden before hover or keyboard focus")
 
         with self.step("hover the inactive tab: its close icon becomes visible, its own width does not change"):
             width_before = tabs[0]["bounds"]["width"]
@@ -688,6 +715,8 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.state()
             hovered_bounds = title_bar(state)["tabs"][0]["bounds"]
             self.expect_equal("hovered tab width unchanged", width_before, hovered_bounds["width"])
+            self.expect_equal("all tab and close positions unchanged", [(tab["bounds"], tab["close_bounds"], tab["visible"]) for tab in tabs],
+                              [(tab["bounds"], tab["close_bounds"], tab["visible"]) for tab in title_bar(state)["tabs"]])
             screenshot_ppm(shot)
             width, height, pixels = read_ppm(shot)
             hovered_close = bounds_pixel(
@@ -884,8 +913,8 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.keys("enter")
             state = self.wait_until_shown(shown_id, 1, "only the third workspace left, shown")
 
-    # Issue #77 C4: natural width when there is room must not break correct shrinking when the
-    # title bar is genuinely full. The test makes its own narrow window: it sets the output of
+    # Issue #93: crowded tabs keep readable minimum widths and scroll inside the title bar.
+    # The test makes its own narrow window: it sets the output of
     # this run's sway to 640x600 logical pixels before Cod starts and restores the output's own
     # mode afterwards, so it runs in the same default script/e2e batch as the other tests.
 
@@ -917,18 +946,90 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             raise AssertionError(f"expected one Cod window in sway's tree, actual widths {widths}")
         return float(widths[0])
 
-    def test_ac7_narrow_window_many_short_tabs_stay_inside_the_bar(self) -> None:
-        """Six default workspaces, each able to grow up to COD_TAB_MAX_WIDTH, in a 640 px title
-        bar: every tab, its close button and "+" must stay inside it, and a name that does not
-        fit is cut (truncated), not left overflowing past the window edge or blank."""
+    def test_ac7_narrow_window_tabs_scroll_and_reveal_each_active_workspace(self) -> None:
+        """Six default workspaces in 640 px: the strip clips overflow, reveals each active tab,
+        and keeps the adjacent plus reachable without squeezing away the default number."""
         self.check_a_full_bar_of_default_tabs(640, 600, 6)
 
-    def test_ac7_twelve_default_tabs_in_a_1280_px_bar_stay_inside_and_distinct(self) -> None:
-        """Issue #81 (QA #92) at the stakeholder's 1280 px width: twelve default workspaces fill the bar, and every drawn label is still different."""
+    def test_ac7_twelve_default_tabs_scroll_and_stay_distinct_at_1280_px(self) -> None:
+        """Issue #81 (QA #92) with #93 scrolling: each revealed default label is distinguishable."""
         self.check_a_full_bar_of_default_tabs(1280, 800, 12)
 
+    def assert_tab_controls_in_view(self, state: dict[str, Any], index: int) -> None:
+        """Content bounds can exist offscreen; only the real scroll viewport proves visibility."""
+        bar = title_bar(state)
+        viewport = bar["tabs_viewport"]
+        tab = bar["tabs"][index]
+        if not contains_bounds(viewport, tab["bounds"]):
+            raise AssertionError(f"expected tab {index} fully revealed in {viewport!r}, actual {tab['bounds']!r}")
+        if not contains_bounds(tab["bounds"], tab["close_bounds"]):
+            raise AssertionError(f"expected tab {index}'s close slot inside its tab, actual {tab!r}")
+        if not contains_bounds(viewport, tab["close_bounds"]):
+            raise AssertionError(f"expected tab {index}'s close slot revealed in {viewport!r}, actual {tab['close_bounds']!r}")
+
+    def assert_plus_reachable(self, state: dict[str, Any], window_width: float) -> None:
+        bar = title_bar(state)
+        viewport = bar["tabs_viewport"]
+        add = bar["add_button"]["bounds"]
+        if not drawn(viewport) or not drawn(add):
+            raise AssertionError(f"expected drawn scroll viewport and plus, actual {bar!r}")
+        if viewport["x"] < 0 or add["x"] + add["width"] > window_width + 0.5:
+            raise AssertionError(f"expected viewport and plus inside {window_width} px window, actual {bar!r}")
+        gap = add["x"] - (viewport["x"] + viewport["width"])
+        if abs(gap) > 1:
+            raise AssertionError(f"expected plus immediately beside the viewport, actual gap {gap} px")
+
+    def tab_is_revealed(self, state: dict[str, Any], index: int) -> bool:
+        bar = title_bar(state)
+        return contains_bounds(bar["tabs_viewport"], bar["tabs"][index]["bounds"])
+
+    def press_until_tab_focus(self, index: int, close: bool = False) -> dict[str, Any]:
+        """Use real Tab events and observed focus; do not assume a global focus order."""
+        field = "close_focused" if close else "focused"
+        for _ in range(4 * self.state()["workspace_count"] + 40):
+            self.keys("tab")
+            state = self.state()
+            if title_bar(state)["tabs"][index][field]:
+                return self.wait_for(lambda state: self.tab_is_revealed(state, index), SHOW_TIMEOUT, f"focused tab {index} revealed")
+        raise AssertionError(f"Tab did not reach tab {index}'s {field}: {title_bar(self.state())!r}")
+
+    def test_ac7_keyboard_focus_reveals_tabs_and_can_activate_and_close_them(self) -> None:
+        self.check_a_full_bar_of_default_tabs(640, 600, 6)
+        with self.step("Tab to the first tab without selecting it: focus reveals it and its close icon"):
+            self.hover_at(400, 100)
+            state = self.press_until_tab_focus(0)
+            self.expect_equal("focus alone preserves the active workspace", 5, state["active_workspace"])
+            self.assert_tab_controls_in_view(state, 0)
+            shot = self.workdir / "keyboard-close.ppm"
+            screenshot_ppm(shot)
+            width, height, pixels = read_ppm(shot)
+            tab = title_bar(state)["tabs"][0]
+            icon = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["close_bounds"])
+            bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["bounds"], dy=0.15)
+            if color_distance(icon, bg) <= COLOR_TOLERANCE:
+                raise AssertionError("expected keyboard focus to reveal the close icon without hover")
+
+        with self.step("Enter activates the focused workspace, then Tab reaches its close control without label jitter"):
+            self.keys("enter")
+            state = self.wait_for_tabs("the first workspace selected by keyboard", {"active_workspace": 0, "active": one_hot(6, 0)})
+            # Selection changes font weight; measure jitter only across the focus change.
+            before = [(tab["bounds"]["width"], tab["visible"]) for tab in title_bar(state)["tabs"]]
+            state = self.press_until_tab_focus(0, close=True)
+            self.expect_equal("focus leaves label widths and text unchanged", before,
+                              [(tab["bounds"]["width"], tab["visible"]) for tab in title_bar(state)["tabs"]])
+            self.assert_tab_controls_in_view(state, 0)
+            surviving_ids = [workspace["id"] for workspace in state["workspaces"][1:]]
+            self.keys("enter")
+            state = self.wait_for(lambda state: state["workspace_count"] == 5, SHOW_TIMEOUT, "the focused close control to close its workspace")
+            self.expect_equal("keyboard close preserves the other workspace identities", surviving_ids,
+                              [workspace["id"] for workspace in state["workspaces"]])
+
     def check_a_full_bar_of_default_tabs(self, width: int, height: int, count: int) -> None:
-        """Opens `count` default workspaces in a `width` px window and checks that every tab, its close button and "+" stay inside the bar, that a name is cut, and that the drawn labels differ."""
+        """Open real default workspaces, then reveal every one with palette navigation.
+
+        Positive content bounds alone do not imply visibility. The clipped viewport is checked
+        separately, and each label/close slot is checked only after it is actually revealed.
+        """
         with self.step(f"set this run's output to {width}x{height} for this test only"):
             self.narrow_the_output(width, height)
 
@@ -940,58 +1041,53 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
         with self.step(f'open {count - 1} more default workspaces with "+", which stays inside the window for every click'):
             for expected_count in range(2, count + 1):
-                add = title_bar(state)["add_button"]["bounds"]
-                if drawn(add) and add["x"] + add["width"] > bar_width + 0.5:
-                    raise AssertionError(
-                        f'expected the "+" button inside the {bar_width} px window before opening workspace '
-                        f'{expected_count}, actual right edge {add["x"] + add["width"]}; tab right edges: '
-                        f'{[tab["bounds"]["x"] + tab["bounds"]["width"] for tab in title_bar(state)["tabs"]]}'
-                    )
+                self.assert_plus_reachable(state, bar_width)
                 self.click_add_button(state)
                 state = self.wait_for(
                     lambda state, expected_count=expected_count: state["workspace_count"] == expected_count
+                    and state["active_workspace"] == expected_count - 1
                     and len(title_bar(state)["tabs"]) == expected_count,
                     SHOW_TIMEOUT,
                     f"{expected_count} workspaces and tabs",
                 )
 
-        with self.step(f"every tab, its close button and + stay inside the {width} px title bar"):
+        with self.step("the strip overflows internally while tabs retain the approved compact dimensions"):
             bar = title_bar(state)
             tabs = bar["tabs"]
-            self.expect_equal("tabs drawn", count, len(tabs))
+            self.expect_equal("tab count", count, len(tabs))
             for index, tab in enumerate(tabs):
                 if not drawn(tab["bounds"]) or tab["bounds"]["width"] <= 0:
                     raise AssertionError(f"expected tab {index} drawn with a positive width, actual {tab['bounds']!r}")
-                right = tab["bounds"]["x"] + tab["bounds"]["width"]
-                if right > bar_width + 0.5:
-                    raise AssertionError(f"tab {index} ({tab['name']!r}) right edge {right} is past the {bar_width} px title bar")
-                close = tab["close_bounds"]
-                if close is not None:
-                    close_right = close["x"] + close["width"]
-                    if close_right > bar_width + 0.5:
-                        raise AssertionError(f"tab {index}'s close button right edge {close_right} is past the title bar")
-                    # Issue #81: the number drawn after a cut name must not push the close button out of its own tab.
-                    if close_right > right + 0.5:
-                        raise AssertionError(f"tab {index}'s close button right edge {close_right} is past its tab's right edge {right}")
-            add = bar["add_button"]["bounds"]
-            add_right = add["x"] + add["width"]
-            if add_right > bar_width + 0.5:
-                raise AssertionError(f'expected the "+" button inside the {bar_width} px title bar, actual right edge {add_right}')
-
-        with self.step("at least one name that does not fit is marked cut"):
-            if not any(tab["truncated"] for tab in tabs):
-                raise AssertionError(f"expected at least one of {count} tabs in a {width} px bar to be cut")
+                if not TAB_MIN_WIDTH - 0.5 <= tab["bounds"]["width"] <= TAB_MAX_WIDTH + 0.5:
+                    raise AssertionError(f"expected tab {index} width in {TAB_MIN_WIDTH}..{TAB_MAX_WIDTH}, actual {tab['bounds']!r}")
+                if abs(tab["bounds"]["height"] - TAB_HEIGHT) > 0.5:
+                    raise AssertionError(f"expected tab {index} height {TAB_HEIGHT}, actual {tab['bounds']!r}")
+            if all(contains_bounds(bar["tabs_viewport"], tab["bounds"]) for tab in tabs):
+                raise AssertionError("expected this crowded strip to overflow its viewport instead of squeezing every tab")
+            self.assert_plus_reachable(state, bar_width)
 
         # Issue #81 (QA #92): cut names must still tell the workspaces apart. The number of a
         # default name stays drawn after the cut ("New w... 2"), like the "[ID]" of a named one.
-        with self.step("every drawn label is different, and each numbered one ends with its number"):
-            visible = [tab["visible"] for tab in tabs]
+        with self.step("palette navigation reveals every tab and close slot, preserving distinct default suffixes"):
+            visible = []
+            ids = [workspace["id"] for workspace in state["workspaces"]]
+            # Start on the last workspace, wrap to the first and visit every workspace.
+            for index in range(count):
+                self.run_command(NEXT_WORKSPACE)
+                state = self.wait_for(
+                    lambda state, index=index: state["active_workspace"] == index and self.tab_is_revealed(state, index),
+                    SHOW_TIMEOUT, f"workspace {index} active and fully revealed",
+                )
+                self.assert_tab_controls_in_view(state, index)
+                self.assert_plus_reachable(state, bar_width)
+                tab = title_bar(state)["tabs"][index]
+                self.expect_equal("full tooltip preserved", tab["name"], tab["tooltip"])
+                visible.append(tab["visible"])
+                if index and not tab["visible"].endswith(f" {index + 1}"):
+                    raise AssertionError(f"expected default number {index + 1} preserved, actual {tab['visible']!r}")
+            self.expect_equal("navigation preserves workspace identities", ids, [workspace["id"] for workspace in state["workspaces"]])
             if len(set(visible)) != len(visible):
                 raise AssertionError(f"expected {count} different drawn labels, actual {visible}")
-            for tab in tabs[1:]:
-                number = tab["name"].rsplit(" ", 1)[-1]
-                if not tab["visible"].endswith(f" {number}"):
-                    raise AssertionError(f"expected the drawn label of {tab['name']!r} to end with its number, actual {tab['visible']!r}")
 
 
 class FirstUseWelcomeTest(CodStatusFixtures, CodTestCase):
