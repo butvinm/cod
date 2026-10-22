@@ -1010,6 +1010,10 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         self.check_a_full_bar_of_default_tabs(640, 600, 6)
         with self.step("Tab to the first tab without selecting it: focus reveals it and its close icon"):
             self.hover_at(400, 100)
+            # This fresh fixture has an open left dock between the editor and title bar.
+            # Enter the toolbar through native region navigation before traversing its controls.
+            self.keys("shift-f6")
+            self.keys("shift-f6")
             state = self.press_until_tab_focus(0)
             self.expect_equal("focus alone preserves the active workspace", 5, state["active_workspace"])
             self.assert_tab_controls_in_view(state, 0)
