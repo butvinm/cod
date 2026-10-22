@@ -190,13 +190,10 @@ def logical_pixel(width: int, height: int, pixels: bytes, scale: float, x: float
     return ppm_pixel(width, height, pixels, round(x * scale), round(y * scale))
 
 
-def ink_vertical_center(width: int, height: int, pixels: bytes, scale: float, bounds: dict[str, Any]) -> float:
-    """The vertical center, in logical pixels, of the ink (any pixel that differs from the box's own most common color) inside `bounds`.
+def ink_columns(width: int, height: int, pixels: bytes, scale: float, bounds: dict[str, Any]) -> dict[int, tuple[int, int]]:
+    """The ink inside `bounds` (a driver bounds dict in logical pixels) per screenshot column: {x: (first ink row, last ink row)} in device pixels, only for columns with ink.
 
-    Used to check that a tab's drawn content (its label and dot) sits in the middle of the tab's
-    own box (issue #77 AC(d)), without needing new bounds of the label or the dot: the background
-    occupies most of the box, so its most common color is read as the background and any
-    different pixel counts as ink.
+    Any pixel that differs from the box's own most common color counts as ink: the background occupies most of a tab or button, so its most common color is its background. Used to check that a tab's dot, label and close icon and the "+" icon sit in the middle of the title bar (issue #77 AC(d)) without new driver bounds for each of them.
     """
     left = max(0, round(bounds["x"] * scale))
     right = min(width, round((bounds["x"] + bounds["width"]) * scale))
@@ -205,17 +202,33 @@ def ink_vertical_center(width: int, height: int, pixels: bytes, scale: float, bo
     if left >= right or top >= bottom:
         raise AssertionError(f"bounds {bounds!r} at scale {scale} are empty in a {width}x{height} screenshot")
     counts: dict[tuple[int, int, int], int] = {}
-    sampled: list[tuple[int, int, tuple[int, int, int]]] = []
     for y in range(top, bottom):
-        for x in range(left, right, 2):
+        for x in range(left, right):
             color = ppm_pixel(width, height, pixels, x, y)
             counts[color] = counts.get(color, 0) + 1
-            sampled.append((x, y, color))
     background = max(counts, key=lambda color: counts[color])
-    ink_rows = sorted({y for x, y, color in sampled if color_distance(color, background) > 20})
-    if not ink_rows:
-        raise AssertionError(f"no ink found in bounds {bounds!r} (background {hex_color(background)})")
-    return (ink_rows[0] + ink_rows[-1]) / 2 / scale
+    columns: dict[int, tuple[int, int]] = {}
+    for x in range(left, right):
+        rows = [y for y in range(top, bottom) if color_distance(ppm_pixel(width, height, pixels, x, y), background) > 20]
+        if rows:
+            columns[x] = (rows[0], rows[-1])
+    return columns
+
+
+def ink_runs(columns: dict[int, tuple[int, int]], gap: int) -> list[tuple[int, int]]:
+    """Groups the ink columns `ink_columns` returned into runs separated by more than `gap` empty columns: [(first x, last x)], left to right."""
+    runs: list[list[int]] = []
+    for x in sorted(columns):
+        if runs and x - runs[-1][1] <= gap:
+            runs[-1][1] = x
+        else:
+            runs.append([x, x])
+    return [(first, last) for first, last in runs]
+
+
+def rows_center(top: int, bottom: int, scale: float) -> float:
+    """The vertical center, in logical pixels, of device pixel rows `top` to `bottom` inclusive, measured at pixel edges (rows 12 to 21 span y 12.0 to 22.0, center 17.0) like driver bounds are."""
+    return (top + bottom + 1) / 2 / scale
 
 
 def color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:

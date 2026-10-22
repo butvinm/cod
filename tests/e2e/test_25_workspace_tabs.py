@@ -27,10 +27,12 @@ from cod_status_fixtures import (
     color_distance,
     drawn,
     hex_color,
-    ink_vertical_center,
+    ink_columns,
+    ink_runs,
     logical_pixel,
     output_scale,
     read_ppm,
+    rows_center,
     screenshot_ppm,
     tab_dots,
     tab_names,
@@ -589,17 +591,53 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for_tabs("the dot", {"dots": ["blue"]})
 
         shot = self.workdir / "align.ppm"
-        with self.step("check the drawn content (dot and label) sits within 1 px of the tab's own vertical center"):
+        with self.step("check the drawn dot, label, close icon and + icon each sit within 1 px of the tab's vertical center and of each other"):
             screenshot_ppm(shot)
             width, height, pixels = read_ppm(shot)
+            scale = FIRST_USE_OUTPUT_SCALE
             bar = title_bar(state)
-            bounds = bar["tabs"][0]["bounds"]
-            ink_center = ink_vertical_center(width, height, pixels, FIRST_USE_OUTPUT_SCALE, bounds)
+            tab = bar["tabs"][0]
+            # The label is measured by its cap-height band (topmost ink row to the baseline), which a descender such as the "p" of "workspace" does not move; that needs the known default name.
+            self.expect_equal("tab name", UNNAMED, tab["name"])
+            bounds = tab["bounds"]
             tab_center = bounds["y"] + bounds["height"] / 2
-            if abs(ink_center - tab_center) > 1.0:
-                raise AssertionError(
-                    f"expected the tab's content centered within 1 px of {tab_center:.1f}, actual ink center {ink_center:.1f}"
-                )
+            close_left = round(tab["close_bounds"]["x"] * scale)
+            content = {x: rows for x, rows in ink_columns(width, height, pixels, scale, bounds).items() if x < close_left}
+            runs = ink_runs(content, gap=round(3 * scale))
+            if len(runs) < 2:
+                raise AssertionError(f"expected a dot and then a label in the tab, actual ink runs {runs!r}")
+            dot_first, dot_last = runs[0]
+            dot = [content[x] for x in range(dot_first, dot_last + 1) if x in content]
+            dot_top, dot_bottom = min(top for top, _ in dot), max(bottom for _, bottom in dot)
+            dot_width, dot_height = (dot_last - dot_first + 1) / scale, (dot_bottom - dot_top + 1) / scale
+            if dot_width > 10 or abs(dot_width - dot_height) > 2:
+                raise AssertionError(f"expected the first ink in the tab to be its small round dot, actual {dot_width:.1f}x{dot_height:.1f} px")
+            label = [rows for x, rows in content.items() if x > dot_last]
+            cap_top = min(top for top, _ in label)
+            bottoms = [bottom for _, bottom in label]
+            baseline = max(set(bottoms), key=bottoms.count)
+            if (baseline - cap_top + 1) / scale < 6:
+                raise AssertionError(f"expected the label's cap-height band to be at least 6 px tall, actual rows {cap_top}-{baseline}")
+            close_ink = list(ink_columns(width, height, pixels, scale, tab["close_bounds"]).values())
+            if not close_ink:
+                raise AssertionError("expected the active tab's close icon drawn")
+            add_bounds = bar["add_button"]["bounds"]
+            add_columns = ink_columns(width, height, pixels, scale, add_bounds)
+            add_middle = (add_bounds["x"] + add_bounds["width"] / 2) * scale
+            plus_first, plus_last = min(ink_runs(add_columns, gap=round(2 * scale)), key=lambda run: abs((run[0] + run[1]) / 2 - add_middle))
+            plus = [add_columns[x] for x in range(plus_first, plus_last + 1) if x in add_columns]
+            centers = {
+                "dot": rows_center(dot_top, dot_bottom, scale),
+                "label cap-height band": rows_center(cap_top, baseline, scale),
+                "close icon": rows_center(min(top for top, _ in close_ink), max(bottom for _, bottom in close_ink), scale),
+                "+ icon": rows_center(min(top for top, _ in plus), max(bottom for _, bottom in plus), scale),
+            }
+            print(f"  tab center {tab_center:.1f}, drawn centers {centers}")
+            for element, element_center in centers.items():
+                if abs(element_center - tab_center) > 1.0:
+                    raise AssertionError(f"expected the {element} centered within 1 px of the tab's {tab_center:.1f}, actual {element_center:.1f}")
+            if max(centers.values()) - min(centers.values()) > 1.0:
+                raise AssertionError(f"expected the dot, label, close icon and + icon on one line within 1 px, actual centers {centers!r}")
 
         with self.step("check the close button and the + button centers against the title bar's own center"):
             bar_center = bounds["y"] + bounds["height"] / 2  # the title bar's content row is as tall as a tab
