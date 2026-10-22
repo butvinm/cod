@@ -529,66 +529,177 @@ jobs:
             echo "P1 SKIP: no internet access on this runner (curl could not reach https://example.com/ in 5s)"
           fi
 
-          # #23 round 5, P2: an agent-made page (#43). JS-off-by-default is checked the same way
-          # the Linux e2e test's AC4 does (the page must not auto-submit and close on its own): a
-          # fixture whose inline script would call the submit bridge action if JS ran, which also
-          # closes the tab (crates/web_view/src/offscreen.rs's run_bridge_action), so "the tab is
-          # still open and loaded after settling" is equivalent evidence to "the waiting codctl
-          # process did not exit".
+          # Round 6: the 300 KB total screenshot budget leaves no room for full-size captures of a
+          # large runner display, so every extra capture is scaled down and recompressed in place.
+          shrink_jpg() {
+            sips -Z 1280 -s format jpeg -s formatOptions 50 "$1" --out "$1" > /dev/null 2>&1 \
+              || echo "::warning::could not shrink $1"
+          }
+
+          # Round 6: a stack sample of cod-browser, taken when a page never loads, so the next hang
+          # shows which thread is stuck where instead of only "state=loading".
+          sample_browser() {
+            browser_pid=$(pgrep -f "$app/Contents/MacOS/cod-browser" | head -n 1)
+            if [ -n "$browser_pid" ]; then
+              sample "$browser_pid" 2 -file "smoke-artifacts/cod-browser-sample-$1.txt" > /dev/null 2>&1 \
+                || echo "::warning::sample of cod-browser ($browser_pid) failed"
+            else
+              echo "no cod-browser process to sample"
+            fi
+          }
+
+          # #23 round 5, P2 (round 6: the fixture has its own <title>): an agent-made page (#43).
+          # JS off by default is checked three ways. The inline script would change the title and
+          # call the submit bridge action (which also closes the tab, see
+          # crates/web_view/src/offscreen.rs's run_bridge_action), and an inline onerror handler
+          # would change the title too. So the page must reach state=loaded with the document's
+          # own title, unchanged, and still be open and unchanged after settling.
           echo "== round 5 P2: agent-made page (#43), JS off by default =="
           agent_dir=$(mktemp -d)
+          agent_title="Cod Mac agent page smoke"
           printf '%s\n' \
-            '<!doctype html><html><head><meta charset="utf-8"></head>' \
+            '<!doctype html><html><head><meta charset="utf-8"><title>Cod Mac agent page smoke</title></head>' \
             '<body style="margin:0">' \
             '<h1 id="heading">Cod Mac agent page smoke</h1>' \
-            '<button data-cod="submit" data-cod-value-from="#answer">Send</button>' \
-            '<input id="answer" type="text" value="mac-agent-smoke">' \
+            '<input id="answer" type="text" autofocus value="mac-agent-smoke">' \
             '<button data-cod="erase-everything">Not in the allowlist</button>' \
-            '<script>if (window.cod) { window.cod.call("submit", {value: "script-ran"}); }</script>' \
+            '<button data-cod="submit" data-cod-value-from="#answer">Send</button>' \
+            '<img src="cod-missing.png" alt="" width="1" height="1" onerror="document.title=&quot;handler-ran&quot;">' \
+            '<script>document.title = "script-ran"; if (window.cod) { window.cod.call("submit", {value: "script-ran"}); }</script>' \
             '</body></html>' \
             > "$agent_dir/ask.html"
+          p2_id=""
           if "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" \
             > smoke-artifacts/codctl-open-p2.txt 2>&1; then
             p2_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p2.txt)
             echo "codctl open --html reported page id: $p2_id"
-            p2_loaded=0
-            for _attempt in $(seq 1 30); do
-              if "$app/Contents/MacOS/codctl" page get "$p2_id" --json \
-                > smoke-artifacts/codctl-page-get-p2.txt 2>&1; then
-                p2_state=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get-p2.txt')).get('state', ''))" 2> /dev/null || echo "")
-                if [ "$p2_state" = "loaded" ]; then
-                  p2_loaded=1
-                  break
-                fi
-              fi
-              sleep 1
-            done
-            cat smoke-artifacts/codctl-page-get-p2.txt 2> /dev/null || true
-            if [ "$p2_loaded" != "1" ]; then
-              echo "::error::P2 FAIL: the agent page never reported state=loaded"
-              status=1
-            else
+            if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2.txt 30; then
+              echo "P2 loaded: state=loaded title='$agent_title' (the document's own title)"
               sleep 3
-              if "$app/Contents/MacOS/codctl" page get "$p2_id" --json \
-                > smoke-artifacts/codctl-page-get-p2-after-settle.txt 2>&1; then
-                echo "P2 PASS (JS off by default): the agent page is still open after settling, so the inline scripts auto-submit did not run"
-                cat smoke-artifacts/codctl-page-get-p2-after-settle.txt
+              if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2-after-settle.txt 1; then
+                echo "P2 PASS (JS off by default): after settling the agent page is still open, loaded and titled '$agent_title', so neither the inline script nor the inline onerror handler ran"
               else
-                echo "::error::P2 FAIL: the agent page closed itself (or became unreachable) without --js; the inline script may have run"
+                echo "::error::P2 FAIL: after settling the agent page closed itself, became unreachable or changed its title without --js; page JavaScript may have run"
+                cat smoke-artifacts/codctl-page-get-p2-after-settle.txt 2> /dev/null || true
                 status=1
               fi
+            else
+              echo "::error::P2 FAIL: the agent page never reported state=loaded with title '$agent_title' within 30s"
+              sample_browser p2
+              status=1
             fi
+            cat smoke-artifacts/codctl-page-get-p2.txt 2> /dev/null || true
+            echo
             # -t jpg: the 300 KB total screenshot budget for this round leaves little room for a
             # second full-resolution PNG next to the existing screen.png.
-            screencapture -x -t jpg smoke-artifacts/screen-agent-page.jpg 2> /dev/null \
-              || echo "::warning::P2 screenshot failed"
+            if screencapture -x -t jpg smoke-artifacts/screen-agent-page.jpg 2> /dev/null; then
+              shrink_jpg smoke-artifacts/screen-agent-page.jpg
+            else
+              echo "::warning::P2 screenshot failed"
+            fi
             "$app/Contents/MacOS/codctl" page close "$p2_id" > /dev/null 2>&1 || true
           else
             echo "::error::P2 FAIL: codctl open --html failed"
             cat smoke-artifacts/codctl-open-p2.txt || true
             status=1
           fi
-          echo "P2 GAP: the allowed action (data-cod=submit) returning its value, and the disallowed action (data-cod=erase-everything) being refused, both need a real click dispatched into the page. The Linux e2e test drives that click through cod_e2e_driver, a crate this story does not own and that is not part of this preview build. Not faked here; left for the e2e driver on macOS or a human check."
+
+          # #23 round 6, P2b: the same agent page's actions, through `codctl open --html --wait`
+          # and real key presses (System Events), the same Tab and Enter the Linux e2e test's AC2
+          # uses: Tab from the autofocused field to the disallowed "erase-everything" button and
+          # Enter (refused, logged, the page stays open), then Tab to the allowed "submit" button
+          # and Enter (codctl prints the field's value and exits 0). No new input system: the keys
+          # reach the page the ordinary way, through Cod's window. If this runner does not let
+          # osascript send keystrokes, that is reported as a gap, not faked.
+          echo "== round 6 P2b: agent page actions by keyboard (codctl open --html --wait) =="
+          p2b_out=smoke-artifacts/codctl-open-p2b-wait.txt
+          p2b_log=smoke-artifacts/osascript-p2b.txt
+          : > "$p2b_log"
+          "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" --wait \
+            > "$p2b_out" 2> smoke-artifacts/codctl-open-p2b-wait-stderr.txt &
+          p2b_pid=$!
+          # --wait prints no page id; page ids count up within one Cod session, so this page is
+          # the one after P2's.
+          p2b_id=""
+          case "$p2_id" in
+            page-[0-9] | page-[0-9][0-9] | page-[0-9][0-9][0-9]) p2b_id="page-$(( ${p2_id#page-} + 1 ))" ;;
+          esac
+          send_key() {
+            osascript -e "tell application \"System Events\" to key code $1" >> "$p2b_log" 2>&1
+          }
+          zed_log_now() {
+            find "$data" -iname "Zed.log" 2>/dev/null | head -n 1
+          }
+          if [ -z "$p2b_id" ]; then
+            echo "::error::P2b FAIL: no page id from P2 to derive the --wait page's id from"
+            status=1
+          elif ! poll_page_loaded "$p2b_id" "$agent_title" smoke-artifacts/codctl-page-get-p2b.txt 30; then
+            echo "::error::P2b FAIL: the --wait agent page ($p2b_id) never reported state=loaded with title '$agent_title' within 30s"
+            cat smoke-artifacts/codctl-page-get-p2b.txt 2> /dev/null || true
+            sample_browser p2b
+            status=1
+          elif sleep 2 && ! kill -0 "$p2b_pid" 2>/dev/null; then
+            echo "::error::P2b FAIL: codctl open --html --wait exited before any key was pressed; page JavaScript may have submitted on its own"
+            cat "$p2b_out" || true
+            status=1
+          elif ! osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >> "$p2b_log" 2>&1 \
+            || ! sleep 1 || ! send_key 48 || ! sleep 0.5 || ! send_key 36; then
+            echo "P2b GAP: this runner refused synthetic key presses (osascript/System Events, accessibility permission), so the allowed and the disallowed action could not be triggered here; they need a real click or key press on macOS by QA."
+            cat "$p2b_log"
+          else
+            # Tab, Enter on "erase-everything": refused in Cod and logged, the page stays open.
+            p2b_refused=0
+            for _attempt in $(seq 1 10); do
+              p2b_zed_log=$(zed_log_now)
+              if [ -n "$p2b_zed_log" ] && grep -F "$p2b_id refused the action \"erase-everything\"" "$p2b_zed_log" > smoke-artifacts/p2b-refused.txt 2>/dev/null; then
+                p2b_refused=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_refused" = "1" ] && kill -0 "$p2b_pid" 2>/dev/null; then
+              echo "P2b PASS (disallowed action refused): Cod logged:"
+              cat smoke-artifacts/p2b-refused.txt
+            else
+              echo "::error::P2b FAIL: no refusal of \"erase-everything\" logged for $p2b_id within 10s of Tab, Enter (or codctl --wait exited on it)"
+              status=1
+            fi
+            # Tab, Enter on "submit": codctl prints the field's value and exits 0.
+            send_key 48 && sleep 0.5 && send_key 36 || true
+            p2b_done=0
+            for _attempt in $(seq 1 15); do
+              if ! kill -0 "$p2b_pid" 2>/dev/null; then
+                p2b_done=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_done" = "1" ]; then
+              # `|| ...`: GitHub runs this step with bash -e, so a nonzero wait must not end it.
+              p2b_exit=0
+              wait "$p2b_pid" || p2b_exit=$?
+              p2b_value=$(cat "$p2b_out")
+              if [ "$p2b_exit" = "0" ] && [ "$p2b_value" = "mac-agent-smoke" ]; then
+                echo "P2b PASS (allowed action): codctl open --html --wait exited 0 and printed '$p2b_value'"
+              else
+                echo "::error::P2b FAIL: codctl open --html --wait exited $p2b_exit with '$p2b_value', expected 0 and 'mac-agent-smoke'"
+                status=1
+              fi
+            else
+              echo "::error::P2b FAIL: codctl open --html --wait did not exit within 15s of Tab, Enter on the submit button"
+              status=1
+            fi
+            if [ -n "$(cat "$p2b_log")" ]; then
+              echo "osascript said:"
+              cat "$p2b_log"
+            fi
+          fi
+          if kill -0 "$p2b_pid" 2>/dev/null; then
+            kill "$p2b_pid" 2>/dev/null || true
+          fi
+          if [ -n "$p2b_id" ]; then
+            "$app/Contents/MacOS/codctl" page close "$p2b_id" > /dev/null 2>&1 || true
+          fi
 
           # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
           # loaded page from the P1-round page tab test above.
@@ -681,8 +792,11 @@ jobs:
               status=1
             elif poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-after.txt 30; then
               echo "P4 PASS: the page tab was restored and loaded after the restart, same id $persist_id"
-              screencapture -x -t jpg smoke-artifacts/screen-after-restart.jpg 2> /dev/null \
-                || echo "::warning::P4 screenshot failed"
+              if screencapture -x -t jpg smoke-artifacts/screen-after-restart.jpg 2> /dev/null; then
+                shrink_jpg smoke-artifacts/screen-after-restart.jpg
+              else
+                echo "::warning::P4 screenshot failed"
+              fi
             else
               echo "::error::P4 FAIL: the page was not restored as state=loaded title='Cod Mac restart smoke' within 30s of the relaunch"
               cat smoke-artifacts/codctl-page-get-p4-after.txt 2> /dev/null || true

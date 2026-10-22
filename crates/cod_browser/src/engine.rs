@@ -104,13 +104,27 @@ impl PageState {
         self.out.send(Outgoing::Message(message)).ok();
     }
 
+    /// Runs `run` with this page's host, never while holding the `browser` lock (#23 macOS agent
+    /// page hang): on macOS `handle` runs on CEF's own UI thread, where `close_browser(1)` of a
+    /// windowless browser calls `on_before_close` synchronously, and that locks `browser` itself.
+    /// Holding the (non-reentrant) lock across the call deadlocked the UI thread on the first
+    /// page close, so every later page, agent or not, stayed "loading" forever. On Linux the
+    /// same call only posts a task to CEF's own UI thread, so releasing the lock first changes
+    /// nothing there.
     fn with_host(&self, run: impl FnOnce(&BrowserHost)) {
-        let Ok(slot) = self.browser.lock() else {
-            return;
-        };
-        if let Some(host) = slot.as_ref().and_then(|handle| handle.0.host()) {
+        if let Some(host) = self.browser().and_then(|browser| browser.host()) {
             run(&host);
         }
+    }
+
+    /// A reference to this page's browser, taken out of the `browser` lock, so no CEF call made
+    /// with it can re-enter a callback that needs that same lock (see `with_host`).
+    fn browser(&self) -> Option<Browser> {
+        self.browser
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|handle| handle.0.clone())
     }
 
     fn main_frame(&self) -> Option<Frame> {
@@ -789,6 +803,13 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
             background_color: 0xFFFF_FFFF,
             ..Default::default()
         };
+        // #23 macOS agent page hang: the scheme and length only, never the address itself.
+        #[cfg(target_os = "macos")]
+        eprintln!(
+            "cod-browser: creating page {page} ({} URL, {} bytes)",
+            url.split(':').next().unwrap_or_default(),
+            url.len()
+        );
         let created = browser_host_create_browser(
             Some(&window_info),
             Some(&mut PageClient::new(PageHandler { state })),
@@ -932,19 +953,23 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         }
         ToBrowser::Close { .. } => {
             state.close_requested.store(true, Ordering::Release);
+            // #23 macOS agent page hang: shows in cod-stderr.log whether `on_before_close` ("closed
+            // and freed") ran inside this call, which is what deadlocked when the `browser` lock
+            // was still held here.
+            #[cfg(target_os = "macos")]
+            eprintln!("cod-browser: closing page {page}");
             state.with_host(|host| host.close_browser(1));
+            #[cfg(target_os = "macos")]
+            eprintln!("cod-browser: close_browser for page {page} returned");
         }
         ToBrowser::Navigate { action, .. } => {
-            let Ok(slot) = state.browser.lock() else {
-                return;
-            };
-            let Some(handle) = slot.as_ref() else {
+            let Some(browser) = state.browser() else {
                 return;
             };
             match action {
-                protocol::NAVIGATE_BACK => handle.0.go_back(),
-                protocol::NAVIGATE_FORWARD => handle.0.go_forward(),
-                _ => handle.0.reload(),
+                protocol::NAVIGATE_BACK => browser.go_back(),
+                protocol::NAVIGATE_FORWARD => browser.go_forward(),
+                _ => browser.reload(),
             }
         }
     }
