@@ -32,7 +32,105 @@ static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_os = "macos")]
 static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// Logged once, for the first key event a page gets on macOS (#23 macOS key input), so a smoke
+/// run shows whether key presses reach cod-browser at all. Never the key itself.
+#[cfg(target_os = "macos")]
+static FIRST_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 use protocol::{MAX_URL_BYTES, limited};
+
+/// The macOS virtual key code (`kVK_*`, US ANSI layout) of the key that types `character`, the
+/// character macOS itself puts in that key's events: `\t`, `\r`, 0x7F for backspace, the
+/// `NS*FunctionKey` private-use characters for arrows, Home, End, Page Up and Down, forward
+/// Delete, Insert (Help) and F1 to F12, and printable ASCII, shifted or not. None for anything
+/// else (#23 macOS key input). Only macOS uses it; it is compiled everywhere so its tests run on
+/// every platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_virtual_key(character: u16) -> Option<i32> {
+    let code = match character {
+        0x09 => 0x30,
+        0x0A | 0x0D => 0x24,
+        0x1B => 0x35,
+        0x08 | 0x7F => 0x33,
+        0x20 => 0x31,
+        0xF700 => 0x7E,
+        0xF701 => 0x7D,
+        0xF702 => 0x7B,
+        0xF703 => 0x7C,
+        0xF704 => 0x7A,
+        0xF705 => 0x78,
+        0xF706 => 0x63,
+        0xF707 => 0x76,
+        0xF708 => 0x60,
+        0xF709 => 0x61,
+        0xF70A => 0x62,
+        0xF70B => 0x64,
+        0xF70C => 0x65,
+        0xF70D => 0x6D,
+        0xF70E => 0x67,
+        0xF70F => 0x6F,
+        0xF727 | 0xF746 => 0x72,
+        0xF728 => 0x75,
+        0xF729 => 0x73,
+        0xF72B => 0x77,
+        0xF72C => 0x74,
+        0xF72D => 0x79,
+        _ => {
+            let ch = char::from_u32(u32::from(character))?;
+            match ch.to_ascii_lowercase() {
+                'a' => 0x00,
+                's' => 0x01,
+                'd' => 0x02,
+                'f' => 0x03,
+                'h' => 0x04,
+                'g' => 0x05,
+                'z' => 0x06,
+                'x' => 0x07,
+                'c' => 0x08,
+                'v' => 0x09,
+                'b' => 0x0B,
+                'q' => 0x0C,
+                'w' => 0x0D,
+                'e' => 0x0E,
+                'r' => 0x0F,
+                'y' => 0x10,
+                't' => 0x11,
+                '1' | '!' => 0x12,
+                '2' | '@' => 0x13,
+                '3' | '#' => 0x14,
+                '4' | '$' => 0x15,
+                '6' | '^' => 0x16,
+                '5' | '%' => 0x17,
+                '=' | '+' => 0x18,
+                '9' | '(' => 0x19,
+                '7' | '&' => 0x1A,
+                '-' | '_' => 0x1B,
+                '8' | '*' => 0x1C,
+                '0' | ')' => 0x1D,
+                ']' | '}' => 0x1E,
+                'o' => 0x1F,
+                'u' => 0x20,
+                '[' | '{' => 0x21,
+                'i' => 0x22,
+                'p' => 0x23,
+                'l' => 0x25,
+                'j' => 0x26,
+                '\'' | '"' => 0x27,
+                'k' => 0x28,
+                ';' | ':' => 0x29,
+                '\\' | '|' => 0x2A,
+                ',' | '<' => 0x2B,
+                '/' | '?' => 0x2C,
+                'n' => 0x2D,
+                'm' => 0x2E,
+                '.' | '>' => 0x2F,
+                '`' | '~' => 0x32,
+                _ => return None,
+            }
+        }
+    };
+    Some(code)
+}
 
 /// Whether a console line is forwarded at this pending-console backlog (RC review B5, final
 /// batch): an ordinary diagnostic only below `MAX_PENDING_CONSOLE`, a bridge call
@@ -940,11 +1038,24 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
                 protocol::KEY_CHAR => KeyEventType::CHAR,
                 _ => KeyEventType::RAWKEYDOWN,
             };
+            // CEF on macOS ignores `windows_key_code`: it builds an NSEvent from
+            // `native_key_code`, which must be a macOS virtual key code, and treats an event
+            // with no character at all as a modifier change (#23 macOS key input). Cod sends the
+            // key's own character there on macOS (`offscreen.rs`), so the virtual key code comes
+            // from it; Linux keeps the Windows key code, as before.
+            #[cfg(target_os = "macos")]
+            let native_key_code = mac_virtual_key(character).unwrap_or(code);
+            #[cfg(not(target_os = "macos"))]
+            let native_key_code = code;
+            #[cfg(target_os = "macos")]
+            if !FIRST_KEY_LOGGED.swap(true, Ordering::AcqRel) {
+                eprintln!("cod-browser: first key event forwarded");
+            }
             let event = KeyEvent {
                 type_,
                 modifiers,
                 windows_key_code: code,
-                native_key_code: code,
+                native_key_code,
                 character,
                 unmodified_character: character,
                 ..Default::default()
@@ -1003,6 +1114,33 @@ mod tests {
             &line,
             MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
         ));
+    }
+
+    // #23 macOS key input: CEF on macOS reads the key from `native_key_code` alone, so Tab and
+    // Enter in a page (the agent page's Tab, Enter submit) need macOS's own key codes, not the
+    // Windows ones Cod sends as `code` (0x09 is kVK_ANSI_V there, 0x0D kVK_ANSI_W).
+    #[test]
+    fn named_keys_get_their_macos_virtual_key_codes() {
+        assert_eq!(mac_virtual_key(u16::from(b'\t')), Some(0x30));
+        assert_eq!(mac_virtual_key(u16::from(b'\r')), Some(0x24));
+        assert_eq!(mac_virtual_key(0x7F), Some(0x33));
+        assert_eq!(mac_virtual_key(0x1B), Some(0x35));
+        assert_eq!(mac_virtual_key(0xF702), Some(0x7B));
+        assert_eq!(mac_virtual_key(0xF728), Some(0x75));
+        assert_eq!(mac_virtual_key(0xF704), Some(0x7A));
+    }
+
+    // Letters, digits and punctuation map by the key that types them, shifted or not, so a key
+    // whose Windows code collides with a named key ('.' and Delete are both 0x2E) stays itself.
+    #[test]
+    fn printable_characters_map_to_the_key_that_types_them() {
+        assert_eq!(mac_virtual_key(u16::from(b'a')), Some(0x00));
+        assert_eq!(mac_virtual_key(u16::from(b'A')), Some(0x00));
+        assert_eq!(mac_virtual_key(u16::from(b'.')), Some(0x2F));
+        assert_eq!(mac_virtual_key(u16::from(b'!')), Some(0x12));
+        assert_eq!(mac_virtual_key(u16::from(b'\'')), Some(0x27));
+        assert_eq!(mac_virtual_key(0), None);
+        assert_eq!(mac_virtual_key(0x00E9), None);
     }
 
     #[test]
