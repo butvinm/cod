@@ -743,9 +743,13 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step("start Cod with a fresh profile and open five more default workspaces"):
             self.start_cod(None)
             self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
-            for _ in range(5):
+            for expected_count in range(2, 7):
                 self.click_add_button(self.state())
-            state = self.wait_for(lambda state: state["workspace_count"] == 6, SHOW_TIMEOUT, "six workspaces")
+                state = self.wait_for(
+                    lambda state, expected_count=expected_count: state["workspace_count"] == expected_count,
+                    SHOW_TIMEOUT,
+                    f"{expected_count} workspaces",
+                )
 
         with self.step("every tab, its close button and + stay inside the 640 px title bar"):
             bar = title_bar(state)
