@@ -36,6 +36,7 @@ pub struct CodTabsState {
     focus: HashMap<ElementId, (FocusHandle, FocusHandle)>,
     revealed: Option<(ElementId, Pixels, usize)>,
     viewport_width: Rc<Cell<Option<Pixels>>>,
+    content_width: Rc<Cell<Option<Pixels>>>,
 }
 
 /// One tab as it was last drawn, for the end-to-end driver.
@@ -503,8 +504,16 @@ pub fn render_cod_workspace_tabs(
     let drawn_scroll = state.scroll.clone();
     let resized_scroll = state.scroll.clone();
     let viewport_width = state.viewport_width.clone();
+    let content_width = state.content_width.clone();
+    // An auto-sized scroll container under nested shrinkable rows can report less than its
+    // children's natural width. Request that width explicitly, keeping shrink enabled so a
+    // crowded bar still reserves the adjacent plus and scrolls only the tabs.
+    let preferred_width = content_width
+        .get()
+        .unwrap_or(px(member_count as f32 * COD_TAB_MAX_WIDTH));
     h_flex()
         .min_w_0()
+        .w(preferred_width + px(36.))
         .h_full()
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
@@ -525,17 +534,23 @@ pub fn render_cod_workspace_tabs(
         .child(
             h_flex()
                 .min_w_0()
+                .flex_1()
                 .h_full()
                 .items_end()
-                .on_children_prepainted(move |_, _window, _cx| {
+                .on_children_prepainted(move |_, window, _cx| {
                     // Tracked scroll containers keep child bounds on their handle instead of
                     // passing them to this callback. Include the painted scroll offset.
                     let offset = drawn_scroll.offset();
+                    let mut width = px(0.);
                     for (index, tab) in tab_layout.borrow_mut().tabs.iter_mut().enumerate() {
                         tab.bounds = drawn_scroll.bounds_for_item(index).map(|mut bounds| {
+                            width += bounds.size.width;
                             bounds.origin += offset;
                             bounds
                         });
+                    }
+                    if content_width.replace(Some(width)) != Some(width) {
+                        window.refresh();
                     }
                 })
                 .id("cod-workspace-tabs-scroll")

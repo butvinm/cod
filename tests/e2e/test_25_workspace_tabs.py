@@ -462,6 +462,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             for index, tab in enumerate(tabs):
                 self.expect_equal(f"tab {index} truncated", False, tab["truncated"])
                 self.expect_equal(f"tab {index} tooltip matches its name", tab["name"], tab["tooltip"])
+                self.assert_tab_controls_in_view(state, index)
 
         with self.step("open a third workspace with +: three distinct default names, none cut"):
             self.click_add_button(state)
@@ -471,6 +472,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             tabs = title_bar(state)["tabs"]
             for index, tab in enumerate(tabs):
                 self.expect_equal(f"tab {index} truncated", False, tab["truncated"])
+                self.assert_tab_controls_in_view(state, index)
 
         with self.step("the overview (#26) lists the same three distinct names"):
             self.keys("ctrl-alt-o")
@@ -521,6 +523,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
         with self.step(f"check neither tab is squeezed under its own {TAB_MAX_WIDTH} px max width"):
             for index, tab in enumerate(tabs):
+                self.assert_tab_controls_in_view(state, index)
                 width = tab["bounds"]["width"]
                 if abs(width - TAB_MAX_WIDTH) > 1:
                     raise AssertionError(
