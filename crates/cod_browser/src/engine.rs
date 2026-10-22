@@ -463,13 +463,27 @@ fn switch_value(prefix: &str) -> Option<String> {
 /// including `api_hash` (#23 round 1). `cef::library_loader::LibraryLoader` resolves the
 /// framework relative to the running executable's own location inside the app bundle: `../
 /// Frameworks` for the main `cod-browser` executable (`Contents/MacOS/cod-browser`), or `../../..`
-/// for a copy running from the nested helper bundle this module places at
-/// `helper_subprocess_path()` (see `script/bundle-cod-mac`). Keeping the returned loader alive for
-/// the rest of `main` matches every CEF Rust example (it unloads the framework on drop).
+/// for a copy running from one of the nested helper bundles this module points at
+/// (`helper_subprocess_path()`, see `script/bundle-cod-mac`). Keeping the returned loader alive
+/// for the rest of `main` matches every CEF Rust example (it unloads the framework on drop).
+///
+/// `is_helper` matches every "Cod Helper*" name (#23 round 4), not only the plain "Cod Helper":
+/// round 3 shipped only that one bundle and saw CEF start, create the browser and then make no
+/// further progress at all (no frame ever painted, no network request until the helper was
+/// killed). Chromium's macOS child-process launching derives a per-process-type executable path
+/// from `Settings::browser_subprocess_path` by inserting " (Type)" before ".app" and before the
+/// final path component whenever that path already looks like it points inside a nested app
+/// bundle, which it does here; it looks for that derived path on its own regardless of what this
+/// module points at, so the renderer, GPU, plugin and alerts process types all failed to launch
+/// (round 4's diagnosis). `script/bundle-cod-mac` now bundles all five names (plain, GPU,
+/// Renderer, Plugin, Alerts), so every one of them needs this same relative-path resolution.
 #[cfg(target_os = "macos")]
 fn load_framework() -> cef::library_loader::LibraryLoader {
     let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
-    let is_helper = exe.file_name().is_some_and(|name| name == "Cod Helper");
+    let is_helper = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("Cod Helper"));
     let loader = cef::library_loader::LibraryLoader::new(&exe, is_helper);
     if !loader.load() {
         eprintln!("cod-browser: cannot load the CEF framework next to {}", exe.display());
@@ -479,11 +493,11 @@ fn load_framework() -> cef::library_loader::LibraryLoader {
 }
 
 /// Where CEF should re-launch this same helper for its renderer, GPU and utility subprocesses on
-/// macOS (#23 round 1). Chromium's macOS convention is four differently-entitled helper bundles
-/// (plain, GPU, Renderer, Plugin) for the App Store sandbox; Cod's preview is ad-hoc signed and
-/// already passes `--no-sandbox`, so one helper bundles every subprocess type here, pointed at
-/// explicitly through `Settings::browser_subprocess_path` instead of CEF's automatic per-type
-/// naming (which would otherwise look for "Cod Helper (GPU).app" and so on next to this one).
+/// macOS (#23 round 1). This only needs to name the plain "Cod Helper.app": Chromium derives the
+/// four other process-type variants (GPU, Renderer, Plugin, Alerts) from this same path on its
+/// own, inserting " (Type)" before ".app" and before the final path component (see
+/// `load_framework`'s doc comment, round 4 diagnosis); `script/bundle-cod-mac` bundles all five
+/// names so every one of those derived paths actually exists.
 #[cfg(target_os = "macos")]
 fn helper_subprocess_path() -> std::path::PathBuf {
     let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
@@ -550,12 +564,20 @@ pub fn main() {
     let pages: Pages = Arc::new(Mutex::new(HashMap::new()));
 
     let started = Instant::now();
+    // COD_BROWSER_LOG_VERBOSE=1 (#23 round 4 diagnosis H1) raises CEF's own log (cef.log) to
+    // verbose for a smoke run or a manual repro, without changing the production default.
+    let log_severity = if std::env::var("COD_BROWSER_LOG_VERBOSE").is_ok_and(|value| value == "1")
+    {
+        LogSeverity::VERBOSE
+    } else {
+        LogSeverity::WARNING
+    };
     let mut settings = Settings {
         windowless_rendering_enabled: 1,
         no_sandbox: 1,
         root_cache_path: CefString::from(cache.as_str()),
         log_file: CefString::from(format!("{cache}/cef.log").as_str()),
-        log_severity: LogSeverity::WARNING,
+        log_severity,
         ..Default::default()
     };
     // Only Windows and Linux support `multi_threaded_message_loop` (CEF spins its own UI thread);

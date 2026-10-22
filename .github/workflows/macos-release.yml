@@ -147,15 +147,24 @@ jobs:
           echo "== codesign --verify =="
           codesign --verify --deep --strict --verbose=2 "$app"
 
-          echo "== CEF framework and helper bundle are in place (#23 round 1) =="
+          # Round 4 diagnosis H3: Chromium derives each subprocess type's own helper path from
+          # Settings::browser_subprocess_path by inserting " (Type)" before ".app" and before the
+          # final path component, regardless of what that path actually names; round 3 shipped
+          # only the plain "Cod Helper.app" and no page ever painted or finished loading, because
+          # every renderer/GPU/plugin/alerts launch silently failed. All five now have to exist.
+          echo "== CEF framework and all five helper bundles are in place (#23 round 1/4) =="
           framework="$app/Contents/Frameworks/Chromium Embedded Framework.framework"
-          helper="$app/Contents/Frameworks/Cod Helper.app/Contents/MacOS/Cod Helper"
           test -d "$framework" || { echo "::error::no CEF framework at $framework"; exit 1; }
-          test -x "$helper" || { echo "::error::no Cod Helper executable at $helper"; exit 1; }
+          helpers=()
+          for variant_suffix in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+            helper="$app/Contents/Frameworks/Cod Helper$variant_suffix.app/Contents/MacOS/Cod Helper$variant_suffix"
+            test -x "$helper" || { echo "::error::no helper executable at $helper"; exit 1; }
+            helpers+=("$helper")
+          done
 
           echo "== file: arch must be arm64 =="
           for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
-            "$app/Contents/MacOS/cod-browser" "$helper"; do
+            "$app/Contents/MacOS/cod-browser" "${helpers[@]}"; do
             file "$bin"
             file "$bin" | grep -q "arm64" || {
               echo "::error::$bin is not an arm64 binary"
@@ -169,7 +178,7 @@ jobs:
           # (#23 round 1, P3).
           echo "== otool -L: only /System/, /usr/lib/, and the bundled CEF framework =="
           for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
-            "$app/Contents/MacOS/cod-browser" "$helper"; do
+            "$app/Contents/MacOS/cod-browser" "${helpers[@]}"; do
             echo "-- $bin --"
             otool -L "$bin"
             other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
@@ -289,8 +298,12 @@ jobs:
           data=$(mktemp -d)/cod-preview-smoke
           mkdir -p "$data"
           if open --help 2>&1 | grep -q -- '--env'; then
-            echo "Launching with open -n --env COD_PREVIEW_DIR=$data"
-            open -n --env "COD_PREVIEW_DIR=$data" "$app"
+            # COD_BROWSER_LOG_VERBOSE=1 (round 4 diagnosis H1): raises cod-browser's own CEF log
+            # (cef.log) to verbose for this smoke run only; engine.rs keeps the production default
+            # (WARNING) otherwise. Cod's own child processes, including cod-browser, inherit this
+            # the ordinary way (Rust's Command inherits the parent's environment by default).
+            echo "Launching with open -n --env COD_PREVIEW_DIR=$data --env COD_BROWSER_LOG_VERBOSE=1"
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
           else
             echo "::warning::this runner's open(1) has no --env option; Cod will use its default data directory instead of the temporary one made for this smoke test"
             data="$HOME/Library/Application Support/Cod-preview"
@@ -356,10 +369,18 @@ jobs:
           fi
 
           # #23 round 1, P4: a real page tab, end to end, through the ported off-screen CEF
-          # backend. The fixture is invented data served locally (no captured real page, per the
-          # public-repo rule), with a distinct title so the read-back cannot be confused with a
-          # stale or unrelated page.
-          echo "== page tab: serve a local fixture =="
+          # backend. The fixture is invented data (no captured real page, per the public-repo
+          # rule), with a distinct title so the read-back cannot be confused with a stale or
+          # unrelated page.
+          #
+          # Round 4 diagnosis H2: opened as a file:// URL, not served over HTTP. python3 -m
+          # http.server, even bound to 127.0.0.1 only (round 2's own fix), still made macOS ask
+          # "Allow Python to find devices on local networks?" in round 3's screenshot, a dialog
+          # that has nothing to do with page tabs; file:// removes that python process entirely.
+          # codctl open's own CLI parsing already treats anything containing "://" as a URL (not a
+          # file path to open as a Zed editor tab), and page_control::open passes it to CEF
+          # unvalidated, the same as any other scheme.
+          echo "== page tab: write a local fixture =="
           fixture_dir=$(mktemp -d)
           printf '%s\n' \
             '<!DOCTYPE html>' \
@@ -368,18 +389,11 @@ jobs:
             '<body><h1>Cod Mac page smoke</h1></body>' \
             '</html>' \
             > "$fixture_dir/index.html"
-          fixture_port=8934
-          # --bind 127.0.0.1: round 2 diagnosis Q1. Bound to all interfaces, the previous round's
-          # server made macOS ask "Allow Python to find devices on local networks?", a dialog that
-          # has nothing to do with this smoke test and that nothing here answers.
-          python3 -m http.server "$fixture_port" --bind 127.0.0.1 --directory "$fixture_dir" \
-            > smoke-artifacts/fixture-server.log 2>&1 &
-          fixture_server_pid=$!
-          sleep 1
+          fixture_url="file://$fixture_dir/index.html"
 
           echo "== page tab: codctl open =="
           page_id=""
-          if "$app/Contents/MacOS/codctl" open "http://127.0.0.1:$fixture_port/index.html" \
+          if "$app/Contents/MacOS/codctl" open "$fixture_url" \
             > smoke-artifacts/codctl-open.txt 2>&1; then
             page_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open.txt)
             echo "codctl open reported page id: $page_id"
@@ -392,6 +406,16 @@ jobs:
             echo "::error::codctl open printed no page id"
             status=1
           fi
+
+          # Round 4 diagnosis H1: a snapshot of cod-browser's and every "Cod Helper" process at
+          # 5s and 20s after codctl open, evidence for whether the renderer/GPU/plugin/alerts
+          # subprocesses actually started (round 4's own fix, H3, bundles all five helper names).
+          snapshot_helpers() {
+            ps -axo pid,ppid,etime,command | grep -iE 'cod-browser|Cod Helper' | grep -v grep \
+              > "smoke-artifacts/ps-${1}s.txt" || echo "(no matching process)" > "smoke-artifacts/ps-${1}s.txt"
+            echo "-- ps at ${1}s --"
+            cat "smoke-artifacts/ps-${1}s.txt"
+          }
 
           # Round 2 diagnosis Q1: round 1's smoke test read the page back once, a few seconds
           # after opening it, while it still said state "loading" (and passed anyway, because it
@@ -409,12 +433,17 @@ jobs:
                 title=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('title') or '')" 2> /dev/null || echo "")
                 if [ "$state" = "loaded" ] && [ "$title" = "Cod Mac page smoke" ]; then
                   loaded=1
+                  snapshot_helpers "$_attempt"
                   break
                 fi
                 if [ "$state" = "failed" ]; then
                   echo "codctl page get reported state=failed, not waiting out the rest of the 30s"
+                  snapshot_helpers "$_attempt"
                   break
                 fi
+              fi
+              if [ "$_attempt" = "5" ] || [ "$_attempt" = "20" ]; then
+                snapshot_helpers "$_attempt"
               fi
               sleep 1
             done
@@ -447,7 +476,6 @@ jobs:
             kill -9 "$pid" 2>/dev/null || true
           fi
           kill "$fake_zed_pid" 2>/dev/null || true
-          kill "$fixture_server_pid" 2>/dev/null || true
 
           cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
             || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
@@ -456,8 +484,13 @@ jobs:
           # Settings::log_file to <cache>/cef.log the same way on every platform, cache being
           # data_dir.join("cef"), i.e. $data/cef/cef.log here) was never collected before, so any
           # CEF-side CHECK/DCHECK or renderer-launch failure never reached the uploaded artifacts.
-          cp "$data/cef/cef.log" smoke-artifacts/cef.log 2>/dev/null \
-            || echo "no cef.log was written" > smoke-artifacts/cef.log
+          # Round 4 diagnosis H1 raises it to verbose (COD_BROWSER_LOG_VERBOSE=1 above) for this
+          # run; capped at 2 MB (tail, the most recent lines) in case verbose logging makes it large.
+          if [ -f "$data/cef/cef.log" ]; then
+            tail -c 2000000 "$data/cef/cef.log" > smoke-artifacts/cef.log
+          else
+            echo "no cef.log was written" > smoke-artifacts/cef.log
+          fi
 
           # Round 2 diagnosis Q2: a crash report for cod-browser or its "Cod Helper" subprocess
           # bundle, created after this run's launch, with its full content (unlike the zed/cod/
@@ -477,7 +510,7 @@ jobs:
                 status=1
               fi
             done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
-              \( -iname 'cod-browser-*' -o -iname 'Cod Helper-*' \) -print0 2>/dev/null)
+              \( -iname 'cod-browser-*' -o -iname 'Cod Helper*' \) -print0 2>/dev/null)
             [ "$found" = 1 ] || echo "none"
           else
             echo "none (no DiagnosticReports directory)"

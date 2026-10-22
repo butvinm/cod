@@ -136,19 +136,31 @@ strip -x "$app_path/Contents/MacOS/zed" "$app_path/Contents/MacOS/codctl"
 # *.pak, locales), unlike Linux where those are loose files next to libcef.so, so nothing else
 # needs to be copied for CEF to find them.
 #
-# One helper app bundle ("Cod Helper.app", a second copy of the same cod-browser binary, renamed)
-# stands in for every CEF subprocess type (renderer, GPU, utility). Upstream CEF samples ship four
-# differently-entitled helper bundles (plain, GPU, Renderer, Plugin) for Apple's App Store sandbox;
-# Cod's ad-hoc-signed preview already runs CEF with --no-sandbox (crates/cod_browser/src/engine.rs),
-# so `Settings::browser_subprocess_path` points every subprocess type at this one helper instead of
-# CEF's automatic per-type bundle names, which this script does not need to produce.
+# Five helper app bundles, each a copy of the same cod-browser binary renamed to its own variant
+# name: Chromium's macOS process-launching code (chrome/browser/.../mac/ in the Chromium source
+# cef-rs builds against) derives a child process's executable path from the *name* of the main
+# helper by inserting " (Type)" before ".app" and before the final path component, whenever that
+# name looks like it already points inside a nested app bundle (as `Settings::browser_subprocess_path`
+# does here, see crates/cod_browser/src/engine.rs's `helper_subprocess_path`) - it does not matter
+# that Cod itself only ever points at the plain "Cod Helper"; Chromium still looks for the suffixed
+# variant on its own for the renderer, GPU, plugin and (notification) alerts process types. Round 3
+# shipped only the plain "Cod Helper.app" and saw CEF start, create the browser, and then make no
+# further progress at all (no frame ever painted, no network request until the helper was killed):
+# exactly what happens when every one of those subprocess types fails to launch. Cod's ad-hoc-signed
+# preview already runs CEF with --no-sandbox (crates/cod_browser/src/engine.rs), so none of the five
+# needs its own sandbox entitlements, unlike the official CEF/Chromium release builds that ship these
+# same five names.
 if [ "$bundle_pages" = 1 ]; then
 	cp "$cod_browser_bin" "$app_path/Contents/MacOS/cod-browser"
 	strip -x "$app_path/Contents/MacOS/cod-browser"
 
-	helper_app="$app_path/Contents/Frameworks/Cod Helper.app"
-	mkdir -p "$helper_app/Contents/MacOS"
-	cat > "$helper_app/Contents/Info.plist" <<PLIST
+	make_helper_bundle() {
+		variant_suffix=$1   # "", " (GPU)", " (Renderer)", " (Plugin)" or " (Alerts)"
+		identifier_suffix=$2 # "", ".gpu", ".renderer", ".plugin" or ".alerts"
+		name="Cod Helper$variant_suffix"
+		helper_app="$app_path/Contents/Frameworks/$name.app"
+		mkdir -p "$helper_app/Contents/MacOS"
+		cat > "$helper_app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -156,13 +168,13 @@ if [ "$bundle_pages" = 1 ]; then
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Cod Helper</string>
+	<string>$name</string>
 	<key>CFBundleIdentifier</key>
-	<string>io.github.cod-editor.cod-preview.helper</string>
+	<string>io.github.cod-editor.cod-preview.helper$identifier_suffix</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>Cod Helper</string>
+	<string>$name</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -176,8 +188,14 @@ if [ "$bundle_pages" = 1 ]; then
 </dict>
 </plist>
 PLIST
-	cp "$cod_browser_bin" "$helper_app/Contents/MacOS/Cod Helper"
-	strip -x "$helper_app/Contents/MacOS/Cod Helper"
+		cp "$cod_browser_bin" "$helper_app/Contents/MacOS/$name"
+		strip -x "$helper_app/Contents/MacOS/$name"
+	}
+	make_helper_bundle "" ""
+	make_helper_bundle " (GPU)" ".gpu"
+	make_helper_bundle " (Renderer)" ".renderer"
+	make_helper_bundle " (Plugin)" ".plugin"
+	make_helper_bundle " (Alerts)" ".alerts"
 
 	# ditto (not cp -R) preserves the framework's internal versioned symlinks
 	# (Versions/Current -> Versions/A, and so on), which a plain recursive copy would instead
@@ -209,12 +227,14 @@ chmod +x "$app_path/Contents/MacOS/cod"
 printf '%s\n' "$commit" > "$app_path/Contents/Resources/cod-commit.txt"
 
 # --- Ad-hoc signature (no certificate: Code signing and notarization are out of scope, #23) ----
-# Signed inside-out: the CEF framework and the helper bundle it is nested under first (codesign
+# Signed inside-out: the CEF framework and every helper bundle nested under it first (codesign
 # refuses to sign an outer bundle whose nested code is unsigned), then the whole of Cod.app last,
 # which also covers zed, codctl and cod-browser in Contents/MacOS.
 if [ "$bundle_pages" = 1 ]; then
 	codesign --force --sign - "$app_path/Contents/Frameworks/Chromium Embedded Framework.framework"
-	codesign --force --sign - "$app_path/Contents/Frameworks/Cod Helper.app"
+	for variant_suffix in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+		codesign --force --sign - "$app_path/Contents/Frameworks/Cod Helper$variant_suffix.app"
+	done
 fi
 codesign --force --deep --sign - "$app_path"
 
