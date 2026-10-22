@@ -120,6 +120,8 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
             json!({
                 "name": tab.name,
                 "active": tab.active,
+                "focused": tab.focused,
+                "close_focused": tab.close_focused,
                 // Review #25/#26: the dot's color and pulsing come from what the title bar
                 // actually prepainted and animated in the last frame, not from the workspace's
                 // status (crates/title_bar/src/cod_workspace_tabs.rs::status_dot).
@@ -137,6 +139,7 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
         .collect();
     json!({
         "tabs": tabs,
+        "tabs_viewport": bounds_json(layout.tabs_viewport),
         "add_button": { "bounds": bounds_json(layout.add_button) },
         "items": title_bar.cod_visible_items(cx),
     })

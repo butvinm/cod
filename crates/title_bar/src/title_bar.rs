@@ -7,7 +7,7 @@ mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
-use crate::cod_workspace_tabs::{CodTabsLayout, render_cod_workspace_tabs};
+use crate::cod_workspace_tabs::{CodTabsLayout, CodTabsState, render_cod_workspace_tabs};
 use std::{cell::RefCell, rc::Rc};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
@@ -217,6 +217,7 @@ pub struct TitleBar {
     _diagnostics_subscription: Option<gpui::Subscription>,
     /// Cod (#25): the workspace tabs as they were last drawn.
     cod_tabs: Rc<RefCell<CodTabsLayout>>,
+    cod_tabs_state: CodTabsState,
 }
 
 impl Render for TitleBar {
@@ -310,10 +311,8 @@ impl Render for TitleBar {
 
         let cod_tabs = self.render_cod_tabs(window, cx);
         children.push(
-            // #77 F1: no `min_w_0` here (see cod_workspace_tabs.rs): this group reports its
-            // natural width to the title bar's three-group row; only the tabs shrink, each to
-            // its own cap, once the bar is full (C4).
             h_flex()
+                .min_w_0()
                 .h_full()
                 .gap_0p5()
                 .map(|title_bar| {
@@ -551,6 +550,7 @@ impl TitleBar {
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
             cod_tabs: Rc::default(),
+            cod_tabs_state: CodTabsState::default(),
         };
 
         this.observe_diagnostics(cx);
@@ -565,6 +565,7 @@ impl TitleBar {
         Some(render_cod_workspace_tabs(
             &multi_workspace,
             self.cod_tabs.clone(),
+            &mut self.cod_tabs_state,
             window,
             cx,
         ))
