@@ -4,13 +4,13 @@
 //! `saved` lists the saved page rows (page ID and URL), including those of workspaces not loaded yet.
 //! `prompt` is the "web: open url" prompt: its text and its error, or null while it is closed.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use gpui::Entity;
 use gpui::{App, Window};
 use serde_json::Value;
 use workspace::MultiWorkspace;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn state(multi: &MultiWorkspace, window: &Window, cx: &App) -> Value {
     use gpui::Focusable as _;
     use serde_json::json;
@@ -94,7 +94,7 @@ pub(crate) fn state(multi: &MultiWorkspace, window: &Window, cx: &App) -> Value 
 }
 
 /// The workspace's center panes in layout order, the same order as the driver's `panes`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ordered_panes(workspace: &workspace::Workspace) -> Vec<Entity<workspace::Pane>> {
     let panes = workspace.panes();
     let rects: Option<Vec<crate::Rect>> = panes
@@ -115,7 +115,7 @@ fn ordered_panes(workspace: &workspace::Workspace) -> Vec<Entity<workspace::Pane
     order.into_iter().map(|index| panes[index].clone()).collect()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn state(
     _multi: &MultiWorkspace,
     _window: &Window,

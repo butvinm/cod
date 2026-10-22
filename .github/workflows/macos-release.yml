@@ -306,13 +306,16 @@ jobs:
           # default data folder, and says so, if this runner's open(1) predates --env.
           data=$(mktemp -d)/cod-preview-smoke
           mkdir -p "$data"
+          driver_dir=$(mktemp -d /tmp/cod-mac-XXXXXX)
+          python3 tests/e2e/macos_candidate_smoke.py prepare "$data"
           if open --help 2>&1 | grep -q -- '--env'; then
             # COD_BROWSER_LOG_VERBOSE=1 (round 4 diagnosis H1): raises cod-browser's own CEF log
             # (cef.log) to verbose for this smoke run only; engine.rs keeps the production default
             # (WARNING) otherwise. Cod's own child processes, including cod-browser, inherit this
             # the ordinary way (Rust's Command inherits the parent's environment by default).
             echo "Launching with open -n --env COD_PREVIEW_DIR=$data --env COD_BROWSER_LOG_VERBOSE=1"
-            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
+              --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" --args "$data/project"
           else
             echo "::warning::this runner's open(1) has no --env option; Cod will use its default data directory instead of the temporary one made for this smoke test"
             data="$HOME/Library/Application Support/Cod-preview"
@@ -701,6 +704,16 @@ jobs:
             "$app/Contents/MacOS/codctl" page close "$p2b_id" > /dev/null 2>&1 || true
           fi
 
+          # The shared driver uses native GPUI input, while System Events above is OS input.
+          # Exercise missing paths on this same extracted signed app, before restart.
+          if ! COD_PREVIEW_DIR="$data" python3 tests/e2e/macos_candidate_smoke.py exercise \
+            "$data" "$driver_dir/driver.sock" "$app/Contents/MacOS/codctl" smoke-artifacts \
+            > smoke-artifacts/mac-candidate-smoke.log 2>&1; then
+            echo "::error::Mac candidate input/history/file/chat workflow failed"
+            status=1
+          fi
+          cat smoke-artifacts/mac-candidate-smoke.log
+
           # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
           # loaded page from the P1-round page tab test above.
           echo "== round 5 P3: codctl parity (reload, back, forward, close) =="
@@ -804,13 +817,8 @@ jobs:
             fi
           fi
 
-          # #23 round 5, P5: link-from-chat (#32) needs an actual chat message with a rendered
-          # link, clicked, which (like P2's and P3's click-dependent parts) needs cod_e2e_driver;
-          # there is no non-interactive codctl path that exercises CodPageOpener/the chat-link
-          # wiring itself (codctl open of a plain URL only re-tests what P1 already covers, the
-          # offscreen backend's own open path, not the chat-to-page wiring). Not attempted here;
-          # left for the e2e driver on macOS or a human check.
-          echo "P5 GAP: link-from-chat (#32) needs a real chat message and a click (cod_e2e_driver); left for the e2e driver on macOS or a human check."
+          # Chat/file links, typed input and real in-page history were exercised above by
+          # macos_candidate_smoke.py with readouts and representative full-screen captures.
 
           if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
@@ -913,4 +921,4 @@ jobs:
             --prerelease \
             --target "$GITHUB_SHA" \
             --title "$tag (macOS, Apple Silicon, unsigned)" \
-            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Page tabs use the same off-screen CEF backend as Linux (round 1: opening a plain URL); agent-made HTML pages and the bridge are not ported yet."
+            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Page tabs and restricted agent-made HTML pages use the same off-screen CEF backend as Linux."

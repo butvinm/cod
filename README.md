@@ -39,7 +39,7 @@ Both start scripts keep its settings and data in `~/.local/share/cod-preview`, s
 
 ## macOS (Apple Silicon) preview
 
-The macOS preview is unsigned (ad-hoc signature only, no Apple Developer certificate: code signing and notarization cost money and are a separate decision) and built for Apple Silicon only (no Intel build). Web page tabs and agent-made pages (`codctl open --html`) are Linux-only for now; on macOS the system web view they need is not wired up yet.
+The macOS preview is unsigned (ad-hoc signature only, no Apple Developer certificate: code signing and notarization cost money and are a separate decision) and built for Apple Silicon only (no Intel build). The current candidate includes web page tabs and agent-made pages (`codctl open --html`) through the same off-screen browser backend as Linux. Native package acceptance is still required before a new preview is offered for use.
 
 1. Download `cod-macos-aarch64.zip` from the latest macOS preview prerelease on the [Releases](https://github.com/cod-editor/cod/releases) page (a release titled like `macos-preview-N (macOS, Apple Silicon, unsigned)`).
 2. Unzip it and move `Cod.app` to `/Applications`.
