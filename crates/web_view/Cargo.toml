@@ -62,13 +62,19 @@ objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 wry.workspace = true
 
+# image, paths and smallvec are used by the off-screen page-tab backend (offscreen.rs,
+# offscreen_driver.rs), which is widened to macOS too (issue #23 round 1): both platforms need
+# them, so they moved out of the Linux-only table below (build error on macOS otherwise: E0432/
+# E0433 unresolved import/cannot find crate, from the macOS run of #23 round 1's first push).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+image.workspace = true
+paths.workspace = true
+smallvec.workspace = true
+
 # WebKitGTK in an X11 child window. The versions match what wry 0.57 uses.
 [target.'cfg(target_os = "linux")'.dependencies]
 gdkx11 = "0.18"
 gtk = "0.18"
-image.workspace = true
-paths.workspace = true
-smallvec.workspace = true
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { workspace = true, features = ["os-webview"] }
 x11-dl = "2.21"

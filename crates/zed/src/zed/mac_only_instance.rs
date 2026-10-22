@@ -14,6 +14,24 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(10);
 const RECEIVE_TIMEOUT: Duration = Duration::from_millis(35);
 const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 const USER_BLOCK: u16 = 100;
+// Upstream Zed's four channels use 43737, 43837, 43937 and 44037 as their port base (plus the
+// per-user offset below), so stock Zed, in any channel, never listens here. A Mac can have a
+// stock Zed installed next to Cod (#23 AC-R2: a Cod build must never mistake a running stock
+// Zed, or the other way around, for another instance of itself); the two must not share a port
+// for the same user, whatever channel either happens to report itself as.
+const COD_PORT_BASE: u16 = 44737;
+
+fn port_base() -> u16 {
+    // Cod ships as a single preview channel today, but the per-channel spacing is kept (not
+    // collapsed to one constant) so a later Cod dev/nightly build still gets its own port,
+    // the same way upstream Zed separates its channels.
+    match *release_channel::RELEASE_CHANNEL {
+        ReleaseChannel::Dev => COD_PORT_BASE,
+        ReleaseChannel::Preview => COD_PORT_BASE + USER_BLOCK,
+        ReleaseChannel::Stable => COD_PORT_BASE + (2 * USER_BLOCK),
+        ReleaseChannel::Nightly => COD_PORT_BASE + (3 * USER_BLOCK),
+    }
+}
 
 fn address() -> SocketAddr {
     // These port numbers are offset by the user ID to avoid conflicts between
@@ -21,19 +39,7 @@ fn address() -> SocketAddr {
     // release channel are spaced out by 100 to avoid conflicts between different
     // users running different release channels on the same machine. This ends up
     // interleaving the ports between different users and different release channels.
-    //
-    // On macOS user IDs start at 501 and on Linux they start at 1000. The first user
-    // on a Mac with ID 501 running a dev channel build will use port 44238, and the
-    // second user with ID 502 will use port 44239, and so on. User 501 will use ports
-    // 44338, 44438, and 44538 for the preview, stable, and nightly channels,
-    // respectively. User 502 will use ports 44339, 44439, and 44539 for the preview,
-    // stable, and nightly channels, respectively.
-    let port = match *release_channel::RELEASE_CHANNEL {
-        ReleaseChannel::Dev => 43737,
-        ReleaseChannel::Preview => 43737 + USER_BLOCK,
-        ReleaseChannel::Stable => 43737 + (2 * USER_BLOCK),
-        ReleaseChannel::Nightly => 43737 + (3 * USER_BLOCK),
-    };
+    let port = port_base();
     let mut user_port = port;
     let mut sys = System::new_all();
     sys.refresh_all();
@@ -70,12 +76,14 @@ fn get_uid_as_u32(uid: &sysinfo::Uid) -> u32 {
         .unwrap_or(0)
 }
 
+// "Cod", not "Zed Editor": a stock Zed's identical handshake text (over a different port,
+// see COD_PORT_BASE above) must never be mistaken for Cod's own, or the other way around.
 fn instance_handshake() -> &'static str {
     match *release_channel::RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed Editor Dev Instance Running",
-        ReleaseChannel::Nightly => "Zed Editor Nightly Instance Running",
-        ReleaseChannel::Preview => "Zed Editor Preview Instance Running",
-        ReleaseChannel::Stable => "Zed Editor Stable Instance Running",
+        ReleaseChannel::Dev => "Cod Dev Instance Running",
+        ReleaseChannel::Nightly => "Cod Nightly Instance Running",
+        ReleaseChannel::Preview => "Cod Preview Instance Running",
+        ReleaseChannel::Stable => "Cod Stable Instance Running",
     }
 }
 
@@ -147,5 +155,34 @@ fn check_got_handshake() -> bool {
         }
 
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Upstream Zed's four port bases (Dev, Preview, Stable, Nightly), kept here as plain
+    // numbers rather than imported, so this test still catches it if a future edit of
+    // port_base() accidentally goes back to COD_PORT_BASE = 43737 (#23 AC-R2).
+    const STOCK_ZED_PORT_BASES: [u16; 4] = [43737, 43737 + 100, 43737 + 200, 43737 + 300];
+
+    #[test]
+    fn port_base_never_matches_a_stock_zed_channel() {
+        let base = port_base();
+        assert!(
+            !STOCK_ZED_PORT_BASES.contains(&base),
+            "Cod's port base {base} collides with a stock Zed channel {STOCK_ZED_PORT_BASES:?}"
+        );
+    }
+
+    #[test]
+    fn instance_handshake_never_matches_a_stock_zed_handshake() {
+        let handshake = instance_handshake();
+        assert!(
+            handshake.starts_with("Cod "),
+            "expected a Cod-specific handshake, got {handshake:?}"
+        );
+        assert!(!handshake.contains("Zed Editor"));
     }
 }

@@ -37,6 +37,20 @@ Without a Wayland session (X11), or if the off-screen browser does not work for 
 
 Both start scripts keep its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), a core dump is available if systemd-coredump is installed and enabled: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
 
+## macOS (Apple Silicon) preview
+
+The macOS preview is unsigned (ad-hoc signature only, no Apple Developer certificate: code signing and notarization cost money and are a separate decision) and built for Apple Silicon only (no Intel build). Web page tabs and agent-made pages (`codctl open --html`) are Linux-only for now; on macOS the system web view they need is not wired up yet.
+
+1. Download `cod-macos-aarch64.zip` from the latest macOS preview prerelease on the [Releases](https://github.com/cod-editor/cod/releases) page (a release titled like `macos-preview-N (macOS, Apple Silicon, unsigned)`).
+2. Unzip it and move `Cod.app` to `/Applications`.
+3. Because it is unsigned, the first open needs one extra step: right-click `Cod.app` in Finder, choose Open, then confirm in the dialog. (After that, opening it normally works.) Instead of the right-click, you can also run `xattr -dr com.apple.quarantine /Applications/Cod.app` once in Terminal.
+
+Cod's data lives in `~/Library/Application Support/Cod-preview`, separate from stock Zed's `~/Library/Application Support/Zed`, so installing Cod never touches a stock Zed also on the machine. Zed's log and the app's error output go to `~/Library/Application Support/Cod-preview/logs/cod-stderr.log`.
+
+`codctl` is bundled inside the app, at `/Applications/Cod.app/Contents/MacOS/codctl`. To use it from a terminal, put it on your `PATH`, for example `ln -s /Applications/Cod.app/Contents/MacOS/codctl /usr/local/bin/codctl` (or any folder already on your `PATH`).
+
+The macOS preview is built by `.github/workflows/macos-release.yml`, on a free GitHub-hosted Apple Silicon runner.
+
 ## Building
 
 Cod builds like Zed: see [Building Zed for Linux](./docs/src/development/linux.md) and [Building Zed for macOS](./docs/src/development/macos.md). On Linux the web view also needs `libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libxdo-dev`. The Linux preview is built by `.github/workflows/linux-release.yml`.

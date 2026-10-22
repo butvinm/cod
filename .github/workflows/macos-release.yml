@@ -1,0 +1,916 @@
+# Builds the Cod preview for Apple Silicon macOS and uploads it to a GitHub prerelease (issue #23).
+# This workflow is separate from linux-release.yml so a macOS build never costs Linux preview
+# minutes, and the other way around.
+#
+# It can only start by hand (workflow_dispatch) or by a push to macos-preview/**: a workflow file
+# that is not yet on the default branch cannot be started by workflow_dispatch alone, so a branch
+# push is the only way to try this workflow itself before it is merged. It never runs on
+# pull_request, so a fork's PR (or any PR) never spends these minutes.
+#
+# The macOS archive is unsigned (ad-hoc signature only, script/bundle-cod-mac): code signing and
+# notarization cost money and need a stakeholder decision (#23 out of scope). It targets Apple
+# Silicon only.
+#
+# #23 round 1 ports Linux's off-screen CEF page-tab backend (cod_browser) to macOS: the CEF
+# runtime is downloaded and cached the same way as linux-release.yml's own CEF steps (CEF_PATH,
+# restored/saved by actions/cache, keyed by CEF version and this platform), and script/bundle-cod-mac
+# packages "Chromium Embedded Framework.framework" plus one helper app bundle inside Cod.app.
+name: macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a macOS preview prerelease when the build and smoke check pass"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - "macos-preview/**"
+
+permissions:
+  contents: write
+
+# Its own group: a macOS run never waits for, or blocks, a Linux release run.
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # No debug info: keeps the link step and the artifact small, as on Linux.
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      # The same two flags as linux-release.yml, minus the Linux-only mold linker flag.
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable"
+      # The cef crate's build script downloads CEF into here if it is not already present, the
+      # same two variables linux-release.yml uses, so the download is cached the same way.
+      # CEF_VERSION is the distribution version the pinned cef crate resolves to, not the crate's
+      # own semver; it must stay in step with Cargo.toml's `cef = "=154.5.0"` on every platform.
+      CEF_VERSION: 154.0.34
+      CEF_PATH: /Users/runner/cef
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Show disk space
+        run: df -h /
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      # sccache keeps every compiled crate in the GitHub Actions cache, the same action and
+      # version as linux-release.yml (a different version would need a separate validation).
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      # Only the cargo registry and git checkouts, like linux-release.yml; the target folder is
+      # left to sccache. Only a push to macos-preview/** writes the cache (this workflow never
+      # runs on master), so a one-off dispatch run from another branch cannot fill or poison it.
+      - name: Restore the cargo registry cache
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-targets: false
+          cache-on-failure: true
+          save-if: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') }}
+
+      # remote_server is a Linux-only concern for this preview. cod_browser (the off-screen CEF
+      # page-tab helper) now builds here too (#23 round 1): its cef dependency needs the CEF
+      # download restored below, same as linux-release.yml's own cef-cache step.
+      - name: Restore the CEF download
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
+      - name: Build (cargo release-fast, sccache)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+        run: |
+          sccache --zero-stats
+          cargo build --locked --profile release-fast -p zed -p codctl -p cod_browser
+          sccache --show-stats
+          df -h /
+
+      - name: Save the CEF download
+        if: startsWith(github.ref, 'refs/heads/macos-preview/') && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
+      # Finds wherever the cef crate's build script actually put "Chromium Embedded
+      # Framework.framework" under CEF_PATH, instead of assuming its exact subfolder name (that
+      # name is cef-dll-sys's own internal convention, not documented, and guessing it wrong would
+      # fail the bundle step below for a reason this search avoids entirely).
+      - name: Find the downloaded CEF framework
+        run: |
+          set -euo pipefail
+          framework=$(find "$CEF_PATH" -maxdepth 6 -type d -name "Chromium Embedded Framework.framework" | head -n 1)
+          test -n "$framework"
+          echo "Found $framework"
+          echo "CEF_RUNTIME_DIR=$(dirname "$framework")" >> "$GITHUB_ENV"
+
+      - name: Bundle Cod.app (script/bundle-cod-mac)
+        env:
+          COMMIT: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: script/bundle-cod-mac
+
+      # Fails the job on the first problem found, printing enough to diagnose it without a Mac at hand.
+      - name: Bundle checks
+        env:
+          COMMIT: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          app=dist/Cod.app
+
+          echo "== plutil -lint Info.plist =="
+          plutil -lint "$app/Contents/Info.plist"
+
+          echo "== codesign --verify =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # Round 4 diagnosis H3: Chromium derives each subprocess type's own helper path from
+          # Settings::browser_subprocess_path by inserting " (Type)" before ".app" and before the
+          # final path component, regardless of what that path actually names; round 3 shipped
+          # only the plain "Cod Helper.app" and no page ever painted or finished loading, because
+          # every renderer/GPU/plugin/alerts launch silently failed. All five now have to exist.
+          echo "== CEF framework and all five helper bundles are in place (#23 round 1/4) =="
+          framework="$app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          test -d "$framework" || { echo "::error::no CEF framework at $framework"; exit 1; }
+          helpers=()
+          for variant_suffix in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+            helper="$app/Contents/Frameworks/Cod Helper$variant_suffix.app/Contents/MacOS/Cod Helper$variant_suffix"
+            test -x "$helper" || { echo "::error::no helper executable at $helper"; exit 1; }
+            helpers+=("$helper")
+          done
+
+          echo "== file: arch must be arm64 =="
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "${helpers[@]}"; do
+            file "$bin"
+            file "$bin" | grep -q "arm64" || {
+              echo "::error::$bin is not an arm64 binary"
+              exit 1
+            }
+          done
+
+          # Besides /System/ and /usr/lib/, a bundled binary may only reference the CEF framework
+          # this same bundle carries, through a path relative to itself (@executable_path, @rpath
+          # or @loader_path); anything else outside the bundle would break once Cod.app moves
+          # (#23 round 1, P3).
+          #
+          # Round 4: only the plain "Cod Helper" is checked here, not the four GPU/Renderer/
+          # Plugin/Alerts copies. They are byte-identical copies of the same cod-browser binary
+          # (script/bundle-cod-mac's make_helper_bundle), so this specific check has nothing more
+          # to learn from them; this runner's otool -L also falls back to a broken "otool-classic"
+          # for a path whose final component has a parenthesized suffix like " (GPU)", reporting
+          # a path with the suffix silently dropped and "No such file or directory" even though
+          # the arch check above (plain `file`, not otool) already found and read the same file
+          # correctly.
+          echo "== otool -L: only /System/, /usr/lib/, and the bundled CEF framework =="
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "$app/Contents/Frameworks/Cod Helper.app/Contents/MacOS/Cod Helper"; do
+            echo "-- $bin --"
+            otool -L "$bin"
+            other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+              | grep -v -E '^(/System/|/usr/lib/|@executable_path/|@rpath/|@loader_path/)' || true)
+            if [ -n "$other" ]; then
+              echo "::error::$bin links libraries outside /System/, /usr/lib/ and the bundle:"
+              printf '%s\n' "$other"
+              exit 1
+            fi
+          done
+
+          echo "== commit stamp =="
+          echo "Expecting commit $COMMIT"
+          count=$(strings "$app/Contents/MacOS/zed" | grep -c "$COMMIT" || true)
+          echo "Found $count occurrence(s) of $COMMIT in the zed binary"
+          [ "$count" -ge 1 ] || { echo "::error::the zed binary does not contain the full commit $COMMIT"; exit 1; }
+          stamped=$(cat "$app/Contents/Resources/cod-commit.txt")
+          [ "$stamped" = "$COMMIT" ] || { echo "::error::cod-commit.txt has '$stamped', expected '$COMMIT'"; exit 1; }
+          plist_commit=$(plutil -extract CodCommit raw "$app/Contents/Info.plist")
+          [ "$plist_commit" = "$COMMIT" ] || { echo "::error::Info.plist's CodCommit has '$plist_commit', expected '$COMMIT'"; exit 1; }
+
+          echo "== version fields (#23 AC-R7: Apple requires CFBundleVersion to be numeric) =="
+          short_version=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          bundle_version=$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")
+          echo "CFBundleShortVersionString=$short_version CFBundleVersion=$bundle_version"
+          [ "$short_version" = "0.0.1" ] || { echo "::error::CFBundleShortVersionString is '$short_version', expected '0.0.1'"; exit 1; }
+          case "$bundle_version" in
+            ''|*[!0-9]*) echo "::error::CFBundleVersion '$bundle_version' is not a plain numeric string"; exit 1 ;;
+          esac
+          [ "$bundle_version" = "$RUN_NUMBER" ] || { echo "::error::CFBundleVersion is '$bundle_version', expected the run number '$RUN_NUMBER'"; exit 1; }
+
+          echo "== zip checksum =="
+          test -f cod-macos-aarch64.zip
+          test -f cod-macos-aarch64.zip.sha256
+          cat cod-macos-aarch64.zip.sha256
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+
+      # Tests the shipped zip, not the build tree: extracts it fresh with ditto (keeping the
+      # signature's extended attributes), verifies the extracted signature, and opens Cod.app the
+      # way Finder does (open -n) with an isolated, temporary data folder, waiting for the window
+      # before poking at it with codctl. A crash report for one of Cod's own executables, created
+      # after this run's own launch, also fails the job, even if the process looked alive below.
+      - name: Smoke test the zip
+        id: smoke
+        run: |
+          set -uo pipefail
+
+          # AC-R5: ditto -x -k (not unzip) restores the code signature's extended attributes, so
+          # codesign --verify below checks the same bits a user's double-click-to-unzip would
+          # produce, not a copy unzip silently stripped the signature from.
+          work=$(mktemp -d)
+          ditto -x -k cod-macos-aarch64.zip "$work"
+          app="$work/Cod.app"
+
+          mkdir -p smoke-artifacts
+          status=0
+
+          echo "== codesign --verify on the extracted bundle =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # AC-R1: --user-data-dir must isolate Cod's logs and cache too, not only its config and
+          # application data, so a stock Zed on the same Mac keeps its own
+          # ~/Library/Logs/Zed and ~/Library/Caches/Zed untouched. Checked both before and after
+          # the run: if either already existed before Cod ever started, the after-comparison
+          # below could not tell Cod's own write apart from a pre-existing one.
+          stock_logs="$HOME/Library/Logs/Zed"
+          stock_cache="$HOME/Library/Caches/Zed"
+          echo "== stock Zed folders before launch (must not exist) =="
+          [ -e "$stock_logs" ] && echo "exists: $stock_logs" || echo "absent: $stock_logs"
+          [ -e "$stock_cache" ] && echo "exists: $stock_cache" || echo "absent: $stock_cache"
+          if [ -e "$stock_logs" ] || [ -e "$stock_cache" ]; then
+            echo "::error::a stock Zed folder already exists before Cod even launched; this runner cannot tell Cod's own writes apart from a pre-existing folder"
+            status=1
+          fi
+
+          # AC-R2: a stock Zed Stable on the same Mac, for the same user, must not stop Cod from
+          # starting (and the other way around: Cod must not stop a stock Zed from starting
+          # either). Fakes the stock Zed Stable single-instance listener at the exact port
+          # crates/zed/src/zed/mac_only_instance.rs's address() computes for this user (port base
+          # 43737 + 200, the Stable channel's block, then + the user ID wrapped the same way),
+          # answering with stock Zed's own handshake text, before Cod ever starts.
+          uid=$(id -u)
+          fake_zed_port=$(python3 -c "
+          port = 43737 + 200
+          max_uid = 65535 - port
+          print(port + ($uid % max_uid))
+          ")
+          echo "Faking a stock Zed Stable instance on 127.0.0.1:$fake_zed_port (uid $uid)"
+          python3 -c "
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('127.0.0.1', $fake_zed_port))
+          s.listen(5)
+          while True:
+              conn, _ = s.accept()
+              try:
+                  conn.sendall(b'Zed Editor Stable Instance Running')
+              finally:
+                  conn.close()
+          " &
+          fake_zed_pid=$!
+
+          # GitHub Actions runs this step as `bash -eo pipefail`, on top of this script's own
+          # `set -uo pipefail`, so `ls <missing dir>` would abort the whole step right here
+          # before Cod is even launched (its own nonzero exit survives a pipe under pipefail,
+          # and -e then exits the script, since it is a plain command, not part of an if/while
+          # condition). `[ -d ... ]` is not: a missing ~/Library/Logs/DiagnosticReports reads as
+          # no reports yet, not as a reason to stop (#23 AC-R4).
+          launch_epoch=$(date +%s)
+
+          # AC-R5: launch it the way Finder does (open -n), not by executing the inner binary
+          # directly. open --env passes the temporary, isolated data folder through to the
+          # launched app (a plain shell `export` would not reach it: open hands the app to
+          # launchd, which does not inherit this script's environment). Falls back to Cod's
+          # default data folder, and says so, if this runner's open(1) predates --env.
+          data=$(mktemp -d)/cod-preview-smoke
+          mkdir -p "$data"
+          if open --help 2>&1 | grep -q -- '--env'; then
+            # COD_BROWSER_LOG_VERBOSE=1 (round 4 diagnosis H1): raises cod-browser's own CEF log
+            # (cef.log) to verbose for this smoke run only; engine.rs keeps the production default
+            # (WARNING) otherwise. Cod's own child processes, including cod-browser, inherit this
+            # the ordinary way (Rust's Command inherits the parent's environment by default).
+            echo "Launching with open -n --env COD_PREVIEW_DIR=$data --env COD_BROWSER_LOG_VERBOSE=1"
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
+          else
+            echo "::warning::this runner's open(1) has no --env option; Cod will use its default data directory instead of the temporary one made for this smoke test"
+            data="$HOME/Library/Application Support/Cod-preview"
+            open -n "$app"
+          fi
+          sleep 20
+
+          # open -n returns as soon as launchd takes over, so its own $! is already gone; the
+          # launcher script (Contents/MacOS/cod) execs zed in place (same PID, new process
+          # image), so the running process is found by the extracted bundle's own zed path.
+          pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+          if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::Cod is not running 20 seconds after open -n (no process matches $app/Contents/MacOS/zed); a stock Zed Stable instance on the same port may have been mistaken for Cod itself (AC-R2)"
+            status=1
+          fi
+
+          echo "== stock Zed folders after the run (must still not exist) =="
+          if [ -e "$stock_logs" ]; then
+            echo "::error::$stock_logs exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_logs"
+          fi
+          if [ -e "$stock_cache" ]; then
+            echo "::error::$stock_cache exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_cache"
+          fi
+
+          # AC-R6: only a report for one of Cod's own executables (zed, cod, codctl), created
+          # after this run's launch_epoch, counts; an unrelated background process's crash
+          # report must not fail a healthy Cod run. macOS names a report after the crashed
+          # process (for example zed-2026-01-01-120000.ips), so the file name is matched, not
+          # its content (a crash report can be large, and the name is already specific enough).
+          echo "== crash reports for Cod's own executables since launch =="
+          new_reports=""
+          if [ -d ~/Library/Logs/DiagnosticReports ]; then
+            while IFS= read -r -d '' report; do
+              mtime=$(stat -f %m "$report" 2>/dev/null || echo 0)
+              if [ "$mtime" -ge "$launch_epoch" ]; then
+                new_reports="$new_reports$report"$'\n'
+              fi
+            done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
+              \( -iname 'zed-*' -o -iname 'cod-*' -o -iname 'codctl-*' \) -print0 2>/dev/null)
+          fi
+          if [ -n "$new_reports" ]; then
+            echo "::error::a crash report for one of Cod's own executables appeared since launch:"
+            printf '%s' "$new_reports" | tee smoke-artifacts/new-crash-reports.txt
+            status=1
+          else
+            echo "none"
+          fi
+
+          echo "== codctl workspace list (proves the command server answers) =="
+          if "$app/Contents/MacOS/codctl" workspace list > smoke-artifacts/codctl-workspace-list.txt 2>&1; then
+            echo "codctl answered:"
+            cat smoke-artifacts/codctl-workspace-list.txt
+          else
+            echo "::error::codctl workspace list failed; Cod's command server did not answer"
+            cat smoke-artifacts/codctl-workspace-list.txt || true
+            status=1
+          fi
+
+          # #23 round 1, P4: a real page tab, end to end, through the ported off-screen CEF
+          # backend. The fixture is invented data (no captured real page, per the public-repo
+          # rule), with a distinct title so the read-back cannot be confused with a stale or
+          # unrelated page.
+          #
+          # Round 4 diagnosis H2: opened as a file:// URL, not served over HTTP. python3 -m
+          # http.server, even bound to 127.0.0.1 only (round 2's own fix), still made macOS ask
+          # "Allow Python to find devices on local networks?" in round 3's screenshot, a dialog
+          # that has nothing to do with page tabs; file:// removes that python process entirely.
+          # codctl open's own CLI parsing already treats anything containing "://" as a URL (not a
+          # file path to open as a Zed editor tab), and page_control::open passes it to CEF
+          # unvalidated, the same as any other scheme.
+          echo "== page tab: write a local fixture =="
+          fixture_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac page smoke</title></head>' \
+            '<body><h1>Cod Mac page smoke</h1></body>' \
+            '</html>' \
+            > "$fixture_dir/index.html"
+          fixture_url="file://$fixture_dir/index.html"
+
+          echo "== page tab: codctl open =="
+          page_id=""
+          if "$app/Contents/MacOS/codctl" open "$fixture_url" \
+            > smoke-artifacts/codctl-open.txt 2>&1; then
+            page_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open.txt)
+            echo "codctl open reported page id: $page_id"
+          else
+            echo "::error::codctl open failed to open the local page fixture"
+            cat smoke-artifacts/codctl-open.txt || true
+            status=1
+          fi
+          if [ -z "$page_id" ]; then
+            echo "::error::codctl open printed no page id"
+            status=1
+          fi
+
+          # Round 4 diagnosis H1: a snapshot of cod-browser's and every "Cod Helper" process at
+          # 5s and 20s after codctl open, evidence for whether the renderer/GPU/plugin/alerts
+          # subprocesses actually started (round 4's own fix, H3, bundles all five helper names).
+          snapshot_helpers() {
+            ps -axo pid,ppid,etime,command | grep -iE 'cod-browser|Cod Helper' | grep -v grep \
+              > "smoke-artifacts/ps-${1}s.txt" || echo "(no matching process)" > "smoke-artifacts/ps-${1}s.txt"
+            echo "-- ps at ${1}s --"
+            cat "smoke-artifacts/ps-${1}s.txt"
+          }
+
+          # Round 2 diagnosis Q1: round 1's smoke test read the page back once, a few seconds
+          # after opening it, while it still said state "loading" (and passed anyway, because it
+          # only checked for the title or URL, both already known before the page ever loaded).
+          # This polls for up to 30 s and requires state "loaded" and the fixture's exact title,
+          # so a page that never finishes loading (or whose helper has died) fails here instead of
+          # looking like a pass.
+          echo "== page tab: codctl page get (poll up to 30s for state=loaded) =="
+          loaded=0
+          if [ -n "$page_id" ]; then
+            for _attempt in $(seq 1 30); do
+              if "$app/Contents/MacOS/codctl" page get "$page_id" --json \
+                > smoke-artifacts/codctl-page-get.txt 2>&1; then
+                state=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('state', ''))" 2> /dev/null || echo "")
+                title=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$state" = "loaded" ] && [ "$title" = "Cod Mac page smoke" ]; then
+                  loaded=1
+                  snapshot_helpers "$_attempt"
+                  break
+                fi
+                if [ "$state" = "failed" ]; then
+                  echo "codctl page get reported state=failed, not waiting out the rest of the 30s"
+                  snapshot_helpers "$_attempt"
+                  break
+                fi
+              fi
+              if [ "$_attempt" = "5" ] || [ "$_attempt" = "20" ]; then
+                snapshot_helpers "$_attempt"
+              fi
+              sleep 1
+            done
+          fi
+          echo "codctl page get (last read):"
+          cat smoke-artifacts/codctl-page-get.txt 2> /dev/null || echo "(no output captured)"
+          if [ -z "$page_id" ]; then
+            echo "::error::no page id to read back (codctl open did not report one)"
+            status=1
+          elif [ "$loaded" != "1" ]; then
+            echo "::error::codctl page get never reported state=loaded with title 'Cod Mac page smoke' within 30s"
+            status=1
+          else
+            echo "page tab loaded: state=loaded title='Cod Mac page smoke'"
+          fi
+
+          # Round 2 diagnosis Q1: the screenshot is taken after the poll above, once the page has
+          # either loaded or the 30s have run out, not a few seconds after codctl open.
+          echo "== screenshot =="
+          if screencapture -x smoke-artifacts/screen.png; then
+            echo "Saved smoke-artifacts/screen.png"
+          else
+            echo "::error::screencapture failed: this runner may have no GUI session or no window opened (report this explicitly, do not pass silently)"
+            status=1
+          fi
+
+          # Round 5: a one-shot helper for "poll codctl page get for state=loaded and an exact
+          # title", shared by P1, P3's reload wait and P4, without touching the round 1-4 poll
+          # above (already proven working, left alone).
+          poll_page_loaded() {
+            poll_page_id=$1
+            poll_expected_title=$2
+            poll_outfile=$3
+            poll_timeout=${4:-30}
+            poll_i=0
+            while [ "$poll_i" -lt "$poll_timeout" ]; do
+              if "$app/Contents/MacOS/codctl" page get "$poll_page_id" --json > "$poll_outfile" 2>&1; then
+                poll_state=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('state', ''))" 2> /dev/null || echo "")
+                poll_title=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$poll_state" = "loaded" ] && [ "$poll_title" = "$poll_expected_title" ]; then
+                  return 0
+                fi
+                if [ "$poll_state" = "failed" ]; then
+                  return 1
+                fi
+              fi
+              sleep 1
+              poll_i=$((poll_i + 1))
+            done
+            return 1
+          }
+
+          # #23 round 5, P1: a page on the open internet, the same way a real agent-made link
+          # would be. Skipped, not failed, if this runner has no internet access.
+          echo "== round 5 P1: internet page (codctl open https://example.com/) =="
+          if curl -s -m 5 -o /dev/null https://example.com/; then
+            if "$app/Contents/MacOS/codctl" open "https://example.com/" \
+              > smoke-artifacts/codctl-open-p1.txt 2>&1; then
+              p1_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p1.txt)
+              if poll_page_loaded "$p1_id" "Example Domain" smoke-artifacts/codctl-page-get-p1.txt 30; then
+                echo "P1 PASS: https://example.com/ reported state=loaded title='Example Domain'"
+              else
+                echo "::error::P1 FAIL: https://example.com/ never reported state=loaded title='Example Domain' within 30s"
+                status=1
+              fi
+              cat smoke-artifacts/codctl-page-get-p1.txt 2> /dev/null || true
+              "$app/Contents/MacOS/codctl" page close "$p1_id" > /dev/null 2>&1 || true
+            else
+              echo "::error::P1 FAIL: codctl open https://example.com/ failed"
+              cat smoke-artifacts/codctl-open-p1.txt || true
+              status=1
+            fi
+          else
+            echo "P1 SKIP: no internet access on this runner (curl could not reach https://example.com/ in 5s)"
+          fi
+
+          # Round 6: the 300 KB total screenshot budget leaves no room for full-size captures of a
+          # large runner display, so every extra capture is scaled down and recompressed in place.
+          shrink_jpg() {
+            sips -Z 1280 -s format jpeg -s formatOptions 50 "$1" --out "$1" > /dev/null 2>&1 \
+              || echo "::warning::could not shrink $1"
+          }
+
+          # Round 6: a stack sample of cod-browser, taken when a page never loads, so the next hang
+          # shows which thread is stuck where instead of only "state=loading".
+          sample_browser() {
+            browser_pid=$(pgrep -f "$app/Contents/MacOS/cod-browser" | head -n 1)
+            if [ -n "$browser_pid" ]; then
+              sample "$browser_pid" 2 -file "smoke-artifacts/cod-browser-sample-$1.txt" > /dev/null 2>&1 \
+                || echo "::warning::sample of cod-browser ($browser_pid) failed"
+            else
+              echo "no cod-browser process to sample"
+            fi
+          }
+
+          # #23 round 5, P2 (round 6: the fixture has its own <title>): an agent-made page (#43).
+          # JS off by default is checked three ways. The inline script would change the title and
+          # call the submit bridge action (which also closes the tab, see
+          # crates/web_view/src/offscreen.rs's run_bridge_action), and an inline onerror handler
+          # would change the title too. So the page must reach state=loaded with the document's
+          # own title, unchanged, and still be open and unchanged after settling.
+          echo "== round 5 P2: agent-made page (#43), JS off by default =="
+          agent_dir=$(mktemp -d)
+          agent_title="Cod Mac agent page smoke"
+          printf '%s\n' \
+            '<!doctype html><html><head><meta charset="utf-8"><title>Cod Mac agent page smoke</title></head>' \
+            '<body style="margin:0">' \
+            '<h1 id="heading">Cod Mac agent page smoke</h1>' \
+            '<input id="answer" type="text" autofocus value="mac-agent-smoke">' \
+            '<button data-cod="erase-everything">Not in the allowlist</button>' \
+            '<button data-cod="submit" data-cod-value-from="#answer">Send</button>' \
+            '<img src="cod-missing.png" alt="" width="1" height="1" onerror="document.title=&quot;handler-ran&quot;">' \
+            '<script>document.title = "script-ran"; if (window.cod) { window.cod.call("submit", {value: "script-ran"}); }</script>' \
+            '</body></html>' \
+            > "$agent_dir/ask.html"
+          p2_id=""
+          if "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" \
+            > smoke-artifacts/codctl-open-p2.txt 2>&1; then
+            p2_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p2.txt)
+            echo "codctl open --html reported page id: $p2_id"
+            if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2.txt 30; then
+              echo "P2 loaded: state=loaded title='$agent_title' (the document's own title)"
+              sleep 3
+              if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2-after-settle.txt 1; then
+                echo "P2 PASS (JS off by default): after settling the agent page is still open, loaded and titled '$agent_title', so neither the inline script nor the inline onerror handler ran"
+              else
+                echo "::error::P2 FAIL: after settling the agent page closed itself, became unreachable or changed its title without --js; page JavaScript may have run"
+                cat smoke-artifacts/codctl-page-get-p2-after-settle.txt 2> /dev/null || true
+                status=1
+              fi
+            else
+              echo "::error::P2 FAIL: the agent page never reported state=loaded with title '$agent_title' within 30s"
+              sample_browser p2
+              status=1
+            fi
+            cat smoke-artifacts/codctl-page-get-p2.txt 2> /dev/null || true
+            echo
+            # -t jpg: the 300 KB total screenshot budget for this round leaves little room for a
+            # second full-resolution PNG next to the existing screen.png.
+            if screencapture -x -t jpg smoke-artifacts/screen-agent-page.jpg 2> /dev/null; then
+              shrink_jpg smoke-artifacts/screen-agent-page.jpg
+            else
+              echo "::warning::P2 screenshot failed"
+            fi
+            "$app/Contents/MacOS/codctl" page close "$p2_id" > /dev/null 2>&1 || true
+          else
+            echo "::error::P2 FAIL: codctl open --html failed"
+            cat smoke-artifacts/codctl-open-p2.txt || true
+            status=1
+          fi
+
+          # #23 round 6, P2b: the same agent page's actions, through `codctl open --html --wait`
+          # and real key presses (System Events), the same Tab and Enter the Linux e2e test's AC2
+          # uses: Tab from the autofocused field to the disallowed "erase-everything" button and
+          # Enter (refused, logged, the page stays open), then Tab to the allowed "submit" button
+          # and Enter (codctl prints the field's value and exits 0). No new input system: the keys
+          # reach the page the ordinary way, through Cod's window. If this runner does not let
+          # osascript send keystrokes, that is reported as a gap, not faked.
+          echo "== round 6 P2b: agent page actions by keyboard (codctl open --html --wait) =="
+          p2b_out=smoke-artifacts/codctl-open-p2b-wait.txt
+          p2b_log=smoke-artifacts/osascript-p2b.txt
+          : > "$p2b_log"
+          "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" --wait \
+            > "$p2b_out" 2> smoke-artifacts/codctl-open-p2b-wait-stderr.txt &
+          p2b_pid=$!
+          # --wait prints no page id; page ids count up within one Cod session, so this page is
+          # the one after P2's.
+          p2b_id=""
+          case "$p2_id" in
+            page-[0-9] | page-[0-9][0-9] | page-[0-9][0-9][0-9]) p2b_id="page-$(( ${p2_id#page-} + 1 ))" ;;
+          esac
+          send_key() {
+            osascript -e "tell application \"System Events\" to key code $1" >> "$p2b_log" 2>&1
+          }
+          zed_log_now() {
+            find "$data" -iname "Zed.log" 2>/dev/null | head -n 1
+          }
+          if [ -z "$p2b_id" ]; then
+            echo "::error::P2b FAIL: no page id from P2 to derive the --wait page's id from"
+            status=1
+          elif ! poll_page_loaded "$p2b_id" "$agent_title" smoke-artifacts/codctl-page-get-p2b.txt 30; then
+            echo "::error::P2b FAIL: the --wait agent page ($p2b_id) never reported state=loaded with title '$agent_title' within 30s"
+            cat smoke-artifacts/codctl-page-get-p2b.txt 2> /dev/null || true
+            sample_browser p2b
+            status=1
+          elif sleep 2 && ! kill -0 "$p2b_pid" 2>/dev/null; then
+            echo "::error::P2b FAIL: codctl open --html --wait exited before any key was pressed; page JavaScript may have submitted on its own"
+            cat "$p2b_out" || true
+            status=1
+          elif ! osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >> "$p2b_log" 2>&1 \
+            || ! sleep 1 || ! send_key 48 || ! sleep 0.5 || ! send_key 36; then
+            echo "P2b GAP: this runner refused synthetic key presses (osascript/System Events, accessibility permission), so the allowed and the disallowed action could not be triggered here; they need a real click or key press on macOS by QA."
+            cat "$p2b_log"
+          else
+            # Tab, Enter on "erase-everything": refused in Cod and logged, the page stays open.
+            p2b_refused=0
+            for _attempt in $(seq 1 10); do
+              p2b_zed_log=$(zed_log_now)
+              if [ -n "$p2b_zed_log" ] && grep -F "$p2b_id refused the action \"erase-everything\"" "$p2b_zed_log" > smoke-artifacts/p2b-refused.txt 2>/dev/null; then
+                p2b_refused=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_refused" = "1" ] && kill -0 "$p2b_pid" 2>/dev/null; then
+              echo "P2b PASS (disallowed action refused): Cod logged:"
+              cat smoke-artifacts/p2b-refused.txt
+            else
+              echo "::error::P2b FAIL: no refusal of \"erase-everything\" logged for $p2b_id within 10s of Tab, Enter (or codctl --wait exited on it)"
+              status=1
+            fi
+            # Tab, Enter on "submit": codctl prints the field's value and exits 0.
+            send_key 48 && sleep 0.5 && send_key 36 || true
+            p2b_done=0
+            for _attempt in $(seq 1 15); do
+              if ! kill -0 "$p2b_pid" 2>/dev/null; then
+                p2b_done=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_done" = "1" ]; then
+              # `|| ...`: GitHub runs this step with bash -e, so a nonzero wait must not end it.
+              p2b_exit=0
+              wait "$p2b_pid" || p2b_exit=$?
+              p2b_value=$(cat "$p2b_out")
+              if [ "$p2b_exit" = "0" ] && [ "$p2b_value" = "mac-agent-smoke" ]; then
+                echo "P2b PASS (allowed action): codctl open --html --wait exited 0 and printed '$p2b_value'"
+              else
+                echo "::error::P2b FAIL: codctl open --html --wait exited $p2b_exit with '$p2b_value', expected 0 and 'mac-agent-smoke'"
+                status=1
+              fi
+            else
+              echo "::error::P2b FAIL: codctl open --html --wait did not exit within 15s of Tab, Enter on the submit button"
+              status=1
+            fi
+            if [ -n "$(cat "$p2b_log")" ]; then
+              echo "osascript said:"
+              cat "$p2b_log"
+            fi
+          fi
+          if kill -0 "$p2b_pid" 2>/dev/null; then
+            kill "$p2b_pid" 2>/dev/null || true
+          fi
+          if [ -n "$p2b_id" ]; then
+            "$app/Contents/MacOS/codctl" page close "$p2b_id" > /dev/null 2>&1 || true
+          fi
+
+          # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
+          # loaded page from the P1-round page tab test above.
+          echo "== round 5 P3: codctl parity (reload, back, forward, close) =="
+          if [ -n "$page_id" ] && [ "$loaded" = "1" ]; then
+            if "$app/Contents/MacOS/codctl" page reload "$page_id" > smoke-artifacts/codctl-page-reload.txt 2>&1; then
+              echo "P3 reload: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page reload failed"
+              cat smoke-artifacts/codctl-page-reload.txt
+              status=1
+            fi
+            poll_page_loaded "$page_id" "Cod Mac page smoke" smoke-artifacts/codctl-page-get-after-reload.txt 15 \
+              || echo "::warning::the page did not report state=loaded again within 15s of reload"
+            cat smoke-artifacts/codctl-page-get-after-reload.txt 2> /dev/null || true
+            if "$app/Contents/MacOS/codctl" page back "$page_id" > smoke-artifacts/codctl-page-back.txt 2>&1; then
+              echo "P3 back: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page back failed"
+              cat smoke-artifacts/codctl-page-back.txt
+              status=1
+            fi
+            if "$app/Contents/MacOS/codctl" page forward "$page_id" > smoke-artifacts/codctl-page-forward.txt 2>&1; then
+              echo "P3 forward: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page forward failed"
+              cat smoke-artifacts/codctl-page-forward.txt
+              status=1
+            fi
+            echo "P3 LIMIT: codctl has no command to navigate an existing page tab to a second URL (open always opens a new tab), so back and forward are only checked here at the command level (exit 0, same result shape as Linux's shared page_control.rs code): real history needs an in-page link click, the same gap P2 reports."
+            if "$app/Contents/MacOS/codctl" page close "$page_id" --json > smoke-artifacts/codctl-page-close.txt 2>&1; then
+              echo "P3 close:"
+              cat smoke-artifacts/codctl-page-close.txt
+            else
+              echo "::error::P3 FAIL: codctl page close failed"
+              cat smoke-artifacts/codctl-page-close.txt
+              status=1
+            fi
+          else
+            echo "::error::P3 FAIL: no loaded page from the P1-round page tab test to exercise reload/back/forward/close on"
+            status=1
+          fi
+
+          # #23 round 5, P4: persistence across a restart. Opened now, while Cod is still running
+          # from this run's first launch, then checked again after quitting and relaunching Cod
+          # with the same --user-data-dir (the restore mechanism is not a test-only path: it is
+          # the ordinary default behavior of a real restart).
+          echo "== round 5 P4: open a page to check after a restart =="
+          persist_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac restart smoke</title></head>' \
+            '<body><h1>Cod Mac restart smoke</h1></body>' \
+            '</html>' \
+            > "$persist_dir/index.html"
+          persist_id=""
+          if "$app/Contents/MacOS/codctl" open "file://$persist_dir/index.html" \
+            > smoke-artifacts/codctl-open-p4.txt 2>&1; then
+            persist_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p4.txt)
+            if poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-before.txt 30; then
+              echo "P4 setup: the restart-check page is loaded ($persist_id), before quitting"
+            else
+              echo "::error::P4 FAIL: the restart-check page never loaded before the restart"
+              status=1
+            fi
+          else
+            echo "::error::P4 FAIL: codctl open file://$persist_dir/index.html failed"
+            cat smoke-artifacts/codctl-open-p4.txt || true
+            status=1
+          fi
+
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+
+          if [ -n "$persist_id" ]; then
+            echo "== round 5 P4: relaunch and check the page was restored =="
+            if open --help 2>&1 | grep -q -- '--env'; then
+              open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
+            else
+              open -n "$app"
+            fi
+            sleep 20
+            pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::P4 FAIL: Cod is not running 20s after the relaunch"
+              status=1
+            elif poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-after.txt 30; then
+              echo "P4 PASS: the page tab was restored and loaded after the restart, same id $persist_id"
+              if screencapture -x -t jpg smoke-artifacts/screen-after-restart.jpg 2> /dev/null; then
+                shrink_jpg smoke-artifacts/screen-after-restart.jpg
+              else
+                echo "::warning::P4 screenshot failed"
+              fi
+            else
+              echo "::error::P4 FAIL: the page was not restored as state=loaded title='Cod Mac restart smoke' within 30s of the relaunch"
+              cat smoke-artifacts/codctl-page-get-p4-after.txt 2> /dev/null || true
+              status=1
+            fi
+          fi
+
+          # #23 round 5, P5: link-from-chat (#32) needs an actual chat message with a rendered
+          # link, clicked, which (like P2's and P3's click-dependent parts) needs cod_e2e_driver;
+          # there is no non-interactive codctl path that exercises CodPageOpener/the chat-link
+          # wiring itself (codctl open of a plain URL only re-tests what P1 already covers, the
+          # offscreen backend's own open path, not the chat-to-page wiring). Not attempted here;
+          # left for the e2e driver on macOS or a human check.
+          echo "P5 GAP: link-from-chat (#32) needs a real chat message and a click (cod_e2e_driver); left for the e2e driver on macOS or a human check."
+
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+          kill "$fake_zed_pid" 2>/dev/null || true
+
+          cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
+            || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
+
+          # Round 2 diagnosis Q2: CEF's own log (crates/cod_browser/src/engine.rs sets
+          # Settings::log_file to <cache>/cef.log the same way on every platform, cache being
+          # data_dir.join("cef"), i.e. $data/cef/cef.log here) was never collected before, so any
+          # CEF-side CHECK/DCHECK or renderer-launch failure never reached the uploaded artifacts.
+          # Round 4 diagnosis H1 raises it to verbose (COD_BROWSER_LOG_VERBOSE=1 above) for this
+          # run; capped at 2 MB (tail, the most recent lines) in case verbose logging makes it large.
+          if [ -f "$data/cef/cef.log" ]; then
+            tail -c 2000000 "$data/cef/cef.log" > smoke-artifacts/cef.log
+          else
+            echo "no cef.log was written" > smoke-artifacts/cef.log
+          fi
+
+          # Round 2 diagnosis Q2: a crash report for cod-browser or its "Cod Helper" subprocess
+          # bundle, created after this run's launch, with its full content (unlike the zed/cod/
+          # codctl check above, kept name-only): this is a background helper this smoke test
+          # itself starts well after launch_epoch, through codctl open above, so its own crash
+          # reports need their own check, after that point, not the earlier one.
+          echo "== crash reports for cod-browser or Cod Helper since launch =="
+          if [ -d ~/Library/Logs/DiagnosticReports ]; then
+            found=0
+            while IFS= read -r -d '' report; do
+              mtime=$(stat -f %m "$report" 2>/dev/null || echo 0)
+              if [ "$mtime" -ge "$launch_epoch" ]; then
+                found=1
+                echo "::error::a crash report for cod-browser or Cod Helper appeared: $report"
+                cp "$report" "smoke-artifacts/$(basename "$report")"
+                cat "$report"
+                status=1
+              fi
+            done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
+              \( -iname 'cod-browser-*' -o -iname 'Cod Helper*' \) -print0 2>/dev/null)
+            [ "$found" = 1 ] || echo "none"
+          else
+            echo "none (no DiagnosticReports directory)"
+          fi
+
+          # AC-R1: Zed.log must be under $data, not under stock Zed's ~/Library/Logs/Zed
+          # (already checked above); a missing Zed.log here is itself a failure, not silently
+          # ignored, since it would mean the smoke test cannot tell whether Cod ever wrote one.
+          zed_log=$(find "$data" -iname "Zed.log" 2>/dev/null | head -n 1)
+          if [ -n "$zed_log" ]; then
+            cp "$zed_log" smoke-artifacts/zed.log
+          else
+            echo "::error::no Zed.log was found under $data"
+            status=1
+          fi
+
+          exit $status
+
+      - name: Upload the zip and its checksum
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-aarch64
+          path: |
+            cod-macos-aarch64.zip
+            cod-macos-aarch64.zip.sha256
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload app logs and smoke outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-smoke
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Only a push event whose ref is exactly macos-preview/publish, or a workflow_dispatch run
+      # with its publish input set to true, makes a prerelease; both halves of each arm are
+      # required, so a manual dispatch that merely targets the macos-preview/publish branch
+      # without publish=true does not publish (a dispatch run's github.ref already equals
+      # whatever branch it is run against, which is exactly what let that happen before this
+      # fix). Every other run (macos-preview/dev and any other macos-preview/* branch) only
+      # builds, checks and smoke-tests, so trying this workflow never creates a release by itself.
+      # The tag always carries the run number, so this step only ever creates a new release: it
+      # never edits or deletes one that exists already.
+      - name: Publish a macOS preview prerelease
+        if: >-
+          (github.event_name == 'push' && github.ref == 'refs/heads/macos-preview/publish') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="macos-preview-${{ github.run_number }}"
+          gh release create "$tag" cod-macos-aarch64.zip cod-macos-aarch64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$tag (macOS, Apple Silicon, unsigned)" \
+            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Page tabs use the same off-screen CEF backend as Linux (round 1: opening a plain URL); agent-made HTML pages and the bridge are not ported yet."

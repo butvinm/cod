@@ -428,12 +428,20 @@ fn read_loop(client: Arc<Client>, stream: UnixStream) {
 }
 
 /// Ends a helper process and collects its exit status on a thread of its own, so the caller (possibly the GPUI thread) never waits for it.
+///
+/// Round 2 diagnosis Q2 (#23): the exit status used to be discarded (`.ok()`); logging it here is
+/// often the only place it is ever recorded, since `read_loop`'s own "connection lost" message
+/// usually reaches `fail` first (a closed socket is detected before the 250 ms `watch` poll
+/// notices the same exit through `try_wait`), and that generic message does not say how the
+/// helper ended. On Unix, `std::process::ExitStatus`'s `Display` names a terminating signal (for
+/// example "signal: 11 (SIGSEGV)"), not just a missing zero exit code.
 fn reap(mut child: Child) {
     child.kill().ok();
     let spawned = std::thread::Builder::new()
         .name("cod-browser-reaper".into())
-        .spawn(move || {
-            child.wait().ok();
+        .spawn(move || match child.wait() {
+            Ok(status) => log::info!("web_view: cod-browser helper exited with {status}"),
+            Err(error) => log::error!("web_view: cannot wait for the cod-browser helper: {error}"),
         });
     if let Err(error) = spawned {
         log::error!("web_view: cannot start the reaper thread: {error}");
