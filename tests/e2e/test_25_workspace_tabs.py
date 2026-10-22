@@ -711,8 +711,9 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
     def test_ac7_a_held_close_press_cannot_migrate_to_another_workspace(self) -> None:
         """#77 C1: both the tab and its close button are keyed by the workspace's own identity,
         not its index, so a held press cannot end up acting on whichever workspace now sits at
-        that position. Press B's close button, remove A through codctl before releasing, then
-        release: C (checked by id) must never be the one that closes, whatever happens to B."""
+        that position. Press B's close button, remove A through codctl, wait until the bar is
+        drawn as [B, C] (C's close button now sits where B's was), then release there: the press
+        belonged to B, which moved away, so nothing more closes and B and C (by id) remain."""
         with self.step("start Cod: three workspaces A, B, C, C active"):
             self.start_cod(None)
             self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
@@ -724,20 +725,25 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for_tabs("three named tabs", {"names": ["A", "B", "C"], "active": [False, False, True]})
 
         ids = {workspace["name"]: workspace["id"] for workspace in state["workspaces"]}
-        c_id = ids["C"]
+        pressed = center(title_bar(state)["tabs"][1]["close_bounds"])
 
-        with self.step("press B's close button, remove A through codctl before releasing"):
-            self.mouse_down_on_close_button(state, 1)
+        with self.step("press B's close button, remove A through codctl, wait for the bar drawn as [B, C]"):
+            self.mouse_down_at(*pressed)
             result = self.codctl("workspace", "close", "--workspace", "A", "--force", "--json")
             if result.returncode != 0:
                 raise AssertionError(f"codctl workspace close A failed: exit {result.returncode}, {result.stdout!r} {result.stderr!r}")
-            self.mouse_up_at(*center(title_bar(state)["tabs"][1]["close_bounds"]))
+            state = self.wait_for_tabs("the bar drawn as [B, C]", {"names": ["B", "C"], "workspace_count": 2})
 
-        with self.step("C is never the one that closed, whether or not B also did"):
-            state = self.wait_for(lambda state: state["workspace_count"] <= 2, SHOW_TIMEOUT, "A gone (and maybe B)")
-            remaining_ids = [workspace["id"] for workspace in state["workspaces"]]
-            if c_id not in remaining_ids:
-                raise AssertionError(f"expected C (id {c_id}) to survive, actual surviving workspace ids {remaining_ids}")
+        with self.step("C's close button is now under the held press"):
+            close = title_bar(state)["tabs"][1]["close_bounds"]
+            inside = drawn(close) and close["x"] <= pressed[0] <= close["x"] + close["width"] and close["y"] <= pressed[1] <= close["y"] + close["height"]
+            if not inside:
+                raise AssertionError(f"expected the press position {pressed} over C's close button, actual {close!r}")
+
+        with self.step("release there, let the frames settle: B and C (by id) both remain"):
+            self.mouse_up_at(*pressed)
+            state = self.stays(lambda state: state["workspace_count"] == 2, SETTLE_TIME, "two workspaces after the release")
+            self.expect_equal("surviving workspace ids", sorted([ids["B"], ids["C"]]), sorted(workspace["id"] for workspace in state["workspaces"]))
 
     def test_ac7_close_button_shows_the_unsaved_confirmation_and_keep_keeps_it(self) -> None:
         with self.step("create the fixture repo billing-api"):
