@@ -940,6 +940,7 @@ impl MultiWorkspace {
             return;
         };
         let app_state = doomed.read(cx).app_state().clone();
+        let shown_before = self.workspace().clone();
         cx.spawn_in(window, async move |this, cx| {
             // #77 C2: closing a workspace detaches it, which runs
             // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs, "the workspace's
@@ -981,11 +982,18 @@ impl MultiWorkspace {
                     return anyhow::Ok(());
                 }
             }
+            // The unsaved-edits prompt shows the workspace it asks about (Zed's
+            // `save_all_internal` activates it), which switches away from the shown workspace
+            // when a background tab is closed.
             let consent = doomed
                 .update_in(cx, |workspace, window, cx| {
                     workspace.save_all_internal(SaveIntent::Close, false, window, cx)
                 })?
                 .await?;
+            // Issue #81: whatever the answer, the user is back on the workspace they were using.
+            this.update_in(cx, |this, window, cx| {
+                this.cod_show_again_after_close_prompt(&shown_before, &doomed, window, cx)
+            })?;
             if !consent {
                 return anyhow::Ok(());
             }
@@ -999,9 +1007,9 @@ impl MultiWorkspace {
 
             // The replacement is the member before the closed one (else the one after it), loaded
             // or pending; a listed member whose saved data was not found is skipped.
-            // Issue #77 F3: a replacement is only shown when the closed workspace was the one
-            // shown; closing a tab in the background (the hovered-but-inactive case the story's
-            // test covers) must leave the active workspace exactly as it was.
+            // Issue #77 F3: a replacement is only shown when the closed workspace is the one
+            // shown: it was shown before the close, or the workspace shown then is gone.
+            // Closing a background tab leaves the shown workspace as it was.
             let (replacement, was_active) = this.update(cx, |this, cx| {
                 let was_active = *this.workspace() == doomed;
                 let members = this.cod_members(cx);
@@ -1072,6 +1080,23 @@ impl MultiWorkspace {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Issue #81: shows `previous` again when a close prompt switched from it to `doomed`, the
+    /// workspace being closed, as long as `previous` is still in the window.
+    fn cod_show_again_after_close_prompt(
+        &mut self,
+        previous: &Entity<Workspace>,
+        doomed: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if previous != doomed
+            && self.workspace() == doomed
+            && self.held_index(previous).is_some()
+        {
+            self.activate(previous.clone(), None, window, cx);
+        }
     }
 
     /// The ids to save as the window's workspace list: the held workspaces in window order, then

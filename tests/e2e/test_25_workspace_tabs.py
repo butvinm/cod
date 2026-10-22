@@ -784,6 +784,97 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step("the dirtied buffer is still dirty: nothing was saved or discarded"):
             self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
 
+    # Issue #81 (QA #91): closing a background workspace with unsaved edits shows it for the
+    # prompt; afterwards the user is back on the workspace they were using, whatever the answer.
+
+    def select_prompt_answer(self, label: str) -> None:
+        """Moves the prompt's highlight to the answer `label` with the right arrow key, as a person does from the keyboard."""
+        prompt = self.state()["prompt"]
+        if prompt is None or label not in (prompt["answers"] or []):
+            raise AssertionError(f"expected a prompt with the answer {label!r}, actual {prompt!r}")
+        target = prompt["answers"].index(label)
+        for _ in range(len(prompt["answers"])):
+            if self.state()["prompt"]["highlighted"] == target:
+                return
+            self.keys("right")
+        self.wait_for(
+            lambda state: state["prompt"] is not None and state["prompt"]["highlighted"] == target,
+            SHOW_TIMEOUT,
+            f"{label!r} highlighted",
+        )
+
+    def close_background_tab(self, index: int) -> dict[str, Any]:
+        """Hovers the tab at `index`, clicks its close button and returns the state with the prompt that asks about its unsaved edits."""
+        self.hover_tab(self.state(), index)
+        self.click_close_button(self.state(), index)
+        return self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "a prompt about the unsaved edits")
+
+    def wait_until_shown(self, workspace_id: Any, count: int, what: str) -> dict[str, Any]:
+        """Waits for `count` workspaces, no prompt, and the workspace with `workspace_id` shown."""
+        return self.wait_for(
+            lambda state: state["prompt"] is None
+            and state["workspace_count"] == count
+            and state["workspaces"][state["active_workspace"]]["id"] == workspace_id,
+            SHOW_TIMEOUT,
+            what,
+        )
+
+    def test_ac7_closing_a_background_workspace_returns_to_the_shown_one(self) -> None:
+        with self.step("create the fixture repo billing-api"):
+            billing_api = self.make_repo("billing-api", BILLING_API)
+            main_rs = billing_api / "src" / "main.rs"
+
+        with self.step("start Cod on billing-api and leave unsaved edits in src/main.rs"):
+            self.start_cod(billing_api)
+            self.wait_for_tabs("the first tab", {"names": ["billing-api"], "active": [True]})
+            self.keys("ctrl-p")
+            self.wait_for(lambda state: state["modal"] == "file_finder", SHOW_TIMEOUT, "the file finder to open")
+            self.wait_for(lambda state: state["file_finder_ready"], SHOW_TIMEOUT, "the file finder to be drawn with the focus")
+            # The whole path, so an enter pressed before the matches arrive still opens this file.
+            self.type("src/main.rs")
+            self.keys("enter")
+            self.wait_for(lambda state: state["modal"] is None and state["active_tab"] == "main.rs", SHOW_TIMEOUT, "main.rs to open")
+            self.type("// draft ")
+            self.wait_for(lambda state: state["dirty_tabs"] == ["main.rs"], SHOW_TIMEOUT, "main.rs to have unsaved changes")
+
+        with self.step('"+": a second workspace with an unsaved new buffer'):
+            self.click_add_button(self.state())
+            self.wait_for_tabs("two tabs", {"names": ["billing-api", UNNAMED], "active": [False, True]})
+            self.keys("ctrl-n")
+            self.type("scratch notes")
+            self.wait_for(lambda state: len(state["dirty_tabs"]) == 1, SHOW_TIMEOUT, "the new buffer to have unsaved text")
+
+        with self.step('"+" again: a third workspace, the one the user works in'):
+            self.click_add_button(self.state())
+            state = self.wait_for_tabs(
+                "three tabs, the third shown", {"names": ["billing-api", UNNAMED, UNNAMED_2], "active": [False, False, True]}
+            )
+            shown_id = state["workspaces"][2]["id"]
+            billing_id = state["workspaces"][0]["id"]
+
+        with self.step("close the background billing-api tab, Cancel (escape): billing-api stays, the third workspace is shown again"):
+            self.close_background_tab(0)
+            self.keys("escape")
+            state = self.wait_until_shown(shown_id, 3, "the third workspace shown again, all three kept")
+            self.expect_equal("billing-api kept, by id", billing_id, state["workspaces"][0]["id"])
+            self.expect_equal("main.rs on disk untouched", BILLING_API["src/main.rs"], main_rs.read_text())
+
+        with self.step("close billing-api again, Save (the highlighted answer, enter): it closes, the third workspace is shown"):
+            state = self.close_background_tab(0)
+            self.expect_equal("highlighted answer", "Save", state["prompt"]["answers"][state["prompt"]["highlighted"]])
+            self.keys("enter")
+            state = self.wait_until_shown(shown_id, 2, "billing-api closed, the third workspace shown")
+            if billing_id in [workspace["id"] for workspace in state["workspaces"]]:
+                raise AssertionError(f"expected billing-api (id {billing_id}) closed, actual {state['workspaces']!r}")
+            if "// draft" not in main_rs.read_text():
+                raise AssertionError(f"expected Save to write the edit to main.rs, actual {main_rs.read_text()!r}")
+
+        with self.step("close the background tab with the unsaved new buffer, Don't Save: it closes, the third workspace is shown"):
+            self.close_background_tab(0)
+            self.select_prompt_answer("Don't Save")
+            self.keys("enter")
+            state = self.wait_until_shown(shown_id, 1, "only the third workspace left, shown")
+
     # Issue #77 C4: natural width when there is room must not break correct shrinking when the
     # title bar is genuinely full. The test makes its own narrow window: it sets the output of
     # this run's sway to 640x600 logical pixels before Cod starts and restores the output's own
