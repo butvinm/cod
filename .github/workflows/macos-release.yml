@@ -479,6 +479,225 @@ jobs:
             status=1
           fi
 
+          # Round 5: a one-shot helper for "poll codctl page get for state=loaded and an exact
+          # title", shared by P1, P3's reload wait and P4, without touching the round 1-4 poll
+          # above (already proven working, left alone).
+          poll_page_loaded() {
+            poll_page_id=$1
+            poll_expected_title=$2
+            poll_outfile=$3
+            poll_timeout=${4:-30}
+            poll_i=0
+            while [ "$poll_i" -lt "$poll_timeout" ]; do
+              if "$app/Contents/MacOS/codctl" page get "$poll_page_id" --json > "$poll_outfile" 2>&1; then
+                poll_state=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('state', ''))" 2> /dev/null || echo "")
+                poll_title=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$poll_state" = "loaded" ] && [ "$poll_title" = "$poll_expected_title" ]; then
+                  return 0
+                fi
+                if [ "$poll_state" = "failed" ]; then
+                  return 1
+                fi
+              fi
+              sleep 1
+              poll_i=$((poll_i + 1))
+            done
+            return 1
+          }
+
+          # #23 round 5, P1: a page on the open internet, the same way a real agent-made link
+          # would be. Skipped, not failed, if this runner has no internet access.
+          echo "== round 5 P1: internet page (codctl open https://example.com/) =="
+          if curl -s -m 5 -o /dev/null https://example.com/; then
+            if "$app/Contents/MacOS/codctl" open "https://example.com/" \
+              > smoke-artifacts/codctl-open-p1.txt 2>&1; then
+              p1_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p1.txt)
+              if poll_page_loaded "$p1_id" "Example Domain" smoke-artifacts/codctl-page-get-p1.txt 30; then
+                echo "P1 PASS: https://example.com/ reported state=loaded title='Example Domain'"
+              else
+                echo "::error::P1 FAIL: https://example.com/ never reported state=loaded title='Example Domain' within 30s"
+                status=1
+              fi
+              cat smoke-artifacts/codctl-page-get-p1.txt 2> /dev/null || true
+              "$app/Contents/MacOS/codctl" page close "$p1_id" > /dev/null 2>&1 || true
+            else
+              echo "::error::P1 FAIL: codctl open https://example.com/ failed"
+              cat smoke-artifacts/codctl-open-p1.txt || true
+              status=1
+            fi
+          else
+            echo "P1 SKIP: no internet access on this runner (curl could not reach https://example.com/ in 5s)"
+          fi
+
+          # #23 round 5, P2: an agent-made page (#43). JS-off-by-default is checked the same way
+          # the Linux e2e test's AC4 does (the page must not auto-submit and close on its own): a
+          # fixture whose inline script would call the submit bridge action if JS ran, which also
+          # closes the tab (crates/web_view/src/offscreen.rs's run_bridge_action), so "the tab is
+          # still open and loaded after settling" is equivalent evidence to "the waiting codctl
+          # process did not exit".
+          echo "== round 5 P2: agent-made page (#43), JS off by default =="
+          agent_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!doctype html><html><head><meta charset="utf-8"></head>' \
+            '<body style="margin:0">' \
+            '<h1 id="heading">Cod Mac agent page smoke</h1>' \
+            '<button data-cod="submit" data-cod-value-from="#answer">Send</button>' \
+            '<input id="answer" type="text" value="mac-agent-smoke">' \
+            '<button data-cod="erase-everything">Not in the allowlist</button>' \
+            '<script>if (window.cod) { window.cod.call("submit", {value: "script-ran"}); }</script>' \
+            '</body></html>' \
+            > "$agent_dir/ask.html"
+          if "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" \
+            > smoke-artifacts/codctl-open-p2.txt 2>&1; then
+            p2_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p2.txt)
+            echo "codctl open --html reported page id: $p2_id"
+            p2_loaded=0
+            for _attempt in $(seq 1 30); do
+              if "$app/Contents/MacOS/codctl" page get "$p2_id" --json \
+                > smoke-artifacts/codctl-page-get-p2.txt 2>&1; then
+                p2_state=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get-p2.txt')).get('state', ''))" 2> /dev/null || echo "")
+                if [ "$p2_state" = "loaded" ]; then
+                  p2_loaded=1
+                  break
+                fi
+              fi
+              sleep 1
+            done
+            cat smoke-artifacts/codctl-page-get-p2.txt 2> /dev/null || true
+            if [ "$p2_loaded" != "1" ]; then
+              echo "::error::P2 FAIL: the agent page never reported state=loaded"
+              status=1
+            else
+              sleep 3
+              if "$app/Contents/MacOS/codctl" page get "$p2_id" --json \
+                > smoke-artifacts/codctl-page-get-p2-after-settle.txt 2>&1; then
+                echo "P2 PASS (JS off by default): the agent page is still open after settling, so the inline scripts auto-submit did not run"
+                cat smoke-artifacts/codctl-page-get-p2-after-settle.txt
+              else
+                echo "::error::P2 FAIL: the agent page closed itself (or became unreachable) without --js; the inline script may have run"
+                status=1
+              fi
+            fi
+            # -t jpg: the 300 KB total screenshot budget for this round leaves little room for a
+            # second full-resolution PNG next to the existing screen.png.
+            screencapture -x -t jpg smoke-artifacts/screen-agent-page.jpg 2> /dev/null \
+              || echo "::warning::P2 screenshot failed"
+            "$app/Contents/MacOS/codctl" page close "$p2_id" > /dev/null 2>&1 || true
+          else
+            echo "::error::P2 FAIL: codctl open --html failed"
+            cat smoke-artifacts/codctl-open-p2.txt || true
+            status=1
+          fi
+          echo "P2 GAP: the allowed action (data-cod=submit) returning its value, and the disallowed action (data-cod=erase-everything) being refused, both need a real click dispatched into the page. The Linux e2e test drives that click through cod_e2e_driver, a crate this story does not own and that is not part of this preview build. Not faked here; left for the e2e driver on macOS or a human check."
+
+          # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
+          # loaded page from the P1-round page tab test above.
+          echo "== round 5 P3: codctl parity (reload, back, forward, close) =="
+          if [ -n "$page_id" ] && [ "$loaded" = "1" ]; then
+            if "$app/Contents/MacOS/codctl" page reload "$page_id" > smoke-artifacts/codctl-page-reload.txt 2>&1; then
+              echo "P3 reload: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page reload failed"
+              cat smoke-artifacts/codctl-page-reload.txt
+              status=1
+            fi
+            poll_page_loaded "$page_id" "Cod Mac page smoke" smoke-artifacts/codctl-page-get-after-reload.txt 15 \
+              || echo "::warning::the page did not report state=loaded again within 15s of reload"
+            cat smoke-artifacts/codctl-page-get-after-reload.txt 2> /dev/null || true
+            if "$app/Contents/MacOS/codctl" page back "$page_id" > smoke-artifacts/codctl-page-back.txt 2>&1; then
+              echo "P3 back: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page back failed"
+              cat smoke-artifacts/codctl-page-back.txt
+              status=1
+            fi
+            if "$app/Contents/MacOS/codctl" page forward "$page_id" > smoke-artifacts/codctl-page-forward.txt 2>&1; then
+              echo "P3 forward: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page forward failed"
+              cat smoke-artifacts/codctl-page-forward.txt
+              status=1
+            fi
+            echo "P3 LIMIT: codctl has no command to navigate an existing page tab to a second URL (open always opens a new tab), so back and forward are only checked here at the command level (exit 0, same result shape as Linux's shared page_control.rs code): real history needs an in-page link click, the same gap P2 reports."
+            if "$app/Contents/MacOS/codctl" page close "$page_id" --json > smoke-artifacts/codctl-page-close.txt 2>&1; then
+              echo "P3 close:"
+              cat smoke-artifacts/codctl-page-close.txt
+            else
+              echo "::error::P3 FAIL: codctl page close failed"
+              cat smoke-artifacts/codctl-page-close.txt
+              status=1
+            fi
+          else
+            echo "::error::P3 FAIL: no loaded page from the P1-round page tab test to exercise reload/back/forward/close on"
+            status=1
+          fi
+
+          # #23 round 5, P4: persistence across a restart. Opened now, while Cod is still running
+          # from this run's first launch, then checked again after quitting and relaunching Cod
+          # with the same --user-data-dir (the restore mechanism is not a test-only path: it is
+          # the ordinary default behavior of a real restart).
+          echo "== round 5 P4: open a page to check after a restart =="
+          persist_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac restart smoke</title></head>' \
+            '<body><h1>Cod Mac restart smoke</h1></body>' \
+            '</html>' \
+            > "$persist_dir/index.html"
+          persist_id=""
+          if "$app/Contents/MacOS/codctl" open "file://$persist_dir/index.html" \
+            > smoke-artifacts/codctl-open-p4.txt 2>&1; then
+            persist_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p4.txt)
+            if poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-before.txt 30; then
+              echo "P4 setup: the restart-check page is loaded ($persist_id), before quitting"
+            else
+              echo "::error::P4 FAIL: the restart-check page never loaded before the restart"
+              status=1
+            fi
+          else
+            echo "::error::P4 FAIL: codctl open file://$persist_dir/index.html failed"
+            cat smoke-artifacts/codctl-open-p4.txt || true
+            status=1
+          fi
+
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+
+          if [ -n "$persist_id" ]; then
+            echo "== round 5 P4: relaunch and check the page was restored =="
+            if open --help 2>&1 | grep -q -- '--env'; then
+              open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
+            else
+              open -n "$app"
+            fi
+            sleep 20
+            pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::P4 FAIL: Cod is not running 20s after the relaunch"
+              status=1
+            elif poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-after.txt 30; then
+              echo "P4 PASS: the page tab was restored and loaded after the restart, same id $persist_id"
+              screencapture -x -t jpg smoke-artifacts/screen-after-restart.jpg 2> /dev/null \
+                || echo "::warning::P4 screenshot failed"
+            else
+              echo "::error::P4 FAIL: the page was not restored as state=loaded title='Cod Mac restart smoke' within 30s of the relaunch"
+              cat smoke-artifacts/codctl-page-get-p4-after.txt 2> /dev/null || true
+              status=1
+            fi
+          fi
+
+          # #23 round 5, P5: link-from-chat (#32) needs an actual chat message with a rendered
+          # link, clicked, which (like P2's and P3's click-dependent parts) needs cod_e2e_driver;
+          # there is no non-interactive codctl path that exercises CodPageOpener/the chat-link
+          # wiring itself (codctl open of a plain URL only re-tests what P1 already covers, the
+          # offscreen backend's own open path, not the chat-to-page wiring). Not attempted here;
+          # left for the e2e driver on macOS or a human check.
+          echo "P5 GAP: link-from-chat (#32) needs a real chat message and a click (cod_e2e_driver); left for the e2e driver on macOS or a human check."
+
           if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
             sleep 2
