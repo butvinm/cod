@@ -191,7 +191,12 @@ pub fn render_cod_workspace_tabs(
         let (tab_focus, close_focus) = state
             .focus
             .entry(tab_id.clone())
-            .or_insert_with(|| (cx.focus_handle(), cx.focus_handle()));
+            .or_insert_with(|| {
+                (
+                    cx.focus_handle().tab_stop(true),
+                    cx.focus_handle().tab_stop(true),
+                )
+            });
         let tab_focus = tab_focus.clone();
         let close_focus = close_focus.clone();
         let has_focus = tab_focus.contains_focused(window, cx) || close_focus.is_focused(window);
