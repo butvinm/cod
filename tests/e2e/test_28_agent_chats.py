@@ -533,9 +533,10 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for(
                 lambda state: state["workspace_count"] == before["workspace_count"] + 1
                 and state["active_workspace"] == 1
-                and state["modal"] is None,
+                and state["modal"] is None
+                and len(title_bar(state)["tabs"]) == 2,
                 30,
-                "the second workspace, shown",
+                "the second workspace, shown with both tabs drawn",
             )
             shown_id = state["workspaces"][1]["id"]
 
