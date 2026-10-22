@@ -421,18 +421,16 @@ pub fn render_cod_workspace_tabs(
         weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
             .ok();
     };
-    // #77 F1/C4: no `min_w_0`/`overflow_x_hidden` here (see the comment on `content` above):
-    // each tab already shrinks on its own (its own `min_w_0` and `max_w`), and the title bar's
-    // own outer row already clips (`platform_title_bar.rs`'s `overflow_x_hidden`); this row only
-    // needs to report its true natural width when there is room for it. `max_w(relative(1.))`
-    // is a hard cap at the row's own available width regardless: measured, the layout engine's
-    // own "how much room do I want" pass for an ancestor and its "how much room do I actually
-    // get" pass for this row do not agree without `min_w_0` once there truly is not enough room
-    // for every tab at its natural width (six short-named tabs in a 640 px bar ran 120 px past
-    // the title bar's own right edge without this), so the cap is what actually keeps the row,
-    // and every tab inside it, inside the title bar in that case.
+    // #77 F1/C4: `max_w(relative(1.))` alone did not actually cap this row: measured, it had no
+    // effect (six short-named tabs in a 640 px bar still ran the same 120 px past its right
+    // edge), so the row's own "how much room is available" must itself already be wrong without
+    // `min_w_0` once there truly is not enough room for every tab at its natural width. `min_w_0`
+    // is back here (it alone, not on the left group below, kept the ample-space measurement
+    // correct too): each tab already shrinks on its own (its own `min_w_0` and `max_w`), and the
+    // title bar's own outer row already clips (`platform_title_bar.rs`'s `overflow_x_hidden`).
     h_flex()
         .h_full()
+        .min_w_0()
         .max_w(relative(1.))
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
