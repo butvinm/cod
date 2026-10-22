@@ -176,9 +176,18 @@ jobs:
           # this same bundle carries, through a path relative to itself (@executable_path, @rpath
           # or @loader_path); anything else outside the bundle would break once Cod.app moves
           # (#23 round 1, P3).
+          #
+          # Round 4: only the plain "Cod Helper" is checked here, not the four GPU/Renderer/
+          # Plugin/Alerts copies. They are byte-identical copies of the same cod-browser binary
+          # (script/bundle-cod-mac's make_helper_bundle), so this specific check has nothing more
+          # to learn from them; this runner's otool -L also falls back to a broken "otool-classic"
+          # for a path whose final component has a parenthesized suffix like " (GPU)", reporting
+          # a path with the suffix silently dropped and "No such file or directory" even though
+          # the arch check above (plain `file`, not otool) already found and read the same file
+          # correctly.
           echo "== otool -L: only /System/, /usr/lib/, and the bundled CEF framework =="
           for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
-            "$app/Contents/MacOS/cod-browser" "${helpers[@]}"; do
+            "$app/Contents/MacOS/cod-browser" "$app/Contents/Frameworks/Cod Helper.app/Contents/MacOS/Cod Helper"; do
             echo "-- $bin --"
             otool -L "$bin"
             other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
