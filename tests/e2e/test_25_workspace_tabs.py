@@ -807,23 +807,33 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         with self.step("switch to the second (clean) workspace, hover the first tab, click its close button"):
             self.click_tab(self.state(), 1)
             state = self.wait_for_tabs("the second tab active", {"active": [False, True]})
+            workspace_ids = [workspace["id"] for workspace in state["workspaces"]]
+            shown_id = workspace_ids[1]
             self.hover_tab(state, 0)
             state = self.state()
             self.click_close_button(state, 0)
             state = self.wait_for(lambda state: state["prompt"] is not None, SHOW_TIMEOUT, "a prompt to save main.rs")
 
         with self.step("cancel the prompt (escape): the workspace is kept, both tabs remain"):
-            # Cod shows one workspace's window at a time, so closing a background tab's prompt
-            # shows it first (as the state just above already found: it is the active one, not
-            # the second, once the prompt is up); canceling just means neither tab is lost.
+            # Closing a background tab shows it for the prompt, then restores the workspace
+            # the user was working in. Its clean buffer list does not describe the dirty one.
             self.keys("escape")
             self.wait_for(lambda state: state["prompt"] is None, SHOW_TIMEOUT, "the prompt to close")
             state = self.wait_for_tabs(
                 "both workspaces still open", {"names": ["billing-api", UNNAMED], "workspace_count": 2}
             )
+            state = self.wait_until_shown(shown_id, 2, "Cancel restores the clean workspace")
+            self.expect_equal("Cancel preserves both workspace identities", workspace_ids,
+                              [workspace["id"] for workspace in state["workspaces"]])
 
         with self.step("the dirtied buffer is still dirty: nothing was saved or discarded"):
+            self.click_tab(state, 0)
+            state = self.wait_until_shown(workspace_ids[0], 2, "the original dirty workspace shown")
             self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
+            self.expect_equal("unsaved draft remains in the original workspace", True,
+                              any("// draft " in item["text"] for item in state["unsaved_texts"]))
+            self.expect_equal("Cancel did not save the file", BILLING_API["src/main.rs"],
+                              (billing_api / "src/main.rs").read_text())
 
     # Issue #81 (QA #91): closing a background workspace with unsaved edits shows it for the
     # prompt; afterwards the user is back on the workspace they were using, whatever the answer.
