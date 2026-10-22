@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::item::test::TestItem;
@@ -1950,6 +1949,11 @@ async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &
         .unwrap();
     let windows_before = cx.update(|cx| cx.windows().len());
 
+    // The test platform makes the newest window active; leave no window active so the fallbacks are what is tested.
+    if let Some(active) = cx.update(|cx| cx.active_window()) {
+        VisualTestContext::from_window(active, cx).deactivate_window();
+    }
+
     // B was focused, then the OLDER window A. The newest-window fallback would pick B, so only the last-focused record can make the action reach A.
     cx.update(|cx| cod_set_last_focused_window(window_b, cx));
     cx.update(|cx| cod_set_last_focused_window(window_a, cx));
@@ -2027,15 +2031,14 @@ fn cod_workspace_reached_without_active_window(cx: &mut TestAppContext) -> Entit
         None,
         "precondition: no window is active, so the fallbacks are what is tested"
     );
-    let seen: Rc<RefCell<Option<Entity<Workspace>>>> = Rc::new(RefCell::new(None));
+    // `with_active_or_new_workspace` requires a `Send` callback, so the result travels through an `Arc<Mutex<_>>`.
+    let seen: Arc<Mutex<Option<Entity<Workspace>>>> = Arc::new(Mutex::new(None));
     cx.update(|cx| {
         let seen = seen.clone();
         with_active_or_new_workspace(cx, move |_workspace, _window, cx| {
-            seen.borrow_mut().replace(cx.entity().clone());
+            seen.lock().unwrap().replace(cx.entity().clone());
         });
     });
     cx.run_until_parked();
-    seen.borrow_mut()
-        .take()
-        .expect("the action reached a workspace")
+    seen.lock().unwrap().take().expect("the action reached a workspace")
 }
