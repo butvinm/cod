@@ -132,15 +132,10 @@ pub fn render_cod_workspace_tabs(
     let multi_workspace = multi_workspace.read(cx);
     let active = multi_workspace.workspace().clone();
     let members = multi_workspace.cod_shown_names(cx);
-    // #77 C4: capping the row's own box (with min_w_0 removed for F1, or with an absolute
-    // max_w measured from the window) did not make the tabs inside it actually shrink when the
-    // title bar is genuinely too narrow for all of them at COD_TAB_MAX_WIDTH each; each tab's
-    // own `max_w` is what reliably works (it already does, for the constant 280 px cap), so when
-    // an equal share of the title bar's measured width for every shown tab is less than that,
-    // each tab's own cap shrinks to that share instead, forcing the real constraint without
-    // depending on the row's own shrink behavior at all. Checked by
-    // test_ac7_narrow_window_many_short_tabs_stay_inside_the_bar, which narrows its own sway
-    // output to 640 px inside the default test batch.
+    // #77 C4: each tab is capped at COD_TAB_MAX_WIDTH, or at an equal share of the window width
+    // (less 96 px for the title bar's other items) when the bar is too narrow for every tab at
+    // that width. The cap is on each tab, not on the row, so the row keeps its natural width
+    // when there is room (F1).
     let tab_max_width = {
         let available = (window.viewport_size().width - px(96.)).max(px(0.));
         let fair_share = px(f32::from(available) / members.len().max(1) as f32);
@@ -148,9 +143,7 @@ pub fn render_cod_workspace_tabs(
     };
     // #77 F2: the same ghost tokens Zed's own title bar buttons use (a toggled IconButton), so
     // every theme stays coherent: ghost_element_selected for the active tab, ghost_element_hover
-    // on hover, no background (the title bar shows through) otherwise, and no separate border
-    // color on any tab (the previous `border` token was unrelated to either the fill or the bar,
-    // and read as a third, incoherent grey against them).
+    // on hover, no background (the title bar shows through) otherwise, and no border.
     let colors = cx.theme().colors();
     let (active_text, active_bg) = (colors.text, colors.ghost_element_selected);
     let (inactive_text, hover_bg) = (colors.text_muted, colors.ghost_element_hover);
@@ -183,15 +176,10 @@ pub fn render_cod_workspace_tabs(
         // against the room it got, to report whether the name was cut.
         let rest_text: SharedString = rest.to_string().into();
         let measured_layout = layout.clone();
-        // #77 F1: `content` keeps its own `min_w_0`: once `tab` below is capped at
-        // COD_TAB_MAX_WIDTH, `content` (and inside it, the label) must still be able to shrink
-        // to that width, or the label reports its full, unclipped natural width as the "room" it
-        // got and `cut` below never becomes true for a name that really is too long. What must
-        // NOT have `min_w_0` is the tabs *row* and the left group that holds it
-        // (`title_bar.rs`): those feed the title bar's outer three-group layout, and having
-        // `min_w_0` there made that outer layout measure their natural (max-content) width as
-        // far smaller than the tab labels actually need, cutting even short names like "New
-        // workspace" with most of the title bar still empty.
+        // #77 F1: `content` has `min_w_0` so it (and the label in it) can shrink to the tab's
+        // cap. The tabs row and the group that holds it (`title_bar.rs`) must not: with it, the
+        // title bar's three-group layout measured them narrower than their labels and cut
+        // short names in an empty bar.
         let content = h_flex()
             .min_w_0()
             .gap_1()
@@ -360,14 +348,8 @@ pub fn render_cod_workspace_tabs(
         weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
             .ok();
     };
-    // #77 F1/C4: no `min_w_0`/`overflow_x_hidden` here: this row should report its true natural
-    // width when there is room for it (F1). Measured: capping this row's own box, whether with
-    // `min_w_0` (which also regressed F1's ample-space fix) or an absolute `max_w` computed from
-    // the window, did not make the tabs inside it actually shrink when the title bar is
-    // genuinely too narrow for all of them (the overflow measured exactly the same regardless).
-    // Each tab's own `max_w` is what reliably works (`tab_max_width` above, computed per tab
-    // from the window's own measured width divided evenly among them), so the row itself is left
-    // alone and the real constraint lives there instead.
+    // #77 F1/C4: no `min_w_0` or `overflow_x_hidden` here, so the row reports its natural width
+    // when there is room; the tabs' own caps (`tab_max_width`) keep it inside a full bar.
     h_flex()
         .h_full()
         .on_mouse_up(MouseButton::Left, cancel.clone())

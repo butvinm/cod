@@ -1954,13 +1954,13 @@ async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &
         VisualTestContext::from_window(active, cx).deactivate_window();
     }
 
-    // B was focused, then the OLDER window A. The newest-window fallback would pick B, so only the last-focused record can make the action reach A.
+    // B was focused, then the OLDER window A. The last-resort fallback (the last window `cx.windows()` lists) picks B here, so only the last-focused record can make the action reach A.
     cx.update(|cx| cod_set_last_focused_window(window_b, cx));
     cx.update(|cx| cod_set_last_focused_window(window_a, cx));
     assert_eq!(
         cod_workspace_reached_without_active_window(cx),
         workspace_a,
-        "expected the action to reach the last-focused older window A, not the newest window B"
+        "expected the action to reach the last-focused older window A, not the fallback window B"
     );
 
     // Clearing B's record (as B's window releasing would) while A is the current record must not clear A's.
@@ -1971,12 +1971,12 @@ async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &
         "clearing a different window's record must not clear the current one"
     );
 
-    // Once A's own record is cleared (A releasing), nothing is recorded and the newest open window is still a safer target than a new one.
+    // Once A's own record is cleared (A releasing), nothing is recorded: the action still reaches an already-open window (which one is slot order, not a promise), never a new one.
     cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
-    assert_eq!(
-        cod_workspace_reached_without_active_window(cx),
-        workspace_b,
-        "with no record the action falls back to the newest open window"
+    let reached = cod_workspace_reached_without_active_window(cx);
+    assert!(
+        reached == workspace_a || reached == workspace_b,
+        "with no record the action falls back to an open window's workspace"
     );
     assert_eq!(
         cx.update(|cx| cx.windows().len()),

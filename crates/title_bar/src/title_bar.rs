@@ -310,11 +310,9 @@ impl Render for TitleBar {
 
         let cod_tabs = self.render_cod_tabs(window, cx);
         children.push(
-            // #77 F1: no `min_w_0` here (see cod_workspace_tabs.rs): this group (the tabs, or
-            // Zed's own project/branch items on a non-Cod build) should report its true natural
-            // width to the title bar's three-group row, and only the tabs themselves shrink once
-            // the bar runs out of room for them (each tab's own `max_w`, computed per tab from
-            // the window's own measured width when the bar is genuinely too narrow, C4).
+            // #77 F1: no `min_w_0` here (see cod_workspace_tabs.rs): this group reports its
+            // natural width to the title bar's three-group row; only the tabs shrink, each to
+            // its own cap, once the bar is full (C4).
             h_flex()
                 .h_full()
                 .gap_0p5()

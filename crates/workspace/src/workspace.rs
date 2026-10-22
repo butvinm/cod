@@ -13286,18 +13286,14 @@ pub fn with_active_or_new_workspace(
 ) {
     // Cod #77 V1/C3: `cx.active_window()` is the window with keyboard focus, which the platform
     // does not always report right away (for example right after a command palette entry closes
-    // it and before focus returns to the window behind it), and a headless test compositor with
-    // no real keyboard never reports one at all, so its own activation events the next fallback
-    // relies on never fire either. Falling straight to `open_new` here opened a second, mostly-
-    // empty window the moment a fresh profile's first command (Show Welcome, closing onboarding)
-    // ran before any window had become "active". The first fallback is the last Cod window the
-    // platform did report active and that is still open (`multi_workspace::
-    // cod_last_focused_window`, tracked by an activation observer each `MultiWorkspace` registers
-    // at creation): the one a person was last actually looking at, when the platform ever told us
-    // so. The last-resort fallback, only when neither of those saw any focus at all, is the
-    // newest open `MultiWorkspace` window; `cx.windows()` is a `SlotMap` in no particular focus
-    // or creation order, but any already-open window is still a safer target than a brand new one
-    // for a shared, window-agnostic action like this.
+    // and before focus returns to the window behind it); a headless compositor with no keyboard
+    // never reports one. Opening a new window then gave a fresh profile a second, mostly-empty
+    // window on its first command (Show Welcome after closing onboarding). The first fallback is
+    // the last Cod window the platform reported active that is still open
+    // (`multi_workspace::cod_last_focused_window`). The last resort, when no window was ever
+    // reported active, is any open `MultiWorkspace` window: the last one `cx.windows()` lists,
+    // which is slot order, not focus or creation order. Any open window is a safer target than
+    // a new one for a shared, window-agnostic action like this.
     let multi_workspace = cx
         .active_window()
         .and_then(|w| w.downcast::<MultiWorkspace>())
