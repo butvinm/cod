@@ -25,7 +25,7 @@ def prepare(data: Path) -> None:
     ]}))
     settings = cod_settings()
     settings["agent_servers"] = {
-        "claude": fake_agent_settings(script, log=data / "mac-agent.log")
+        "claude-acp": fake_agent_settings(script, log=data / "mac-agent.log")
     }
     (config / "settings.json").write_text(json.dumps(settings))
     make_repo(data, "project", {"README.md": "# Mac candidate fixture\n"})
@@ -82,8 +82,9 @@ def exercise(data: Path, socket_path: Path, codctl: str, artifacts: Path) -> Non
         page(history_id, "Mac history start")
         ctl("page", "forward", history_id)
         page(history_id, "Mac history destination")
+        (data / "history-next.html").write_text("<title>Mac history reloaded</title><h1>Reloaded</h1>")
         ctl("page", "reload", history_id)
-        page(history_id, "Mac history destination")
+        page(history_id, "Mac history reloaded")
         capture("mac-history")
         ctl("page", "close", history_id)
         wait(lambda s: all(p["id"] != history_id for p in s["pages"]["open"]), "history closed")
