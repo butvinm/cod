@@ -1009,6 +1009,32 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             if color_distance(icon, bg) <= COLOR_TOLERANCE:
                 raise AssertionError("expected keyboard focus to reveal the close icon without hover")
 
+        for resize_width in (560, 640):
+            with self.step(f"resize to {resize_width} px: the first tab keeps focus and stays revealed while the last workspace stays active"):
+                self.narrow_the_output(resize_width, 600)
+
+                def focused_tab_still_revealed(state: dict[str, Any]) -> bool:
+                    return (
+                        state["active_workspace"] == 5
+                        and title_bar(state)["tabs"][0]["focused"]
+                        and self.tab_is_revealed(state, 0)
+                    )
+
+                state = self.wait_for(
+                    lambda state: self.cod_window_width() == float(resize_width) and focused_tab_still_revealed(state),
+                    SHOW_TIMEOUT,
+                    f"the {resize_width} px window with the first tab focused and revealed, last workspace active",
+                )
+
+                def focus_and_controls_stay_visible(state: dict[str, Any]) -> bool:
+                    self.assert_plus_reachable(state, float(resize_width))
+                    return focused_tab_still_revealed(state)
+
+                # Watch later frames too: active-workspace reveal must not override keyboard
+                # focus after the resize's first correct frame. Do not refocus the tab here.
+                state = self.stays(focus_and_controls_stay_visible, SETTLE_TIME, "focused tab and adjacent plus remain visible after resize")
+                self.assert_tab_controls_in_view(state, 0)
+
         with self.step("Enter activates the focused workspace, then Tab reaches its close control without label jitter"):
             self.keys("enter")
             state = self.wait_for_tabs("the first workspace selected by keyboard", {"active_workspace": 0, "active": one_hot(6, 0)})
