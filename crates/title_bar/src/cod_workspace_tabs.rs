@@ -200,6 +200,7 @@ fn status_dot(status: CodStatus, index: usize, layout: &Rc<RefCell<CodTabsLayout
 pub fn render_cod_workspace_tabs(
     multi_workspace: &Entity<MultiWorkspace>,
     layout: Rc<RefCell<CodTabsLayout>>,
+    window: &Window,
     cx: &mut App,
 ) -> AnyElement {
     let weak: WeakEntity<MultiWorkspace> = multi_workspace.downgrade();
@@ -421,17 +422,23 @@ pub fn render_cod_workspace_tabs(
         weak.update(cx, |multi_workspace, _| multi_workspace.cod_cancel_tab_press())
             .ok();
     };
-    // #77 F1/C4: `max_w(relative(1.))` alone did not actually cap this row: measured, it had no
-    // effect (six short-named tabs in a 640 px bar still ran the same 120 px past its right
-    // edge), so the row's own "how much room is available" must itself already be wrong without
-    // `min_w_0` once there truly is not enough room for every tab at its natural width. `min_w_0`
-    // is back here (it alone, not on the left group below, kept the ample-space measurement
-    // correct too): each tab already shrinks on its own (its own `min_w_0` and `max_w`), and the
-    // title bar's own outer row already clips (`platform_title_bar.rs`'s `overflow_x_hidden`).
+    // #77 F1/C4: no `min_w_0`/`overflow_x_hidden` here: each tab already shrinks on its own (its
+    // own `min_w_0` and `max_w`), and this row should otherwise report its true natural width
+    // when there is room for it. Measured: `min_w_0` on this row, or on the left group that holds
+    // it (title_bar.rs), does let the row shrink in a genuinely too-narrow title bar, but the
+    // layout engine conflates that with the "how much do I want" measurement that must stay
+    // natural for the ample-space case, regressing it back to its original bug. `max_w` here is
+    // instead computed from the window's own measured width directly, not the ancestor chain's
+    // possibly-wrong "available space": a hard, absolute cap that does not have that conflict.
+    // The margin subtracted is this title bar's own left padding and window controls/menu
+    // (roughly 32-40 px, measured); generous rather than exact, since overshooting it by a little
+    // only means the row could in principle still be a little too wide for extreme cases this
+    // margin does not fully account for (many tabs plus a wide collaborator list or call
+    // controls on the right), not that it stops capping at all.
+    let bar_max_width = (window.viewport_size().width - px(96.)).max(px(0.));
     h_flex()
         .h_full()
-        .min_w_0()
-        .max_w(relative(1.))
+        .max_w(bar_max_width)
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
         .on_children_prepainted(move |bounds, _window, _cx| {
