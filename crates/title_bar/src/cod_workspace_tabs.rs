@@ -517,7 +517,7 @@ pub fn render_cod_workspace_tabs(
         .h_full()
         .on_mouse_up(MouseButton::Left, cancel.clone())
         .on_mouse_up_out(MouseButton::Left, cancel)
-        .on_children_prepainted(move |bounds, window, _cx| {
+        .on_children_prepainted(move |bounds, window, cx| {
             let mut layout = layout.borrow_mut();
             layout.tabs_viewport = bounds.first().copied();
             layout.add_button = bounds.get(1).copied();
@@ -528,7 +528,8 @@ pub fn render_cod_workspace_tabs(
                 // The scroll handle learns the resized viewport during prepaint, after its
                 // reveal pass. Repeat once with those actual bounds instead of the old width.
                 resized_scroll.scroll_to_item(reveal_index);
-                window.refresh();
+                // Refresh is ignored during prepaint, so invalidate after drawing finishes.
+                window.defer(cx, |window, _cx| window.refresh());
             }
         })
         .child(
@@ -537,7 +538,7 @@ pub fn render_cod_workspace_tabs(
                 .flex_1()
                 .h_full()
                 .items_end()
-                .on_children_prepainted(move |_, window, _cx| {
+                .on_children_prepainted(move |_, window, cx| {
                     // Tracked scroll containers keep child bounds on their handle instead of
                     // passing them to this callback. Include the painted scroll offset.
                     let offset = drawn_scroll.offset();
@@ -550,7 +551,7 @@ pub fn render_cod_workspace_tabs(
                         });
                     }
                     if content_width.replace(Some(width)) != Some(width) {
-                        window.refresh();
+                        window.defer(cx, |window, _cx| window.refresh());
                     }
                 })
                 .id("cod-workspace-tabs-scroll")
