@@ -727,7 +727,10 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
         ids = {workspace["name"]: workspace["id"] for workspace in state["workspaces"]}
         pressed = center(title_bar(state)["tabs"][1]["close_bounds"])
 
-        with self.step("press B's close button, remove A through codctl, wait for the bar drawn as [B, C]"):
+        with self.step("rest the pointer on B's close button and press it, remove A through codctl, wait for the bar drawn as [B, C]"):
+            # B is not the active tab, so its close button is drawn (and takes presses) only while its tab is hovered.
+            # Pressing without a drawn hover frame first would miss the button, and the test would pass whatever the button's id is keyed by.
+            self.hover_at(*pressed)
             self.mouse_down_at(*pressed)
             result = self.codctl("workspace", "close", "--workspace", "A", "--force", "--json")
             if result.returncode != 0:
