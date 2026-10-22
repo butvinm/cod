@@ -7,6 +7,7 @@ Session states come from the driver's set_entry test fixture (tests/e2e/cod_stat
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
@@ -15,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from cod_e2e import CodTestCase
+from cod_e2e import COMMAND_TIMEOUT, CodTestCase, processes_with_marker, sway_socket
 from cod_status_fixtures import (
     REMOVED_ITEMS,
     TAB_MAX_WIDTH,
@@ -113,6 +114,18 @@ def tabs_view(state: dict[str, Any]) -> dict[str, Any]:
 
 def one_hot(count: int, index: int) -> list[bool]:
     return [position == index for position in range(count)]
+
+
+def sway_ipc(*args: str) -> Any:
+    """Runs swaymsg against the private sway of this run (script/e2e) and returns its JSON reply."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    sway = sway_socket(Path(runtime)) if runtime else None
+    if sway is None:
+        raise AssertionError(f"no sway IPC socket in XDG_RUNTIME_DIR={runtime!r}: run the end-to-end tests with script/e2e")
+    reply = subprocess.run(["swaymsg", "-s", str(sway), "-r", *args], capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+    if reply.returncode != 0:
+        raise AssertionError(f"swaymsg {' '.join(args)} failed with status {reply.returncode}: {reply.stdout.strip()} {reply.stderr.strip()}")
+    return json.loads(reply.stdout)
 
 
 class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
@@ -734,28 +747,72 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             self.expect_equal("main.rs still dirty", ["main.rs"], state["dirty_tabs"])
 
     # Issue #77 C4: natural width when there is room must not break correct shrinking when the
-    # title bar is genuinely full. Run with COD_E2E_OUTPUT_MODE=640x600.
+    # title bar is genuinely full. The test makes its own narrow window: it sets the output of
+    # this run's sway to 640x600 logical pixels before Cod starts and restores the output's own
+    # mode afterwards, so it runs in the same default script/e2e batch as the other tests.
+
+    def narrow_the_output(self, width: int, height: int) -> None:
+        """Sets the sway output to `width` x `height` logical pixels until the test ends."""
+        output = next((output for output in sway_ipc("-t", "get_outputs") if output.get("active")), None)
+        if output is None:
+            raise AssertionError("expected an active sway output")
+        scale = output.get("scale") or 1.0
+        mode = output["current_mode"]
+        original = f"{mode['width']}x{mode['height']}"
+        sway_ipc("output", output["name"], "resolution", f"{round(width * scale)}x{round(height * scale)}")
+        self.addCleanup(sway_ipc, "output", output["name"], "resolution", original)
+
+    def cod_window_width(self) -> float:
+        """The logical width sway gave Cod's window."""
+        assert self.cod is not None
+        pids = set(processes_with_marker(self.cod.marker))
+        widths: list[float] = []
+
+        def walk(node: dict[str, Any]) -> None:
+            if node.get("pid") in pids and node.get("type") in ("con", "floating_con"):
+                widths.append(node["rect"]["width"])
+            for child in [*node.get("nodes", []), *node.get("floating_nodes", [])]:
+                walk(child)
+
+        walk(sway_ipc("-t", "get_tree"))
+        if len(widths) != 1:
+            raise AssertionError(f"expected one Cod window in sway's tree, actual widths {widths}")
+        return float(widths[0])
 
     def test_ac7_narrow_window_many_short_tabs_stay_inside_the_bar(self) -> None:
         """Six default workspaces, each able to grow up to COD_TAB_MAX_WIDTH, in a 640 px title
         bar: every tab, its close button and "+" must stay inside it, and a name that does not
         fit is cut (truncated), not left overflowing past the window edge or blank."""
-        with self.step("start Cod with a fresh profile and open five more default workspaces"):
+        with self.step("narrow this run's output to 640x600 for this test only"):
+            self.narrow_the_output(640, 600)
+
+        with self.step("start Cod with a fresh profile: its window is 640 px wide"):
             self.start_cod(None)
-            self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            state = self.wait_for_tabs("the first tab", {"names": [UNNAMED], "active": [True]})
+            bar_width = self.cod_window_width()
+            self.expect_equal("Cod's window width", 640.0, bar_width)
+
+        with self.step('open five more default workspaces with "+", which stays inside the window for every click'):
             for expected_count in range(2, 7):
-                self.click_add_button(self.state())
+                add = title_bar(state)["add_button"]["bounds"]
+                if drawn(add) and add["x"] + add["width"] > bar_width + 0.5:
+                    raise AssertionError(
+                        f'expected the "+" button inside the {bar_width} px window before opening workspace '
+                        f'{expected_count}, actual right edge {add["x"] + add["width"]}; tab right edges: '
+                        f'{[tab["bounds"]["x"] + tab["bounds"]["width"] for tab in title_bar(state)["tabs"]]}'
+                    )
+                self.click_add_button(state)
                 state = self.wait_for(
-                    lambda state, expected_count=expected_count: state["workspace_count"] == expected_count,
+                    lambda state, expected_count=expected_count: state["workspace_count"] == expected_count
+                    and len(title_bar(state)["tabs"]) == expected_count,
                     SHOW_TIMEOUT,
-                    f"{expected_count} workspaces",
+                    f"{expected_count} workspaces and tabs",
                 )
 
         with self.step("every tab, its close button and + stay inside the 640 px title bar"):
             bar = title_bar(state)
             tabs = bar["tabs"]
             self.expect_equal("six tabs drawn", 6, len(tabs))
-            bar_width = 640.0
             for index, tab in enumerate(tabs):
                 if not drawn(tab["bounds"]) or tab["bounds"]["width"] <= 0:
                     raise AssertionError(f"expected tab {index} drawn with a positive width, actual {tab['bounds']!r}")
