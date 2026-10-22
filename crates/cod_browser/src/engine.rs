@@ -25,6 +25,13 @@ const MAX_PENDING_CONSOLE: usize = 64;
 /// Console messages queued for sending and not yet written.
 static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 
+/// Logged once, the first time any page's `on_paint` fires on macOS (#23 round 3 diagnosis M2):
+/// off-screen rendering depends on CEF's own UI-thread message loop actually making progress
+/// (round 2 found it was not), so this one line makes the next failure visible without needing a
+/// full frame dump.
+#[cfg(target_os = "macos")]
+static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
+
 use protocol::{MAX_URL_BYTES, limited};
 
 /// Whether a console line is forwarded at this pending-console backlog (RC review B5, final
@@ -190,6 +197,10 @@ wrap_render_handler! {
             }
             // The same checked size the writer and the reader use, so a bogus size from the engine is dropped before any slice or copy is made.
             let (width, height) = (width as u32, height as u32);
+            #[cfg(target_os = "macos")]
+            if !FIRST_FRAME_LOGGED.swap(true, Ordering::AcqRel) {
+                eprintln!("cod-browser: first frame {width}x{height}");
+            }
             let Ok(length) = protocol::frame_byte_len(width, height) else {
                 eprintln!("cod-browser: dropped a frame of {width}x{height}");
                 return;
@@ -409,6 +420,39 @@ wrap_client! {
     }
 }
 
+/// Runs an arbitrary closure on CEF's own UI thread on macOS (#23 round 3 diagnosis M1).
+///
+/// Linux sets `multi_threaded_message_loop` (see `main`), so CEF spins its own UI thread and
+/// `handle`'s calls into `browser_host_create_browser` and the `BrowserHost`/`Frame` methods,
+/// made from this helper's reader thread, are the documented "callable from any thread" entry
+/// points that mode relies on. `multi_threaded_message_loop` is Windows/Linux only; without it,
+/// macOS round 2 showed the browser gets created (on_after_created still fired) but no further
+/// progress (the page's own HTTP request only reached the fixture server at process shutdown):
+/// evidence that those same calls need to run on the thread actually driving `run_message_loop`
+/// instead. `post_task(ThreadId::UI, ...)` is the marshaling cef-rs's own macOS examples use for
+/// exactly this.
+#[cfg(target_os = "macos")]
+fn post_to_ui_thread(work: impl FnOnce() + Send + 'static) {
+    let work: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::new(Mutex::new(Some(Box::new(work))));
+    post_task(ThreadId::UI, Some(&mut UiTask::new(work)));
+}
+
+#[cfg(target_os = "macos")]
+wrap_task! {
+    struct UiTask {
+        work: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Ok(mut slot) = self.work.lock() else { return };
+            if let Some(work) = slot.take() {
+                work();
+            }
+        }
+    }
+}
+
 fn switch_value(prefix: &str) -> Option<String> {
     std::env::args().find_map(|argument| argument.strip_prefix(prefix).map(str::to_owned))
 }
@@ -516,10 +560,9 @@ pub fn main() {
     };
     // Only Windows and Linux support `multi_threaded_message_loop` (CEF spins its own UI thread);
     // on macOS it must stay 0 (the default) and the main thread runs `run_message_loop` instead,
-    // handled below. `browser_host_create_browser` and the `BrowserHost` methods `handle` calls
-    // are documented safe to call from any thread in both modes (that is the point of the
-    // `multi_threaded_message_loop` Linux already relies on here), so `handle` itself needs no
-    // macOS-specific change: only which thread drives CEF's own message pump differs.
+    // handled below. Round 2 found that macOS still needs `handle`'s calls marshaled onto that
+    // thread (`post_to_ui_thread`, #23 round 3 diagnosis M1), unlike Linux: this is the one
+    // deliberate difference `input_loop` has between the two platforms.
     #[cfg(target_os = "linux")]
     {
         settings.multi_threaded_message_loop = 1;
@@ -587,7 +630,12 @@ pub fn main() {
                 quit_message_loop();
             })
             .expect("cod-browser: cannot start the input thread");
+        // #23 round 3 diagnosis M1: makes it visible in cod-browser's own stderr (collected into
+        // cod-stderr.log) whether this thread ever actually enters and returns from the message
+        // loop, rather than inferring it indirectly from whether pages ever load.
+        eprintln!("cod-browser: entering run_message_loop");
         run_message_loop();
+        eprintln!("cod-browser: run_message_loop returned");
         shutdown();
         std::process::exit(0);
     }
@@ -598,6 +646,11 @@ pub fn main() {
 /// Reads one `ToBrowser` message at a time from the control socket and runs it, until the socket
 /// closes (Cod exited) or sends something unreadable twice in a row is never the case here:
 /// `ToBrowser::read_from` already resyncs after a single oversized message (RC review B4).
+///
+/// On macOS (#23 round 3 diagnosis M1), this thread only does socket I/O and decoding: every
+/// `handle` call is marshaled onto CEF's own UI thread with `post_to_ui_thread` instead of
+/// running directly here. On Linux this is unchanged: `handle` still runs on this thread, exactly
+/// as before `multi_threaded_message_loop` was added for #16.
 fn input_loop(stream: UnixStream, out: mpsc::Sender<Outgoing>, pages: Pages) {
     let mut input = BufReader::new(stream);
     loop {
@@ -616,6 +669,13 @@ fn input_loop(stream: UnixStream, out: mpsc::Sender<Outgoing>, pages: Pages) {
                 std::process::exit(0);
             }
         };
+        #[cfg(target_os = "macos")]
+        {
+            let out = out.clone();
+            let pages = pages.clone();
+            post_to_ui_thread(move || handle(message, &out, &pages));
+        }
+        #[cfg(not(target_os = "macos"))]
         handle(message, &out, &pages);
     }
 }
