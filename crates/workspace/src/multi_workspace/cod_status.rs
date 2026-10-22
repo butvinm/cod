@@ -325,22 +325,44 @@ mod tests {
         };
         let store = cx.update(CodStatusStore::global);
         store.update(cx, |store, cx| {
-            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::Working), cx);
-            store.set_entry(workspace, entry("page", CodEntryKind::Page, CodStatus::Error), cx);
+            store.set_entry(
+                workspace,
+                entry("chat", CodEntryKind::Session, CodStatus::Working),
+                cx,
+            );
+            store.set_entry(
+                workspace,
+                entry("page", CodEntryKind::Page, CodStatus::Error),
+                cx,
+            );
         });
         store.read_with(cx, |store, _| {
             assert_eq!(store.workspace_status(workspace), CodStatus::Error);
             assert!(store.has_running_session(workspace));
         });
         store.update(cx, |store, cx| {
-            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::NeedsInput), cx);
+            store.set_entry(
+                workspace,
+                entry("chat", CodEntryKind::Session, CodStatus::NeedsInput),
+                cx,
+            );
         });
         store.read_with(cx, |store, _| assert!(store.has_running_session(workspace)));
         store.update(cx, |store, cx| {
-            store.set_entry(workspace, entry("chat", CodEntryKind::Session, CodStatus::Done), cx);
+            store.set_entry(
+                workspace,
+                entry("chat", CodEntryKind::Session, CodStatus::Done),
+                cx,
+            );
             // A loading page is not an agent session: closing does not stop an agent.
-            store.set_entry(workspace, entry("page", CodEntryKind::Page, CodStatus::Working), cx);
+            store.set_entry(
+                workspace,
+                entry("page", CodEntryKind::Page, CodStatus::Working),
+                cx,
+            );
         });
-        store.read_with(cx, |store, _| assert!(!store.has_running_session(workspace)));
+        store.read_with(cx, |store, _| {
+            assert!(!store.has_running_session(workspace))
+        });
     }
 }

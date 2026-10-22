@@ -1091,10 +1091,7 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if previous != doomed
-            && self.workspace() == doomed
-            && self.held_index(previous).is_some()
-        {
+        if previous != doomed && self.workspace() == doomed && self.held_index(previous).is_some() {
             self.activate(previous.clone(), None, window, cx);
         }
     }

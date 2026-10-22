@@ -32,12 +32,12 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
-    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
-};
-pub use multi_workspace::{
     COD_UNNAMED_WORKSPACE, CodShownName, is_unnamed_default, member_name_and_folders,
     tab_display_name,
+};
+pub use multi_workspace::{
+    CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
+    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
 pub use multi_workspace::{
     CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, cod_rollup,
