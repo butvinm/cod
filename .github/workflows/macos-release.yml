@@ -77,7 +77,8 @@ jobs:
           set -euo pipefail
           # An observation-only push can consume the corrected package before this
           # workflow exists on the default branch. No extra build is needed.
-          if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+          if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && \
+            [ "$GITHUB_REF" = "refs/heads/macos-preview/remaining-acceptance-20261023" ]; then
             parent=$(git rev-parse HEAD^)
             if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py' && \
               ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml tests/e2e/macos_candidate_smoke.py; then
@@ -1045,6 +1046,226 @@ jobs:
           fi
 
           exit $status
+
+      - name: Working close provider lifetime on the extracted package
+        env:
+          EXPECTED_COD_COMMIT: ${{ steps.reuse.outputs.commit || github.sha }}
+          EXPECTED_COD_VERSION: ${{ steps.reuse.outputs.run_number || github.run_number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tests/e2e"
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          package=$(mktemp -d "${RUNNER_TEMP}/cod-provider-close.XXXXXX")
+          ditto -x -k cod-macos-aarch64.zip "$package"
+          python3 - "$package/Cod.app" "$PWD/smoke-artifacts/provider-close" <<'PY'
+          """Only explicit Working Close and provider process observation on retained Mac bytes."""
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          from cod_e2e import Driver, cod_settings, make_repo, palette_problem
+          from fake_acp_agent import fake_agent_settings
+
+          app, output = (Path(x).resolve() for x in sys.argv[1:])
+          output.mkdir(parents=True, exist_ok=False)
+          head = os.environ["EXPECTED_COD_COMMIT"]
+          version = os.environ["EXPECTED_COD_VERSION"]
+          assert (app / "Contents/Resources/cod-commit.txt").read_text().strip() == head
+          plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+          assert plist["CodCommit"] == head and plist["CFBundleVersion"] == version
+          data = Path(tempfile.mkdtemp(prefix="cod-remaining-")).resolve()
+          repo = make_repo(data, "agent-safety-notes", {"README.txt": "Working close observation.\n"})
+          control = data / "advance-to-permission"
+          script = data / "agent.json"
+          script.write_text(json.dumps({"session_ids": ["mac-safety-session"], "turns": [{"steps": [
+              {"chunk": "Reviewing the release notes."}, {"wait": str(control)},
+              {"end": "end_turn"}]}]}))
+          settings = cod_settings()
+          settings["theme"] = "One Dark"
+          settings["agent_servers"] = {"claude-acp": fake_agent_settings(script, log=output / "fake-agent.log")}
+          (data / "config").mkdir()
+          (data / "config/settings.json").write_text(json.dumps(settings))
+          socket = Path(tempfile.mkdtemp(prefix="cod-rem-", dir="/tmp")) / "d.sock"
+          subprocess.run(["open", "-n", "--env", f"COD_PREVIEW_DIR={data}", "--env",
+                          f"COD_E2E_SOCKET={socket}", str(app), "--args", str(repo)],
+                         check=True, capture_output=True, text=True, timeout=30)
+          deadline = time.monotonic() + 30
+          while not socket.exists() and time.monotonic() < deadline:
+              time.sleep(.1)
+          driver = Driver(socket)
+          snapshot = subprocess.check_output(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,command="], text=True)
+          import shlex
+          editors = []
+          for line in snapshot.splitlines():
+              process_id, command = line.strip().split(None, 1)
+              args = shlex.split(command)
+              if args and args[0] == str(app / "Contents/MacOS/zed") and "--printenv" not in args:
+                  assert args[1:3] == ["--user-data-dir", str(data)], args
+                  editors.append(int(process_id))
+          assert len(editors) == 1, editors
+          pid = editors[0]
+          tracked = {}
+          (output / "identity.json").write_text(json.dumps({"source_commit": head, "version": version, "pid": pid,
+              "profile": str(data), "provider": "scripted fake ACP; no real-provider restore claim",
+              "shortcut_input": "native GPUI in-process driver keys/hover/click; System Events Cmd-Q only"}, indent=2))
+
+          def wait(predicate, description, timeout=25):
+              end = time.monotonic() + timeout
+              state = None
+              while time.monotonic() < end:
+                  state = driver.state()
+                  if predicate(state):
+                      return state
+                  time.sleep(.1)
+              raise AssertionError((description, state))
+
+          def keys(value):
+              driver.keys(value)
+
+          def action(name):
+              keys("super-shift-p")
+              wait(lambda s: s["modal"] == "command_palette", "palette")
+              driver.type(name)
+              wait(lambda s: palette_problem(name, s) is None, name)
+              keys("enter")
+              wait(lambda s: s["modal"] != "command_palette", "palette closed")
+
+          def os_key(letter):
+              subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
+                              f'(first process whose unix id is {pid}) to true', "-e",
+                              f'tell application "System Events" to keystroke "{letter}" using command down'],
+                             check=True, capture_output=True, text=True, timeout=15)
+
+          def capture(name):
+              time.sleep(.5)
+              (output / (name + ".json")).write_text(json.dumps(driver.state(), indent=2))
+              subprocess.run(["screencapture", "-x", "-t", "jpg", str(output / (name + ".jpg"))],
+                             check=True, timeout=15)
+              print("CAPTURE", name, flush=True)
+
+          def point(index, field="bounds"):
+              state = wait(lambda s: len(s["title_bar"]["tabs"]) == s["workspace_count"]
+                           and len(s["title_bar"]["tabs"]) > index
+                           and s["title_bar"]["tabs"][index][field]["width"] > 0, "drawn tab")
+              bounds = state["title_bar"]["tabs"][index][field]
+              return {"x": bounds["x"] + bounds["width"] / 2, "y": bounds["y"] + bounds["height"] / 2}
+
+          def close_background(status, label):
+              driver.request("hover", **point(0))
+              driver.request("click", **point(0, "close_bounds"))
+              state = wait(lambda s: s["prompt"] is not None, label + " prompt")
+              prompt = state["prompt"]
+              assert prompt["answers"] == ["Cancel", "Close"] and prompt["answers"][prompt["highlighted"]] == "Cancel", prompt
+              assert "agent-safety-notes" in prompt["message"] and "still working" in prompt["message"], prompt
+              assert state["workspaces"][0]["status"] == status, state["workspaces"]
+              capture(label + "-consent")
+
+          def processes():
+              rows = {}
+              raw = subprocess.check_output(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True)
+              for line in raw.splitlines():
+                  fields = line.split(None, 7)
+                  if len(fields) == 8:
+                      rows[int(fields[0])] = {"pid": int(fields[0]), "ppid": int(fields[1]),
+                                            "started": " ".join(fields[2:7]), "command": fields[7]}
+              return rows
+
+          def provider_tree():
+              rows = processes()
+              provider = [p for p, row in rows.items() if "fake_acp_agent.py" in row["command"] and row["ppid"] == pid]
+              assert len(provider) == 1, {"matching_direct_providers": provider}
+              selected = set(provider)
+              while True:
+                  expanded = selected | {p for p, row in rows.items() if row["ppid"] in selected}
+                  if expanded == selected:
+                      break
+                  selected = expanded
+              return {p: rows[p] for p in selected}
+
+          try:
+              wait(lambda s: s["window_active"] and len(s["worktrees"]) == 1, "ordinary project window")
+              subprocess.run(["osascript", "-e", 'tell application "System Events" to tell '
+                              f'(first process whose unix id is {pid}) to set position of front window to {{0, 25}}',
+                              "-e", 'tell application "System Events" to tell '
+                              f'(first process whose unix id is {pid}) to set size of front window to {{1000, 660}}'], check=True)
+              wait(lambda s: s.get("agent_panel_ready") is True, "agent panel ready")
+              action("agent: toggle focus")
+              action("agent: toggle new thread menu")
+              keys("end up enter")
+              wait(lambda s: (s.get("chat") or {}).get("agent") == "claude-acp", "scripted ACP agent")
+              driver.type("Review these notes.")
+              keys("enter")
+              wait(lambda s: (s.get("chat") or {}).get("status") == "working"
+                   and "Reviewing the release notes." in (s.get("chat") or {}).get("transcript", ""), "real ACP working state")
+              agent_workspace = driver.state()["workspaces"][0]["id"]
+              action("workspace: new workspace")
+              state = wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "second workspace")
+              shown = state["workspaces"][1]["id"]
+              close_background("working", "01-working-close")
+              tracked = provider_tree()
+              (output / "provider-before.json").write_text(json.dumps(list(tracked.values()), indent=2))
+              keys("right")
+              wait(lambda s: s["prompt"]["answers"][s["prompt"]["highlighted"]] == "Close", "Close selected")
+              keys("enter")
+              wait(lambda s: s["workspace_count"] == 1 and s["workspaces"][0]["id"] == shown, "explicit Close removes only target")
+              capture("02-surviving-workspace")
+              observation_start = time.monotonic()
+              end = observation_start + 12
+              survivors = tracked
+              while time.monotonic() < end:
+                  rows = processes()
+                  survivors = {p: rows[p] for p, before in tracked.items() if p in rows and rows[p]["started"] == before["started"]}
+                  # Include newly spawned children while a tracked process is still alive.
+                  for p, row in rows.items():
+                      if row["ppid"] in survivors and p not in tracked:
+                          tracked[p] = row
+                          survivors[p] = row
+                  if not survivors:
+                      break
+                  time.sleep(.1)
+              receipt = {"provider": "scripted fake ACP", "editor_pid": pid, "target_workspace": agent_workspace,
+                         "surviving_workspace": shown, "tracked": list(tracked.values()),
+                         "survivors_before_app_quit": list(survivors.values()), "budget_seconds": 12,
+                         "elapsed_seconds": time.monotonic() - observation_start,
+                         "forced_provider_signal": "none", "control_released": control.exists()}
+              (output / "provider-close-receipt.json").write_text(json.dumps(receipt, indent=2))
+              assert not survivors, receipt
+              assert not control.exists(), receipt
+              print("PASS explicit Working Close and observed provider tree gone before app quit; scripted ACP", flush=True)
+          finally:
+              try:
+                  capture("final")
+              finally:
+                  quit_started = time.monotonic()
+                  receipt = {"method": "exact-editor-native-Cmd-Q", "pid": pid, "forced_signal": "none"}
+                  try:
+                      os_key("q")
+                      end = time.monotonic() + 30
+                      while time.monotonic() < end:
+                          try:
+                              os.kill(pid, 0)
+                          except ProcessLookupError:
+                              receipt["exited"] = True
+                              break
+                          time.sleep(.1)
+                      assert receipt.get("exited"), receipt
+                  finally:
+                      receipt["elapsed_seconds"] = time.monotonic() - quit_started
+                      rows = processes()
+                      receipt["tracked_provider_survivors"] = [rows[p] for p, before in tracked.items()
+                          if p in rows and rows[p]["started"] == before["started"]]
+                      (output / "quit-receipt.json").write_text(json.dumps(receipt, indent=2))
+                      driver.close()
+                      for name in ("Zed.log", "cod-stderr.log"):
+                          source = data / "logs" / name
+                          if source.is_file():
+                              (output / name).write_bytes(source.read_bytes()[-512 * 1024:])
+          PY
 
       - name: Upload the zip and its checksum
         if: always()
