@@ -929,7 +929,16 @@ jobs:
           old_pid="$pid"
           quit_started=$(date +%s)
           quit_request_exit=0
-          osascript -e "tell application \"$app\" to quit" \
+          # Bundle-addressed quit was observed to stop cod-browser while leaving
+          # the editor alive. Send normal Cmd-Q to the exact editor process, as
+          # the existing System Events input proof does, and require actual exit.
+          ps -p "$old_pid" -o pid=,ppid=,command= > smoke-artifacts/restart-editor-process.txt
+          osascript \
+            -e 'tell application "System Events"' \
+            -e "set editor_process to first process whose unix id is $old_pid" \
+            -e 'set frontmost of editor_process to true' \
+            -e 'tell editor_process to keystroke "q" using command down' \
+            -e 'end tell' \
             > smoke-artifacts/restart-quit-stdout.txt 2> smoke-artifacts/restart-quit-stderr.txt || quit_request_exit=$?
           graceful_exit=0
           for _attempt in $(seq 1 30); do
@@ -939,7 +948,7 @@ jobs:
             fi
             sleep 1
           done
-          echo "old_pid=$old_pid request_exit=$quit_request_exit process_exited=$graceful_exit elapsed_seconds=$(( $(date +%s) - quit_started )) forced_signal=none" \
+          echo "method=editor-pid-command-q old_pid=$old_pid request_exit=$quit_request_exit process_exited=$graceful_exit elapsed_seconds=$(( $(date +%s) - quit_started )) forced_signal=none" \
             | tee smoke-artifacts/restart-quit-result.txt
           snapshot_restart after-quit || status=1
           cp "$data/logs/Zed.log" smoke-artifacts/restart-after-quit/zed.log 2>/dev/null || true

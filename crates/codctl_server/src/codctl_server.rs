@@ -860,7 +860,7 @@ async fn open_file(
         None => None,
     };
     let project = cx.update(|cx| workspace.read(cx).project().clone());
-    let (_, project_path) = cx
+    let (worktree, project_path) = cx
         .update(|cx| Workspace::project_path_for_path(project, &path, false, cx))
         .await?;
     let item = window
@@ -876,6 +876,9 @@ async fn open_file(
             })
         })?
         .await?;
+    // Invisible worktrees are held weakly by the project. Keep this one alive
+    // until the opened item has acquired its own file/buffer ownership.
+    drop(worktree);
     if let Some(line) = line
         && let Some(editor) = item.downcast::<Editor>()
     {
