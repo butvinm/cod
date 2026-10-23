@@ -634,6 +634,96 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
                 "forced_provider_signal": "none",
             }, indent=2))
 
+    def test_ac7_close_background_workspace_during_provider_initialize(self) -> None:
+        """A workspace-owned provider must stop even before its ACP connection is ready."""
+        repo = self.make_repo("billing-api", BILLING_API)
+        survivor_repo = self.make_repo("ledger", {"README.md": "Unrelated workspace.\n"})
+        script = self.workdir / "agent-script.json"
+        log = self.workdir / "agent.log"
+        release = self.workdir / "initialize-finish"
+        script.write_text(json.dumps({"initialize_wait": release.name}))
+        self.start_cod(repo, persistent=False, extra_settings={
+            "agent_servers": {AGENT_ID: fake_agent_settings(script, log=log)},
+        })
+        self.wait_for(lambda state: [real(path) for path in state["worktrees"]] == [real(repo)], 30, "the target folder")
+        editor_pid = self.cod.process.pid
+
+        def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            rows = subprocess.check_output(
+                ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
+            )
+            found = {}
+            for row in rows.splitlines():
+                fields = row.split(None, 7)
+                if len(fields) == 8 and (not direct_only or int(fields[1]) == editor_pid) and "fake_acp_agent.py" in fields[7]:
+                    found[int(fields[0])] = " ".join(fields[2:])
+            return found
+
+        with self.step("choose the fake agent and hold its initialize reply"):
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            self.keys("end up enter")
+            self.wait_for(
+                lambda _state: log.exists() and '"method": "initialize"' in log.read_text(),
+                10,
+                "the provider receives initialize without replying",
+            )
+            target_processes = provider_processes()
+            self.expect_equal("one owned initializing provider", 1, len(target_processes))
+            self.expect_equal("initialize remains held", False, release.exists())
+            self.expect_equal("no ACP initialize reply", False, "out " in log.read_text())
+
+        with self.step("open an unrelated workspace while target initialization remains pending"):
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["active_workspace"] == 1
+                and len(title_bar(state)["tabs"]) == 2 and state["modal"] is None,
+                30,
+                "the second workspace with both tabs drawn",
+            )
+            shown_id = state["workspaces"][1]["id"]
+            self.add_folder(survivor_repo)
+            state = self.wait_for(
+                lambda state: [real(path) for path in state["worktrees"]] == [real(survivor_repo)],
+                30,
+                "the unrelated folder remains usable",
+            )
+            self.expect_equal(
+                "pending provider is still alive before Close", target_processes,
+                dict(target_processes.items() & provider_processes(False).items()),
+            )
+            survivor_processes = {pid: identity for pid, identity in provider_processes().items() if pid not in target_processes}
+
+        with self.step("explicitly close the background initializing workspace"):
+            self.hover_tab(state, 0)
+            self.click_close_button(self.state(), 0)
+            state = self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the pending workspace closes")
+            self.wait_for(
+                lambda _state: not (target_processes.items() & provider_processes(False).items()),
+                12,
+                "the exact pending provider exits before app quit",
+            )
+            state = self.state()
+            self.expect_equal("remaining workspace identity", shown_id, state["workspaces"][state["active_workspace"]]["id"])
+            self.expect_equal("remaining workspace folder", [real(survivor_repo)], [real(path) for path in state["worktrees"]])
+            self.expect_equal(
+                "any unrelated initializing provider remains", survivor_processes,
+                dict(survivor_processes.items() & provider_processes(False).items()),
+            )
+            self.expect_equal("remaining workspace has no modal or prompt", [None, None], [state["modal"], state["prompt"]])
+            self.expect_equal("target initialize was never released", False, release.exists())
+            self.expect_equal("target never replied to initialize", False, "out " in log.read_text())
+            sampled = self.workdir / "sampled-frames"
+            sampled.mkdir(exist_ok=True)
+            subprocess.run(["grim", str(sampled / "provider-initialize-close-survivor.png")], check=True, timeout=20)
+            (sampled / "provider-initialize-close.json").write_text(json.dumps({
+                "target_before": target_processes, "remaining_after_close": provider_processes(False),
+                "survivor_before": survivor_processes,
+                "initialize_control_released": False, "surviving_workspace_id": shown_id,
+                "state": state,
+            }, indent=2))
+
     # Issue #81 (review B1): the confirmation is decided by the sessions, not by the workspace's
     # rolled-up status, where an entry in error (a page that failed to load, an earlier failed
     # chat) outranks working.
