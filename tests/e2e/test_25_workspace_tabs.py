@@ -1021,6 +1021,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
 
         for resize_width in (560, 640):
             with self.step(f"resize to {resize_width} px: the first tab keeps focus and stays revealed while the last workspace stays active"):
+                previous_viewport_width = title_bar(state)["tabs_viewport"]["width"]
                 self.narrow_the_output(resize_width, 600)
 
                 def focused_tab_still_revealed(state: dict[str, Any]) -> bool:
@@ -1031,7 +1032,16 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
                     )
 
                 state = self.wait_for(
-                    lambda state: self.cod_window_width() == float(resize_width) and focused_tab_still_revealed(state),
+                    lambda state: self.cod_window_width() == float(resize_width)
+                    and len(title_bar(state)["tabs"]) == 6
+                    and drawn(title_bar(state)["tabs_viewport"])
+                    and drawn(title_bar(state)["add_button"]["bounds"])
+                    and focused_tab_still_revealed(state)
+                    # Compositor resize and app prepaint are separate observations. Wait for
+                    # the new viewport in both directions before checking later frames strictly.
+                    and title_bar(state)["tabs_viewport"]["width"] != previous_viewport_width
+                    and title_bar(state)["add_button"]["bounds"]["x"]
+                    + title_bar(state)["add_button"]["bounds"]["width"] <= float(resize_width) + 0.5,
                     SHOW_TIMEOUT,
                     f"the {resize_width} px window with the first tab focused and revealed, last workspace active",
                 )

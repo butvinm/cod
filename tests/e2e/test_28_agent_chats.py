@@ -740,12 +740,16 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
         with self.step("add a second, idle workspace and show the first again"):
             before = self.state()
             self.run_command(NEW_WORKSPACE)
-            self.wait_for(
-                lambda state: state["workspace_count"] == before["workspace_count"] + 1 and state["modal"] is None,
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] == 1
+                and state["modal"] is None
+                and len(title_bar(state)["tabs"]) == before["workspace_count"] + 1
+                and drawn(title_bar(state)["tabs"][0]["bounds"]),
                 30,
-                "the second workspace",
+                "the second workspace, shown with both tabs drawn",
             )
-            self.click_tab(self.state(), 0)
+            self.click_tab(state, 0)
             state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
 
         with self.step("click close: the agent-working confirmation shows although the workspace reads error"):
