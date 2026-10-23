@@ -1046,6 +1046,299 @@ jobs:
 
           exit $status
 
+      # Independent ordinary-use QA of the same retained package, without rebuilding.
+      # Linux PR80 remains frozen; this workflow-only observation does not restamp it.
+      - name: Ordinary native package QA and focused beta
+        timeout-minutes: 8
+        env:
+          PYTHONPATH: tests/e2e
+        run: |
+          set -euo pipefail
+          status=0
+          caffeinate -dimsu python3 - "$PWD/dist/Cod.app" "$PWD/smoke-artifacts/ordinary-qa" \
+            > smoke-artifacts/ordinary-qa.log 2>&1 <<'PY' || status=$?
+          """Prepared ordinary macOS package walkthrough using the existing smoke Driver.
+
+          Run only inside the existing reviewed artifact-reuse workflow after its smoke
+          app has exited. No builds, provider sessions, new workflow or live credentials.
+          """
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          from cod_e2e import Driver, cod_settings, make_repo, palette_problem
+          from test_25_workspace_tabs import contains_bounds
+
+          APP_HEAD = "7190fac73fe080a5f4ce9aa4c5037e1dd2c70260"
+
+
+          def ordinary(app, output, theme, fresh):
+              output.mkdir(parents=True, exist_ok=False)
+              # Keep CEF cache and the whole temporary profile outside the artifact tree.
+              # The ephemeral runner owns this profile; preserve it for diagnosis until exit.
+              data = Path(tempfile.mkdtemp(prefix="cod-ordinary-profile-")).resolve()
+              repo = make_repo(data, "ordinary-notes", {"README.txt": "Existing release notes.\n"})
+              settings = cod_settings()
+              settings["theme"] = theme
+              (data / "config").mkdir()
+              (data / "config/settings.json").write_text(json.dumps(settings))
+              (output / "settings.json").write_text(json.dumps(settings, indent=2))
+              (output / "identity.json").write_text(json.dumps({
+                  "package_commit": APP_HEAD, "bundle_version": "17", "app": str(app),
+                  "profile": str(data), "theme": theme, "scenario": "fresh QA" if fresh else "nonempty planning beta",
+                  "ordinary_window": [1000, 660], "narrow_window": [640, 600],
+              }, indent=2))
+              page = data / "reference.html"
+              page.write_text("<title>Ordinary release reference</title><h1>Release reference</h1>")
+              # Keep socket paths under Darwin's Unix socket length limit.
+              socket_dir = Path(tempfile.mkdtemp(prefix="cod-qa-", dir="/tmp"))
+              socket_path = socket_dir / "driver.sock"
+              command = ["open", "-n", "--env", f"COD_PREVIEW_DIR={data}",
+                         "--env", f"COD_E2E_SOCKET={socket_path}", str(app)]
+              if not fresh:
+                  command += ["--args", str(repo)]
+              subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+              deadline = time.monotonic() + 30
+              while not socket_path.exists() and time.monotonic() < deadline:
+                  time.sleep(.1)
+              driver = Driver(socket_path)
+              pid_text = subprocess.check_output(["pgrep", "-f", str(app / "Contents/MacOS/zed")], text=True)
+              pids = [int(x) for x in pid_text.split()]
+              assert len(pids) == 1, ("expected only this package editor", pids)
+              pid = pids[0]
+
+              def os_window(statement):
+                  script = (f'tell application "System Events" to tell first process whose unix id is {pid} '
+                            f'to {statement}')
+                  return subprocess.check_output(["osascript", "-e", script], text=True, timeout=15).strip()
+
+              def wait(predicate, description, timeout=20):
+                  end = time.monotonic() + timeout
+                  state = None
+                  while time.monotonic() < end:
+                      state = driver.state()
+                      if predicate(state):
+                          return state
+                      time.sleep(.1)
+                  raise AssertionError((description, state))
+
+              def keys(value):
+                  driver.keys(value)
+
+              def action(name):
+                  keys("super-shift-p")
+                  wait(lambda s: s["modal"] == "command_palette", "palette")
+                  driver.type(name)
+                  wait(lambda s: palette_problem(name, s) is None, name)
+                  keys("enter")
+                  wait(lambda s: s["modal"] != "command_palette", "palette closed")
+
+              def tab_point(index, close=False):
+                  tab = driver.state()["title_bar"]["tabs"][index]
+                  bounds = tab["close_bounds" if close else "bounds"]
+                  return dict(x=bounds["x"] + bounds["width"] / 2,
+                              y=bounds["y"] + bounds["height"] / 2)
+
+              def click_tab(index):
+                  driver.request("click", **tab_point(index))
+
+              def rename(name):
+                  action("workspace: rename workspace")
+                  wait(lambda s: s["rename_input"] is not None, "rename")
+                  driver.type(name)
+                  keys("enter")
+                  wait(lambda s: s["rename_input"] is None
+                       and s["workspaces"][s["active_workspace"]]["name"] == name, "renamed")
+
+              def capture(name):
+                  time.sleep(.7)
+                  state = driver.state()
+                  (output / (name + ".json")).write_text(json.dumps(state, indent=2))
+                  subprocess.run(["screencapture", "-x", "-t", "jpg", str(output / (name + ".jpg"))],
+                                 check=True, timeout=15)
+                  bar = state["title_bar"]
+                  active_tabs = [tab for tab in bar["tabs"] if tab["active"]]
+                  assert len(active_tabs) == 1, (name, bar)
+                  # Overflow may clip background tabs. The selected tab must be revealed,
+                  # matching the accepted narrow-window semantics of test_25_workspace_tabs.
+                  assert contains_bounds(bar["tabs_viewport"], active_tabs[0]["bounds"]), (name, active_tabs[0])
+                  for tab in bar["tabs"]:
+                      assert contains_bounds(tab["bounds"], tab["close_bounds"]), (name, tab)
+                  add = bar["add_button"]["bounds"]
+                  viewport = bar["tabs_viewport"]
+                  width = int(os_window("get size of front window").split(",")[0])
+                  assert add["x"] + add["width"] <= width + .5, (name, add, width)
+                  assert abs(add["x"] - viewport["x"] - viewport["width"]) <= 1, (name, bar)
+                  print("CAPTURE", theme, "fresh" if fresh else "nonempty", name, flush=True)
+
+              def retain_case_evidence():
+                  documents = {}
+                  for filename in ("README.txt", "release-notes.txt"):
+                      document = repo / filename
+                      documents[filename] = document.read_text() if document.is_file() else None
+                  (output / "saved-documents.json").write_text(json.dumps(documents, indent=2))
+                  for filename, limit in (("Zed.log", 512 * 1024), ("cod-stderr.log", 128 * 1024)):
+                      source = data / "logs" / filename
+                      if source.is_file():
+                          with source.open("rb") as log:
+                              log.seek(0, 2)
+                              log.seek(max(0, log.tell() - limit))
+                              (output / filename).write_bytes(log.read(limit))
+
+              def quit_and_retain():
+                  started = time.monotonic()
+                  receipt = {"method": "exact-editor-pid-command-q", "old_pid": pid,
+                             "request_exit": None, "process_exited": False, "forced_signal": "none"}
+                  try:
+                      # Same exact editor PID quit method proven by the existing workflow.
+                      request = subprocess.run([
+                          "osascript", "-e", f'tell application "System Events" to set frontmost of '
+                          f'(first process whose unix id is {pid}) to true', "-e",
+                          'tell application "System Events" to keystroke "q" using command down'],
+                          capture_output=True, text=True, timeout=15)
+                      receipt["request_exit"] = request.returncode
+                      receipt["request_stdout"] = request.stdout[-4096:]
+                      receipt["request_stderr"] = request.stderr[-4096:]
+                      end = time.monotonic() + 30
+                      while time.monotonic() < end:
+                          try:
+                              os.kill(pid, 0)
+                          except ProcessLookupError:
+                              receipt["process_exited"] = True
+                              break
+                          time.sleep(.1)
+                      assert request.returncode == 0 and receipt["process_exited"], (
+                          "ordinary QA editor must exit after Cmd-Q; no force-kill acceptance", receipt)
+                  finally:
+                      receipt["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                      (output / "quit-receipt.json").write_text(json.dumps(receipt, indent=2))
+                      driver.close()
+                      retain_case_evidence()
+
+              try:
+                  os_window("set frontmost to true")
+                  os_window("set position of front window to {0, 25}")
+                  # At y25, height660 ends at685 on the observed768px display, above its Dock.
+                  os_window("set size of front window to {1000, 660}")
+                  wait(lambda s: s["window_active"], "native window activation")
+                  if fresh:
+                      wait(lambda s: s["active_tab"] == "Onboarding", "fresh setup")
+                      capture("01-fresh-onboarding")
+                      # default-macos.json advertises cmd-enter for onboarding::Finish.
+                      keys("super-enter")
+                      wait(lambda s: s["active_tab"] != "Onboarding" and s["onboarding_header"] is None,
+                           "finish setup")
+                      action("workspace: add folder to project")
+                      wait(lambda s: s["path_prompt"] is not None, "folder picker")
+                      keys("super-a")
+                      driver.type(str(repo))
+                      wait(lambda s: s["path_prompt"] is not None and s["path_prompt"]["query"] == str(repo)
+                           and s["path_prompt"]["match_count"] == 1, "exact folder match")
+                      keys("enter")
+                      wait(lambda s: s["path_prompt"] is None and len(s["worktrees"]) == 1, "folder opened")
+                  keys("super-p")
+                  wait(lambda s: s["file_finder_ready"], "ordinary file finder")
+                  driver.type("README.txt")
+                  keys("enter")
+                  wait(lambda s: s["active_tab"] == "README.txt" and s["modal"] is None, "README opened")
+                  driver.type("QA draft: ")
+                  keys("super-s")
+                  wait(lambda s: not s["dirty_tabs"], "saved README")
+                  assert (repo / "README.txt").read_text() == "QA draft: Existing release notes.\n"
+                  # User creates a real file in the selected project, not a fixture write.
+                  keys("super-shift-e")
+                  wait(lambda s: s["project_panel"]["focused"], "project focus")
+                  keys("home super-n")
+                  driver.type("release-notes.txt")
+                  keys("enter")
+                  wait(lambda s: s["active_tab"] == "release-notes.txt", "created file")
+                  driver.type("Created in ordinary package QA.\n")
+                  keys("super-s")
+                  wait(lambda s: not s["dirty_tabs"], "created file saved")
+                  assert (repo / "release-notes.txt").read_text() == "Created in ordinary package QA.\n"
+                  rename("Release preparation and documentation notes")
+                  capture("02-created-saved-file")
+                  add = driver.state()["title_bar"]["add_button"]["bounds"]
+                  driver.request("click", x=add["x"] + add["width"] / 2, y=add["y"] + add["height"] / 2)
+                  wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "new workspace")
+                  rename("Planning and reference page review notes")
+                  action("web: open url")
+                  wait(lambda s: s["pages"]["prompt"] is not None, "URL prompt")
+                  driver.type(page.as_uri())
+                  keys("enter")
+                  state = wait(lambda s: any(p["active"] and p["state"] == "loaded"
+                                            and p["title"] == "Ordinary release reference" for p in s["pages"]["open"]),
+                               "ordinary reference page")
+                  page_id = next(p["id"] for p in state["pages"]["open"] if p["active"])
+                  capture("03-page-and-long-names")
+                  os_window("set size of front window to {640, 600}")
+                  assert os_window("get size of front window").split(",")[0].strip() == "640"
+                  driver.request("hover", **tab_point(0))
+                  capture("04-narrow-long-name")
+                  os_window("set size of front window to {1000, 660}")
+                  action("workspace: previous workspace")
+                  wait(lambda s: s["active_workspace"] == 0 and s["active_tab"] == "release-notes.txt", "file switch")
+                  if not fresh:
+                      # Focused beta persona: a planner returns from the reference to draft
+                      # a note, then tests whether canceling background close preserves it.
+                      driver.type("Beta planning draft.\n")
+                      wait(lambda s: s["dirty_tabs"] == ["release-notes.txt"], "beta unsaved planning note")
+                  click_tab(1)
+                  wait(lambda s: s["active_workspace"] == 1 and any(p["id"] == page_id and p["active"]
+                       and p["state"] == "loaded" for p in s["pages"]["open"]), "same page switch")
+                  if not fresh:
+                      driver.request("hover", **tab_point(0))
+                      driver.request("click", **tab_point(0, close=True))
+                      wait(lambda s: s["prompt"] is not None, "beta dirty-close consent")
+                      capture("05a-beta-dirty-close-consent")
+                      keys("escape")
+                      wait(lambda s: s["prompt"] is None and s["workspace_count"] == 2
+                           and s["active_workspace"] == 1 and s["active_tab"] == "Ordinary release reference",
+                           "beta Cancel preserves reference and both workspaces")
+                      assert (repo / "release-notes.txt").read_text() == "Created in ordinary package QA.\n"
+                      click_tab(0)
+                      state = wait(lambda s: s["active_workspace"] == 0 and s["active_tab"] == "release-notes.txt",
+                                   "beta draft still reachable")
+                      assert [entry["text"] for entry in state["unsaved_texts"]] == [
+                          "Created in ordinary package QA.\nBeta planning draft.\n"]
+                      keys("super-s")
+                      wait(lambda s: not s["dirty_tabs"], "beta explicit save")
+                      assert (repo / "release-notes.txt").read_text() == (
+                          "Created in ordinary package QA.\nBeta planning draft.\n")
+                      click_tab(1)
+                      wait(lambda s: s["active_workspace"] == 1 and s["active_tab"] == "Ordinary release reference",
+                           "beta reference after save")
+                  driver.request("hover", **tab_point(0))
+                  driver.request("click", **tab_point(0, close=True))
+                  wait(lambda s: s["workspace_count"] == 1 and s["active_tab"] == "Ordinary release reference",
+                       "clean background UI close")
+                  capture("05-after-close")
+                  print("PASS prepared scenario executed:", theme, "fresh focused QA" if fresh else "nonempty planning beta",
+                        flush=True)
+              finally:
+                  try:
+                      capture("final")
+                  finally:
+                      quit_and_retain()
+
+
+          if __name__ == "__main__":
+              app = Path(sys.argv[1]).resolve()
+              output = Path(sys.argv[2]).resolve()
+              assert (app / "Contents/Resources/cod-commit.txt").read_text().strip() == APP_HEAD
+              plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+              assert plist["CodCommit"] == APP_HEAD and plist["CFBundleVersion"] == "17"
+              for theme, fresh in (("One Dark", True), ("One Light", False)):
+                  ordinary(app, output / (theme.replace(" ", "-") + ("-fresh" if fresh else "-nonempty")), theme, fresh)
+          PY
+          cat smoke-artifacts/ordinary-qa.log
+          exit "$status"
+
       - name: Upload the zip and its checksum
         if: always()
         uses: actions/upload-artifact@v4
