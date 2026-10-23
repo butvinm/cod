@@ -294,7 +294,7 @@ jobs:
           mkdir -p smoke-artifacts
           status=0
           caffeinate -dimsu python3 - "$PWD/dist/Cod.app" "$PWD/smoke-artifacts/remaining" > smoke-artifacts/remaining.log 2>&1 <<'PY' || status=$?
-          """Only missing native shortcut and scripted ACP safety checks on retained Mac bytes."""
+          """Only explicit Working Close and provider process observation on retained Mac bytes."""
           import json
           import os
           from pathlib import Path
@@ -314,13 +314,12 @@ jobs:
           plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
           assert plist["CodCommit"] == head and plist["CFBundleVersion"] == "17"
           data = Path(tempfile.mkdtemp(prefix="cod-remaining-")).resolve()
-          repo = make_repo(data, "ordinary-start", {"README.txt": "Initial native project.\n"})
-          folder = make_repo(data, "agent-safety-notes", {"README.txt": "Opened with native Command-O.\n"})
+          repo = make_repo(data, "agent-safety-notes", {"README.txt": "Working close observation.\n"})
           control = data / "advance-to-permission"
           script = data / "agent.json"
           script.write_text(json.dumps({"session_ids": ["mac-safety-session"], "turns": [{"steps": [
               {"chunk": "Reviewing the release notes."}, {"wait": str(control)},
-              {"permission": "Allow edit to release notes?"}, {"end": "end_turn"}]}]}))
+              {"end": "end_turn"}]}]}))
           settings = cod_settings()
           settings["theme"] = "One Dark"
           settings["agent_servers"] = {"claude-acp": fake_agent_settings(script, log=output / "fake-agent.log")}
@@ -347,7 +346,7 @@ jobs:
           pid = editors[0]
           (output / "identity.json").write_text(json.dumps({"source_commit": head, "version": "17", "pid": pid,
               "profile": str(data), "provider": "scripted fake ACP; no real-provider restore claim",
-              "shortcut_input": "System Events native Command-O; other input uses native GPUI driver"}, indent=2))
+              "shortcut_input": "native GPUI in-process driver keys/hover/click; System Events Cmd-Q only"}, indent=2))
           
           def wait(predicate, description, timeout=25):
               end = time.monotonic() + timeout
@@ -400,29 +399,34 @@ jobs:
               assert state["workspaces"][0]["status"] == status, state["workspaces"]
               capture(label + "-consent")
           
+          def processes():
+              rows = {}
+              raw = subprocess.check_output(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True)
+              for line in raw.splitlines():
+                  fields = line.split(None, 7)
+                  if len(fields) == 8:
+                      rows[int(fields[0])] = {"pid": int(fields[0]), "ppid": int(fields[1]),
+                                            "started": " ".join(fields[2:7]), "command": fields[7]}
+              return rows
+          
+          def provider_tree():
+              rows = processes()
+              provider = [p for p, row in rows.items() if "fake_acp_agent.py" in row["command"] and row["ppid"] == pid]
+              assert len(provider) == 1, {"matching_direct_providers": provider}
+              selected = set(provider)
+              while True:
+                  expanded = selected | {p for p, row in rows.items() if row["ppid"] in selected}
+                  if expanded == selected:
+                      break
+                  selected = expanded
+              return {p: rows[p] for p in selected}
+          
           try:
               wait(lambda s: s["window_active"] and len(s["worktrees"]) == 1, "ordinary project window")
               subprocess.run(["osascript", "-e", 'tell application "System Events" to tell '
                               f'(first process whose unix id is {pid}) to set position of front window to {{0, 25}}',
                               "-e", 'tell application "System Events" to tell '
                               f'(first process whose unix id is {pid}) to set size of front window to {{1000, 660}}'], check=True)
-              os_key("o")
-              wait(lambda s: s["path_prompt"] is not None, "native Command-O picker")
-              capture("01-native-command-o-picker")
-              keys("super-a")
-              driver.type(str(folder))
-              wait(lambda s: s["path_prompt"] is not None and s["path_prompt"]["query"] == str(folder)
-                   and s["path_prompt"]["match_count"] == 1, "exact folder match")
-              keys("enter")
-              wait(lambda s: s["path_prompt"] is None and s["worktrees"] == [str(folder)]
-                   and s["workspace_count"] == 2 and s["active_workspace"] == 1,
-                   "native shortcut opened exact folder")
-              capture("02-native-command-o-folder")
-              print("PASS native OS Command-O and exact folder", flush=True)
-              # Discard only the clean initial project so safety assertions use the opened folder.
-              driver.request("hover", **point(0))
-              driver.request("click", **point(0, "close_bounds"))
-              wait(lambda s: s["workspace_count"] == 1 and s["worktrees"] == [str(folder)], "initial clean workspace closed")
               wait(lambda s: s.get("agent_panel_ready") is True, "agent panel ready")
               action("agent: toggle focus")
               action("agent: toggle new thread menu")
@@ -436,24 +440,37 @@ jobs:
               action("workspace: new workspace")
               state = wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "second workspace")
               shown = state["workspaces"][1]["id"]
-              close_background("working", "03-working")
-              keys("enter")
-              wait(lambda s: s["prompt"] is None and s["workspace_count"] == 2
-                   and s["workspaces"][s["active_workspace"]]["id"] == shown
-                   and s["workspaces"][0]["id"] == agent_workspace, "Enter default Cancel preserves working workspace")
-              control.touch()
-              wait(lambda s: s["workspaces"][0]["status"] == "needs_input", "ACP permission reaches NeedsInput")
-              close_background("needs_input", "04-needs-input")
-              keys("escape")
-              wait(lambda s: s["prompt"] is None and s["workspace_count"] == 2
-                   and s["workspaces"][s["active_workspace"]]["id"] == shown, "Escape Cancel preserves NeedsInput workspace")
-              close_background("needs_input", "05-explicit-close")
+              close_background("working", "01-working-close")
+              tracked = provider_tree()
+              (output / "provider-before.json").write_text(json.dumps(list(tracked.values()), indent=2))
               keys("right")
               wait(lambda s: s["prompt"]["answers"][s["prompt"]["highlighted"]] == "Close", "Close selected")
               keys("enter")
               wait(lambda s: s["workspace_count"] == 1 and s["workspaces"][0]["id"] == shown, "explicit Close removes only target")
-              capture("06-surviving-workspace")
-              print("PASS Mac Working and NeedsInput background close consent; scripted ACP, no status injection", flush=True)
+              capture("02-surviving-workspace")
+              observation_start = time.monotonic()
+              end = observation_start + 12
+              survivors = tracked
+              while time.monotonic() < end:
+                  rows = processes()
+                  survivors = {p: rows[p] for p, before in tracked.items() if p in rows and rows[p]["started"] == before["started"]}
+                  # Include newly spawned children while a tracked process is still alive.
+                  for p, row in rows.items():
+                      if row["ppid"] in survivors and p not in tracked:
+                          tracked[p] = row
+                          survivors[p] = row
+                  if not survivors:
+                      break
+                  time.sleep(.1)
+              receipt = {"provider": "scripted fake ACP", "editor_pid": pid, "target_workspace": agent_workspace,
+                         "surviving_workspace": shown, "tracked": list(tracked.values()),
+                         "survivors_before_app_quit": list(survivors.values()), "budget_seconds": 12,
+                         "elapsed_seconds": time.monotonic() - observation_start,
+                         "forced_provider_signal": "none", "control_released": control.exists()}
+              (output / "provider-close-receipt.json").write_text(json.dumps(receipt, indent=2))
+              assert not survivors, receipt
+              assert not control.exists(), receipt
+              print("PASS explicit Working Close and observed provider tree gone before app quit; scripted ACP", flush=True)
           finally:
               try:
                   capture("final")
