@@ -24,12 +24,17 @@ on:
         description: "Publish a macOS preview prerelease when the build and smoke check pass"
         type: boolean
         default: false
+      reuse_run_id:
+        description: "Smoke an existing run's unchanged app artifact without compiling or publishing"
+        type: string
+        default: ""
   push:
     branches:
       - "macos-preview/**"
 
 permissions:
   contents: write
+  actions: read
 
 # Its own group: a macOS run never waits for, or blocks, a Linux release run.
 concurrency:
@@ -58,11 +63,53 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       - name: Show disk space
         run: df -h /
 
+      - name: Recover the unchanged native artifact
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          # A workflow-only push can consume its parent's completed package before this
+          # workflow exists on the default branch. No extra workflow or build is needed.
+          if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            parent=$(git rev-parse HEAD^)
+            if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' && \
+              ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml; then
+              REUSE_RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow macos-release.yml \
+                --commit "$parent" --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+              if [ -z "$REUSE_RUN_ID" ]; then
+                echo "::error::Workflow-only change has no completed parent package to verify"
+                exit 1
+              fi
+            fi
+          fi
+          if [ -z "$REUSE_RUN_ID" ]; then
+            exit 0
+          fi
+          [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]]
+          test "${{ inputs.publish }}" != "true"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID" > reuse-run.json
+          source_commit=$(python3 -c 'import json; r=json.load(open("reuse-run.json")); assert r["status"] == "completed"; assert r["path"] == ".github/workflows/macos-release.yml"; print(r["head_sha"])')
+          source_number=$(python3 -c 'import json; print(json.load(open("reuse-run.json"))["run_number"])')
+          git fetch --no-tags --depth=1 origin "$source_commit"
+          # Only this workflow may differ. App, bundler, dependencies and smoke assertions
+          # must be exactly those that produced the retained package.
+          git diff --exit-code "$source_commit" HEAD -- . ':(exclude).github/workflows/macos-release.yml'
+          gh run download "$REUSE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name cod-macos-aarch64
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          mkdir -p dist
+          ditto -x -k cod-macos-aarch64.zip dist
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "run_number=$source_number" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
+        if: steps.reuse.outputs.commit == ''
         run: |
           rustup toolchain install || rustup show
           rustc --version
@@ -71,6 +118,7 @@ jobs:
       # sccache keeps every compiled crate in the GitHub Actions cache, the same action and
       # version as linux-release.yml (a different version would need a separate validation).
       - name: Set up sccache
+        if: steps.reuse.outputs.commit == ''
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.18.0
@@ -79,6 +127,7 @@ jobs:
       # left to sccache. Only a push to macos-preview/** writes the cache (this workflow never
       # runs on master), so a one-off dispatch run from another branch cannot fill or poison it.
       - name: Restore the cargo registry cache
+        if: steps.reuse.outputs.commit == ''
         uses: Swatinem/rust-cache@v2.8.0
         with:
           key: release-fast
@@ -90,6 +139,7 @@ jobs:
       # page-tab helper) now builds here too (#23 round 1): its cef dependency needs the CEF
       # download restored below, same as linux-release.yml's own cef-cache step.
       - name: Restore the CEF download
+        if: steps.reuse.outputs.commit == ''
         id: cef-cache
         uses: actions/cache/restore@v4
         with:
@@ -97,6 +147,7 @@ jobs:
           key: cef-${{ env.CEF_VERSION }}-macos-aarch64
 
       - name: Build (cargo release-fast, sccache)
+        if: steps.reuse.outputs.commit == ''
         env:
           SCCACHE_GHA_ENABLED: "true"
           SCCACHE_GHA_RW_MODE: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') && 'READ_WRITE' || 'READ_ONLY' }}
@@ -108,7 +159,7 @@ jobs:
           df -h /
 
       - name: Save the CEF download
-        if: startsWith(github.ref, 'refs/heads/macos-preview/') && steps.cef-cache.outputs.cache-hit != 'true'
+        if: steps.reuse.outputs.commit == '' && startsWith(github.ref, 'refs/heads/macos-preview/') && steps.cef-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CEF_PATH }}
@@ -119,6 +170,7 @@ jobs:
       # name is cef-dll-sys's own internal convention, not documented, and guessing it wrong would
       # fail the bundle step below for a reason this search avoids entirely).
       - name: Find the downloaded CEF framework
+        if: steps.reuse.outputs.commit == ''
         run: |
           set -euo pipefail
           framework=$(find "$CEF_PATH" -maxdepth 6 -type d -name "Chromium Embedded Framework.framework" | head -n 1)
@@ -127,6 +179,7 @@ jobs:
           echo "CEF_RUNTIME_DIR=$(dirname "$framework")" >> "$GITHUB_ENV"
 
       - name: Bundle Cod.app (script/bundle-cod-mac)
+        if: steps.reuse.outputs.commit == ''
         env:
           COMMIT: ${{ github.sha }}
           RUN_NUMBER: ${{ github.run_number }}
@@ -135,8 +188,8 @@ jobs:
       # Fails the job on the first problem found, printing enough to diagnose it without a Mac at hand.
       - name: Bundle checks
         env:
-          COMMIT: ${{ github.sha }}
-          RUN_NUMBER: ${{ github.run_number }}
+          COMMIT: ${{ steps.reuse.outputs.commit || github.sha }}
+          RUN_NUMBER: ${{ steps.reuse.outputs.run_number || github.run_number }}
         run: |
           set -euo pipefail
           app=dist/Cod.app
@@ -300,28 +353,26 @@ jobs:
           launch_epoch=$(date +%s)
 
           # AC-R5: launch it the way Finder does (open -n), not by executing the inner binary
-          # directly. open --env passes the temporary, isolated data folder through to the
-          # launched app (a plain shell `export` would not reach it: open hands the app to
-          # launchd, which does not inherit this script's environment). Falls back to Cod's
-          # default data folder, and says so, if this runner's open(1) predates --env.
+          # directly. Require per-launch environment support: falling back to plain open
+          # discards the fixture, isolated data path and driver socket. Help's exit status
+          # under pipefail is not a reliable capability probe. Retain an actual launch error.
           data=$(mktemp -d)/cod-preview-smoke
           mkdir -p "$data"
           driver_dir=$(mktemp -d /tmp/cod-mac-XXXXXX)
           python3 tests/e2e/macos_candidate_smoke.py prepare "$data"
-          if open --help 2>&1 | grep -q -- '--env'; then
-            # COD_BROWSER_LOG_VERBOSE=1 (round 4 diagnosis H1): raises cod-browser's own CEF log
-            # (cef.log) to verbose for this smoke run only; engine.rs keeps the production default
-            # (WARNING) otherwise. Cod's own child processes, including cod-browser, inherit this
-            # the ordinary way (Rust's Command inherits the parent's environment by default).
-            echo "Launching with open -n --env COD_PREVIEW_DIR=$data --env COD_BROWSER_LOG_VERBOSE=1"
-            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
-              --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" --args "$data/project"
-          else
-            echo "::warning::this runner's open(1) has no --env option; Cod will use its default data directory instead of the temporary one made for this smoke test"
-            data="$HOME/Library/Application Support/Cod-preview"
-            open -n "$app"
+          if ! open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
+            --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" --args "$data/project" \
+            > smoke-artifacts/open-launch.txt 2>&1; then
+            echo "::error::Cannot launch the isolated native smoke with its driver environment"
+            cat smoke-artifacts/open-launch.txt
+            kill "$fake_zed_pid" 2>/dev/null || true
+            exit 1
           fi
           sleep 20
+          if [ ! -S "$driver_dir/driver.sock" ]; then
+            echo "::error::The isolated app did not create its required driver socket"
+            status=1
+          fi
 
           # open -n returns as soon as launchd takes over, so its own $! is already gone; the
           # launcher script (Contents/MacOS/cod) execs zed in place (same PID, new process
@@ -793,11 +844,8 @@ jobs:
 
           if [ -n "$persist_id" ]; then
             echo "== round 5 P4: relaunch and check the page was restored =="
-            if open --help 2>&1 | grep -q -- '--env'; then
-              open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app"
-            else
-              open -n "$app"
-            fi
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app" \
+              > smoke-artifacts/open-relaunch.txt 2>&1
             sleep 20
             pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
             if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
@@ -910,8 +958,9 @@ jobs:
       # never edits or deletes one that exists already.
       - name: Publish a macOS preview prerelease
         if: >-
-          (github.event_name == 'push' && github.ref == 'refs/heads/macos-preview/publish') ||
-          (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+          !steps.reuse.outputs.commit &&
+          ((github.event_name == 'push' && github.ref == 'refs/heads/macos-preview/publish') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish == true))
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
