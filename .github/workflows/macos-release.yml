@@ -314,9 +314,8 @@ jobs:
           plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
           assert plist["CodCommit"] == head and plist["CFBundleVersion"] == "17"
           data = Path(tempfile.mkdtemp(prefix="cod-remaining-")).resolve()
-          repo = make_repo(data, "agent-safety-notes", {"README.txt": "Native shortcut reference.\n"})
-          external = data / "shortcut-note.txt"
-          external.write_text("Opened with native Command-O.\n")
+          repo = make_repo(data, "ordinary-start", {"README.txt": "Initial native project.\n"})
+          folder = make_repo(data, "agent-safety-notes", {"README.txt": "Opened with native Command-O.\n"})
           control = data / "advance-to-permission"
           script = data / "agent.json"
           script.write_text(json.dumps({"session_ids": ["mac-safety-session"], "turns": [{"steps": [
@@ -411,13 +410,19 @@ jobs:
               wait(lambda s: s["path_prompt"] is not None, "native Command-O picker")
               capture("01-native-command-o-picker")
               keys("super-a")
-              driver.type(str(external))
-              wait(lambda s: s["path_prompt"] is not None and s["path_prompt"]["query"] == str(external)
-                   and s["path_prompt"]["match_count"] == 1, "exact file match")
+              driver.type(str(folder))
+              wait(lambda s: s["path_prompt"] is not None and s["path_prompt"]["query"] == str(folder)
+                   and s["path_prompt"]["match_count"] == 1, "exact folder match")
               keys("enter")
-              wait(lambda s: s["path_prompt"] is None and s["active_tab"] == str(external), "native shortcut opened exact file")
-              capture("02-native-command-o-file")
-              print("PASS native OS Command-O and exact external file", flush=True)
+              wait(lambda s: s["path_prompt"] is None and s["worktrees"] == [str(folder)]
+                   and s["workspace_count"] == 2 and s["active_workspace"] == 1,
+                   "native shortcut opened exact folder")
+              capture("02-native-command-o-folder")
+              print("PASS native OS Command-O and exact folder", flush=True)
+              # Discard only the clean initial project so safety assertions use the opened folder.
+              driver.request("hover", **point(0))
+              driver.request("click", **point(0, "close_bounds"))
+              wait(lambda s: s["workspace_count"] == 1 and s["worktrees"] == [str(folder)], "initial clean workspace closed")
               wait(lambda s: s.get("agent_panel_ready") is True, "agent panel ready")
               action("agent: toggle focus")
               action("agent: toggle new thread menu")
