@@ -78,6 +78,13 @@ jobs:
           # An observation-only push can consume the corrected package before this
           # workflow exists on the default branch. No extra build is needed.
           if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && \
+            [ "$GITHUB_REF" = "refs/heads/macos-preview/smoke-disposition-20261023" ]; then
+            # The c666 package compiled and packaged successfully. Its first internet
+            # observation received a Cloudflare rate-limit page. Retain that failure
+            # and observe identical bytes with the original assertions, without a build.
+            REUSE_RUN_ID=39901694522
+          fi
+          if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && \
             [ "$GITHUB_REF" = "refs/heads/macos-preview/remaining-acceptance-20261023" ]; then
             parent=$(git rev-parse HEAD^)
             if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py' && \
@@ -560,7 +567,10 @@ jobs:
           # #23 round 5, P1: a page on the open internet, the same way a real agent-made link
           # would be. Skipped, not failed, if this runner has no internet access.
           echo "== round 5 P1: internet page (codctl open https://example.com/) =="
-          if curl -s -m 5 -o /dev/null https://example.com/; then
+          if curl -sS -m 5 -D smoke-artifacts/internet-preflight-headers.txt \
+            -o smoke-artifacts/internet-preflight-body.html -w '%{http_code}\n' \
+            https://example.com/ > smoke-artifacts/internet-preflight-status.txt \
+            2> smoke-artifacts/internet-preflight-stderr.txt; then
             if "$app/Contents/MacOS/codctl" open "https://example.com/" \
               > smoke-artifacts/codctl-open-p1.txt 2>&1; then
               p1_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p1.txt)
@@ -569,6 +579,7 @@ jobs:
               else
                 echo "::error::P1 FAIL: https://example.com/ never reported state=loaded title='Example Domain' within 30s"
                 status=1
+                screencapture -x -t jpg smoke-artifacts/internet-page-failure.jpg || true
               fi
               cat smoke-artifacts/codctl-page-get-p1.txt 2> /dev/null || true
               "$app/Contents/MacOS/codctl" page close "$p1_id" > /dev/null 2>&1 || true
