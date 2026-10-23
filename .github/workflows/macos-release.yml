@@ -1139,8 +1139,31 @@ jobs:
                   wait(lambda s: s["modal"] != "command_palette", "palette closed")
 
               def tab_point(index, close=False):
-                  tab = driver.state()["title_bar"]["tabs"][index]
-                  bounds = tab["close_bounds" if close else "bounds"]
+                  initial = driver.state()
+                  expected = [(workspace["id"], workspace["name"]) for workspace in initial["workspaces"]]
+                  assert initial["workspace_count"] == len(expected) and 0 <= index < len(expected), (index, initial)
+                  assert all(name is not None for _, name in expected), expected
+                  field = "close_bounds" if close else "bounds"
+
+                  def requested_tab_drawn(state):
+                      # Logical activation may precede this workspace title bar's paint.
+                      # Wait for exact identities and names, never use another tab's bounds.
+                      if state["workspace_count"] != len(expected) or state["active_workspace"] != initial["active_workspace"]:
+                          return False
+                      if [(workspace["id"], workspace["name"]) for workspace in state["workspaces"]] != expected:
+                          return False
+                      bar = state.get("title_bar") or {}
+                      tabs = bar.get("tabs", [])
+                      if [tab["name"] for tab in tabs] != [name for _, name in expected]:
+                          return False
+                      tab = tabs[index]
+                      bounds = tab.get(field)
+                      return (bounds is not None and bounds["width"] > 0 and bounds["height"] > 0
+                              and contains_bounds(bar["tabs_viewport"], tab["bounds"])
+                              and (not close or contains_bounds(tab["bounds"], bounds)))
+
+                  state = wait(requested_tab_drawn, f"named drawn workspace tab {index}")
+                  bounds = state["title_bar"]["tabs"][index][field]
                   return dict(x=bounds["x"] + bounds["width"] / 2,
                               y=bounds["y"] + bounds["height"] / 2)
 
