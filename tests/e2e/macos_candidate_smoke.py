@@ -119,7 +119,8 @@ def exercise(data: Path, socket_path: Path, codctl: str, artifacts: Path) -> Non
         document = data / "reference.txt"
         document.write_text("https://example.com/\n")
         ctl("open", str(document))
-        wait(lambda s: s["active_tab"] == "reference.txt", "reference file")
+        # External files use their absolute path in the driver's tab content text.
+        wait(lambda s: s["active_tab"] == str(document), "reference file")
         driver.keys("super-home")
         driver.keys("right right")
         command("editor: open url")

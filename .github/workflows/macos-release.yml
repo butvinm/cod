@@ -75,16 +75,15 @@ jobs:
           REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
         run: |
           set -euo pipefail
-          # A workflow-only push can consume its parent's completed package before this
-          # workflow exists on the default branch. No extra workflow or build is needed.
+          # An observation-only push can consume the corrected package before this
+          # workflow exists on the default branch. No extra build is needed.
           if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ]; then
             parent=$(git rev-parse HEAD^)
-            if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' && \
-              ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml; then
-              # Bounded file/restart diagnosis uses the retained original compilation,
-              # not a parent run that merely reuploaded those same bytes. The full
-              # source comparison and bundle identity checks below remain mandatory.
-              REUSE_RUN_ID=39868767781
+            if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py' && \
+              ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml tests/e2e/macos_candidate_smoke.py; then
+              # Correct the external-file identity observation on the exact7190fac
+              # package. Full application source and bundle identity must still match.
+              REUSE_RUN_ID=39879700726
             fi
           fi
           if [ -z "$REUSE_RUN_ID" ]; then
@@ -96,9 +95,9 @@ jobs:
           source_commit=$(python3 -c 'import json; r=json.load(open("reuse-run.json")); assert r["status"] == "completed"; assert r["path"] == ".github/workflows/macos-release.yml"; print(r["head_sha"])')
           source_number=$(python3 -c 'import json; print(json.load(open("reuse-run.json"))["run_number"])')
           git fetch --no-tags --depth=1 origin "$source_commit"
-          # Only this workflow may differ. App, bundler, dependencies and smoke assertions
-          # must be exactly those that produced the retained package.
-          git diff --exit-code "$source_commit" HEAD -- . ':(exclude).github/workflows/macos-release.yml'
+          # Only this workflow and the external smoke driver may differ. Application,
+          # embedded driver, bundler and dependencies must match the retained package.
+          git diff --exit-code "$source_commit" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py'
           gh run download "$REUSE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name cod-macos-aarch64
           shasum -a 256 -c cod-macos-aarch64.zip.sha256
           mkdir -p dist
