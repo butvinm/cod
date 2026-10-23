@@ -1593,7 +1593,7 @@ jobs:
               shown = state["workspaces"][1]["id"]
               action("workspace: add folder to project")
               wait(lambda s: s["path_prompt"] is not None, "survivor folder picker")
-              keys("ctrl-a")
+              keys("super-a")
               driver.type(str(survivor_repo))
               wait(lambda s: s["path_prompt"] is not None
                    and s["path_prompt"]["query"] == str(survivor_repo)
