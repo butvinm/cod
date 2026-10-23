@@ -5,7 +5,10 @@ use agent_servers::AcpConnection;
 use agent_servers::{AgentServer, AgentServerDelegate};
 use anyhow::Result;
 use collections::HashMap;
-use futures::{FutureExt, future::Shared};
+use futures::{
+    FutureExt,
+    future::{AbortHandle, Abortable, Shared},
+};
 use gpui::{App, AppContext, Context, Entity, EventEmitter, SharedString, Subscription, Task};
 
 use project::{AgentServerStore, AgentServersUpdated, Project};
@@ -69,6 +72,8 @@ pub struct ActiveAcpConnection {
 pub struct AgentConnectionStore {
     project: Entity<Project>,
     entries: HashMap<Agent, Entity<AgentConnectionEntry>>,
+    closed: bool,
+    connection_starts: Vec<AbortHandle>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -79,12 +84,35 @@ impl AgentConnectionStore {
         Self {
             project,
             entries: HashMap::default(),
+            closed: false,
+            connection_starts: Vec::new(),
             _subscriptions: vec![subscription],
         }
     }
 
     pub fn project(&self) -> &Entity<Project> {
         &self.project
+    }
+
+    /// A panel owns this store; all sessions sharing its transports leave together.
+    pub fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.closed = true;
+        for start in self.connection_starts.drain(..) {
+            start.abort();
+        }
+        for connection in self.active_acp_connections(cx) {
+            connection.connection.shutdown();
+        }
+        for entry in self.entries.values() {
+            if let AgentConnectionEntry::Connecting { connect_task } = entry.read(cx)
+                && let Some(Ok(state)) = connect_task.peek()
+                && let Some(connection) = state.connection.clone().downcast::<AcpConnection>()
+            {
+                connection.shutdown();
+            }
+        }
+        self.entries.clear();
+        cx.notify();
     }
 
     pub fn entry(&self, key: &Agent) -> Option<&Entity<AgentConnectionEntry>> {
@@ -146,6 +174,11 @@ impl AgentConnectionStore {
         server: Rc<dyn AgentServer>,
         cx: &mut Context<Self>,
     ) -> Entity<AgentConnectionEntry> {
+        if self.closed {
+            return cx.new(|_| AgentConnectionEntry::Error {
+                error: LoadError::Other("Workspace is closed".into()),
+            });
+        }
         if let Some(entry) = self.entries.get(&key) {
             return entry.clone();
         }
@@ -167,6 +200,14 @@ impl AgentConnectionStore {
             async move |this, cx| match connect_task.await {
                 Ok(connected_state) => {
                     this.update(cx, move |this, cx| {
+                        if this.closed {
+                            if let Some(connection) =
+                                connected_state.connection.downcast::<AcpConnection>()
+                            {
+                                connection.shutdown();
+                            }
+                            return;
+                        }
                         if this.entries.get(&key) != entry.upgrade().as_ref() {
                             return;
                         }
@@ -282,7 +323,7 @@ impl AgentConnectionStore {
     }
 
     fn start_connection(
-        &self,
+        &mut self,
         server: Rc<dyn AgentServer>,
         cx: &mut Context<Self>,
     ) -> (
@@ -301,6 +342,13 @@ impl AgentConnectionStore {
         );
 
         let connect_task = server.connect(delegate, self.project.clone(), cx);
+        let (abort, registration) = AbortHandle::new_pair();
+        self.connection_starts.push(abort);
+        let connect_task = cx.spawn(async move |_, _| {
+            Abortable::new(connect_task, registration)
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Workspace is closed")))
+        });
         let connect_task = cx.spawn(async move |_this, _cx| match connect_task.await {
             Ok(connection) => Ok(AgentConnectedState { connection }),
             Err(err) => match err.downcast::<LoadError>() {

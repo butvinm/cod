@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Any
@@ -522,7 +523,26 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             self.wait_for_values("chat status", {"status": "working"}, lambda state: {"status": chat(state).get("status")}, 10)
 
     def test_ac7_closing_a_workspace_with_a_working_agent_asks_first(self) -> None:
-        self.start_a_working_chat()
+        repo = self.start_fake_agent_cod(persistent=False, turns=[
+            {"steps": [{"chunk": "Target working."}, {"wait": "target-finish"}]},
+            {"steps": [{"chunk": "Survivor working."}, {"wait": "survivor-finish"}]},
+        ])
+        self.start_chat("Review target.", "Target working.", [])
+        editor_pid = self.cod.process.pid
+
+        def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            rows = subprocess.check_output(
+                ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
+            )
+            found = {}
+            for row in rows.splitlines():
+                fields = row.split(None, 7)
+                if len(fields) == 8 and (not direct_only or int(fields[1]) == editor_pid) and "fake_acp_agent.py" in fields[7]:
+                    found[int(fields[0])] = " ".join(fields[2:])
+            return found
+
+        target_processes = provider_processes()
+        self.expect_equal("one owned target provider", 1, len(target_processes))
 
         with self.step("the workspace itself is working"):
             state = self.wait_for(lambda state: state["workspaces"][0]["status"] == "working", 10, "the workspace itself working")
@@ -539,6 +559,12 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
                 "the second workspace, shown with both tabs drawn",
             )
             shown_id = state["workspaces"][1]["id"]
+
+        with self.step("start an unrelated working session in the shown workspace"):
+            self.add_folder(repo)
+            survivor_session = self.start_chat("Review survivor.", "Survivor working.", [PAY_SESSION])
+            survivor_processes = {pid: identity for pid, identity in provider_processes().items() if pid not in target_processes}
+            self.expect_equal("one separate survivor provider", 1, len(survivor_processes))
 
         # Issue #81: the working workspace is a background tab here, so the prompt must say which
         # workspace it is about, and Enter (the highlighted answer) must not stop the agent.
@@ -567,10 +593,11 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
                 "both workspaces kept, the first still working",
             )
             self.expect_equal("the shown workspace, by id", shown_id, state["workspaces"][state["active_workspace"]]["id"])
+            self.expect_equal("Cancel keeps both exact provider processes", target_processes | survivor_processes, provider_processes())
 
-        with self.step("show the working workspace, click its close button, choose Close: it (and its session) closes"):
-            self.click_tab(state, 0)
-            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
+        with self.step("close the background working workspace explicitly: only its provider exits"):
+            self.hover_tab(state, 0)
+            state = self.state()
             self.click_close_button(state, 0)
             state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
             self.keys("right")
@@ -582,6 +609,30 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             self.keys("enter")
             state = self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
             self.expect_equal("the remaining workspace, by id", shown_id, state["workspaces"][0]["id"])
+            self.wait_for(lambda _state: not (target_processes.items() & provider_processes(False).items()), 12, "the exact target provider exits before app quit")
+            self.expect_equal("the unrelated provider remains", survivor_processes, provider_processes())
+            self.expect_equal("the unrelated session remains", survivor_session, chat(self.state()).get("session_id"))
+            self.expect_equal("the unrelated session still working", "working", chat(self.state()).get("status"))
+            sampled = self.workdir / "sampled-frames"
+            sampled.mkdir(exist_ok=True)
+            subprocess.run(["grim", str(sampled / "provider-close-surviving-workspace.png")], check=True, timeout=20)
+            (sampled / "provider-close.json").write_text(json.dumps({
+                "target_before": target_processes, "survivor_before": survivor_processes,
+                "remaining_after_close": provider_processes(), "target_control_released": False,
+            }, indent=2))
+
+        with self.step("the surviving provider can finish its own work"):
+            (self.workdir / "survivor-finish").touch()
+            self.wait_for(lambda state: chat(state).get("status") == "done", 10, "unrelated work completes")
+            self.expect_equal("target was never released by the fixture", False, (self.workdir / "target-finish").exists())
+            (sampled / "survivor-done.json").write_text(json.dumps(self.state(), indent=2))
+            self.cod.quit()
+            remaining = (target_processes | survivor_processes).items() & provider_processes(False).items()
+            self.expect_equal("normal app quit leaves neither tracked provider", set(), remaining)
+            (sampled / "quit-receipt.json").write_text(json.dumps({
+                "editor_pid": editor_pid, "exited": True, "tracked_provider_survivors": list(remaining),
+                "forced_provider_signal": "none",
+            }, indent=2))
 
     # Issue #81 (review B1): the confirmation is decided by the sessions, not by the workspace's
     # rolled-up status, where an entry in error (a page that failed to load, an earlier failed

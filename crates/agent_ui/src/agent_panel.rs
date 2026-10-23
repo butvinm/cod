@@ -1858,6 +1858,15 @@ impl AgentPanel {
         &self.connection_store
     }
 
+    /// Called only after workspace-close consent, never when moving to another window.
+    pub(crate) fn cod_shutdown(&mut self, cx: &mut Context<Self>) {
+        for view in self.conversation_views() {
+            view.update(cx, |view, cx| view.cod_cancel_all_sessions(cx));
+        }
+        self.connection_store
+            .update(cx, |store, cx| store.shutdown(cx));
+    }
+
     pub fn selected_agent(&self, cx: &App) -> Agent {
         if self.project.read(cx).is_via_collab() {
             Agent::NativeAgent

@@ -289,13 +289,13 @@ pub(super) async fn delete_stored_workspace_name(
 
 /// Cod (#28) hook: what else goes when a workspace leaves its window for good, next to its name.
 /// The agent panel registers the deletion of the workspace's chats (agent_ui crate).
-struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(WorkspaceId, &mut App)>);
+struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(&Entity<Workspace>, &mut App)>);
 
 impl Global for CodWorkspaceRemovedHook {}
 
 /// Cod (#28): registers what runs when a workspace leaves its window for good.
 pub fn cod_set_workspace_removed_hook(
-    hook: impl Fn(WorkspaceId, &mut App) + 'static,
+    hook: impl Fn(&Entity<Workspace>, &mut App) + 'static,
     cx: &mut App,
 ) {
     cx.set_global(CodWorkspaceRemovedHook(std::rc::Rc::new(hook)));
@@ -318,12 +318,12 @@ pub fn cod_take_fresh_chat(workspace: gpui::EntityId, cx: &mut App) -> bool {
 }
 
 /// Cod (#28): runs the registered hook for a workspace that left its window for good.
-pub(super) fn run_workspace_removed_hook(id: WorkspaceId, cx: &mut App) {
+pub(super) fn run_workspace_removed_hook(workspace: &Entity<Workspace>, cx: &mut App) {
     if let Some(hook) = cx
         .try_global::<CodWorkspaceRemovedHook>()
         .map(|hook| hook.0.clone())
     {
-        (*hook)(id, cx);
+        (*hook)(workspace, cx);
     }
 }
 

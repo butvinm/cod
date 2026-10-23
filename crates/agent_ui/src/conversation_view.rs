@@ -1622,6 +1622,21 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn cod_cancel_all_sessions(&self, cx: &mut App) {
+        if let Some(connected) = self.as_connected() {
+            let threads: Vec<_> = connected
+                .conversation
+                .read(cx)
+                .threads
+                .values()
+                .cloned()
+                .collect();
+            for thread in threads {
+                thread.update(cx, |thread, cx| thread.cancel(cx).detach());
+            }
+        }
+    }
+
     pub fn parent_id(&self) -> ThreadId {
         self.thread_id
     }

@@ -624,7 +624,13 @@ pub fn init(
     thread_metadata_store::init(cx);
     // Cod (#28): a workspace that leaves its window for good takes its agent chats with it.
     workspace::cod_set_workspace_removed_hook(
-        |workspace_id, cx| {
+        |workspace, cx| {
+            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| panel.cod_shutdown(cx));
+            }
+            let Some(workspace_id) = workspace.read(cx).database_id() else {
+                return;
+            };
             if let Some(store) = thread_metadata_store::ThreadMetadataStore::try_global(cx) {
                 store.update(cx, |store, cx| {
                     store.cod_delete_workspace_chats(i64::from(workspace_id), cx)

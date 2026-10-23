@@ -1757,6 +1757,10 @@ impl MultiWorkspace {
             workspace._serialize_workspace_task.take();
         });
 
+        if !keep_name {
+            // Confirmed removal must stop the panel even if other handles retain the workspace.
+            cod_workspaces::run_workspace_removed_hook(workspace, cx);
+        }
         if let Some(workspace_id) = workspace.read(cx).database_id() {
             let db = crate::persistence::WorkspaceDb::global(cx);
             // Cod (#24): a removed workspace loses its name on every removal path (palette close,
@@ -1771,8 +1775,6 @@ impl MultiWorkspace {
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
                 cod_status::cod_forget_workspace_status(workspace_id, cx);
-                // Cod (#28): the workspace's agent chats go with it.
-                cod_workspaces::run_workspace_removed_hook(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);
