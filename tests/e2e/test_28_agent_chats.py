@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from cod_e2e import CodTestCase
+from cod_e2e import CodTestCase, processes_with_marker
 from cod_status_fixtures import CodStatusFixtures, drawn, title_bar
 from fake_acp_agent import fake_agent_settings
 from page_server import PageServer
@@ -528,16 +528,17 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             {"steps": [{"chunk": "Survivor working."}, {"wait": "survivor-finish"}]},
         ])
         self.start_chat("Review target.", "Target working.", [])
-        editor_pid = self.cod.process.pid
+        launcher_pid = self.cod.process.pid
 
         def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            owned = set(processes_with_marker(self.cod.marker)) if direct_only else set()
             rows = subprocess.check_output(
                 ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
             )
             found = {}
             for row in rows.splitlines():
                 fields = row.split(None, 7)
-                if len(fields) == 8 and (not direct_only or int(fields[1]) == editor_pid) and "fake_acp_agent.py" in fields[7]:
+                if len(fields) == 8 and (not direct_only or int(fields[0]) in owned) and "fake_acp_agent.py" in fields[7]:
                     found[int(fields[0])] = " ".join(fields[2:])
             return found
 
@@ -630,7 +631,7 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             remaining = (target_processes | survivor_processes).items() & provider_processes(False).items()
             self.expect_equal("normal app quit leaves neither tracked provider", set(), remaining)
             (sampled / "quit-receipt.json").write_text(json.dumps({
-                "editor_pid": editor_pid, "exited": True, "tracked_provider_survivors": list(remaining),
+                "launcher_pid": launcher_pid, "exited": True, "tracked_provider_survivors": list(remaining),
                 "forced_provider_signal": "none",
             }, indent=2))
 
@@ -646,16 +647,16 @@ class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
             "agent_servers": {AGENT_ID: fake_agent_settings(script, log=log)},
         })
         self.wait_for(lambda state: [real(path) for path in state["worktrees"]] == [real(repo)], 30, "the target folder")
-        editor_pid = self.cod.process.pid
 
         def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            owned = set(processes_with_marker(self.cod.marker)) if direct_only else set()
             rows = subprocess.check_output(
                 ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
             )
             found = {}
             for row in rows.splitlines():
                 fields = row.split(None, 7)
-                if len(fields) == 8 and (not direct_only or int(fields[1]) == editor_pid) and "fake_acp_agent.py" in fields[7]:
+                if len(fields) == 8 and (not direct_only or int(fields[0]) in owned) and "fake_acp_agent.py" in fields[7]:
                     found[int(fields[0])] = " ".join(fields[2:])
             return found
 
