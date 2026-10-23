@@ -1017,14 +1017,7 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.press_until_tab_focus(0)
             self.expect_equal("focus alone preserves the active workspace", 5, state["active_workspace"])
             self.assert_tab_controls_in_view(state, 0)
-            shot = self.workdir / "keyboard-close.ppm"
-            screenshot_ppm(shot)
-            width, height, pixels = read_ppm(shot)
-            tab = title_bar(state)["tabs"][0]
-            icon = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["close_bounds"])
-            bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["bounds"], dy=0.15)
-            if color_distance(icon, bg) <= COLOR_TOLERANCE:
-                raise AssertionError("expected keyboard focus to reveal the close icon without hover")
+            self.wait_for_presented_close_icon(state, 0)
 
         for resize_width in (560, 640):
             with self.step(f"resize to {resize_width} px: the first tab keeps focus and stays revealed while the last workspace stays active"):
@@ -1066,6 +1059,46 @@ class WorkspaceTabsTest(CodStatusFixtures, CodTestCase):
             state = self.wait_for(lambda state: state["workspace_count"] == 5, SHOW_TIMEOUT, "the focused close control to close its workspace")
             self.expect_equal("keyboard close preserves the other workspace identities", surviving_ids,
                               [workspace["id"] for workspace in state["workspaces"]])
+
+    def wait_for_presented_close_icon(self, focused_state: dict[str, Any], index: int) -> None:
+        """Observe presentation after logical focus without sending any further input."""
+        samples = self.workdir / "sampled-frames"
+        samples.mkdir(exist_ok=True)
+        shot = samples / "keyboard-close-last.ppm"
+        identities = [workspace["id"] for workspace in focused_state["workspaces"]]
+        started = time.monotonic()
+        observations: list[dict[str, Any]] = []
+
+        def unchanged_focus(state: dict[str, Any]) -> None:
+            self.expect_equal("workspace identities during presentation", identities,
+                              [workspace["id"] for workspace in state["workspaces"]])
+            self.expect_equal("active workspace during presentation", focused_state["active_workspace"], state["active_workspace"])
+            self.expect_equal("tab remains keyboard focused", True, title_bar(state)["tabs"][index]["focused"])
+            self.assert_tab_controls_in_view(state, index)
+
+        try:
+            while True:
+                state = self.state()
+                unchanged_focus(state)
+                screenshot_ppm(shot)
+                if not observations:
+                    (samples / "keyboard-close-first.ppm").write_bytes(shot.read_bytes())
+                width, height, pixels = read_ppm(shot)
+                tab = title_bar(state)["tabs"][index]
+                icon = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["close_bounds"])
+                bg = bounds_pixel(width, height, pixels, FIRST_USE_OUTPUT_SCALE, tab["bounds"], dy=0.15)
+                contrast = color_distance(icon, bg)
+                elapsed = time.monotonic() - started
+                observations.append({"elapsed_seconds": elapsed, "icon": icon, "background": bg,
+                                     "contrast": contrast, "tab": tab, "image_size": [width, height]})
+                unchanged_focus(self.state())
+                if contrast > COLOR_TOLERANCE:
+                    return
+                if elapsed >= SHOW_TIMEOUT:
+                    raise AssertionError("expected keyboard focus to reveal the close icon without hover")
+                time.sleep(0.1)
+        finally:
+            (samples / "keyboard-close-observations.json").write_text(json.dumps(observations, indent=2) + "\n")
 
     def check_a_full_bar_of_default_tabs(self, width: int, height: int, count: int) -> None:
         """Open real default workspaces, then reveal every one with palette navigation.

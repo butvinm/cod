@@ -742,6 +742,11 @@ class CodTestCase(unittest.TestCase):
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
         (target / note_name).write_text(note)
+        # Keep the frames actually sampled by visual assertions; the later collection
+        # screenshot may show a different presented frame.
+        sampled = self.workdir / "sampled-frames"
+        if sampled.is_dir():
+            shutil.copytree(sampled, target / "sampled-frames")
         try:
             shot = subprocess.run(["grim", str(target / "screenshot.png")], capture_output=True, text=True, timeout=20)
             if shot.returncode != 0:
