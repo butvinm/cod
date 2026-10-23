@@ -289,6 +289,7 @@ jobs:
       # before poking at it with codctl. A crash report for one of Cod's own executables, created
       # after this run's own launch, also fails the job, even if the process looked alive below.
       - name: Smoke test the zip
+        if: github.ref != 'refs/heads/macos-preview/smoke-disposition-20261023'
         id: smoke
         run: |
           set -uo pipefail
@@ -1060,6 +1061,7 @@ jobs:
 
       # Retain the existing ordinary QA and planning beta on the changed package.
       - name: Ordinary native package QA and focused beta
+        if: github.ref != 'refs/heads/macos-preview/smoke-disposition-20261023'
         timeout-minutes: 8
         env:
           PYTHONPATH: tests/e2e
@@ -1424,10 +1426,13 @@ jobs:
           set -euo pipefail
           export PYTHONPATH="$PWD/tests/e2e"
           shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          if [ "$GITHUB_REF" = "refs/heads/macos-preview/smoke-disposition-20261023" ]; then
+            test "$(shasum -a 256 cod-macos-aarch64.zip | cut -d ' ' -f 1)" = "9b76b99a2269d59453b7da6deae7117a63439f463d30b0f28505e375ac1e5b46"
+          fi
           package=$(mktemp -d "${RUNNER_TEMP}/cod-provider-close.XXXXXX")
           ditto -x -k cod-macos-aarch64.zip "$package"
           python3 - "$package/Cod.app" "$PWD/smoke-artifacts/provider-close" <<'PY'
-          """Only explicit Working Close and provider process observation on retained Mac bytes."""
+          """Observe Cancel and an active surviving provider together on retained Mac bytes."""
           import json
           import os
           from pathlib import Path
@@ -1450,13 +1455,17 @@ jobs:
           data = Path(tempfile.mkdtemp(prefix="cod-remaining-")).resolve()
           repo = make_repo(data, "agent-safety-notes", {"README.txt": "Working close observation.\n"})
           control = data / "advance-to-permission"
+          survivor_control = data / "survivor-finish"
+          survivor_repo = make_repo(data, "release-plan", {"README.txt": "Independent active review.\n"})
           script = data / "agent.json"
-          script.write_text(json.dumps({"session_ids": ["mac-safety-session"], "turns": [{"steps": [
+          script.write_text(json.dumps({"session_ids": ["mac-safety-session", "mac-survivor-session"], "turns": [{"steps": [
               {"chunk": "Reviewing the release notes."}, {"wait": str(control)},
-              {"end": "end_turn"}]}]}))
+              {"end": "end_turn"}]}, {"steps": [
+              {"chunk": "Reviewing the independent release plan."}, {"wait": str(survivor_control)},
+              {"chunk": " Independent review complete."}, {"end": "end_turn"}]}]}))
           settings = cod_settings()
           settings["theme"] = "One Dark"
-          settings["agent_servers"] = {"claude-acp": fake_agent_settings(script, log=output / "fake-agent.log")}
+          settings["agent_servers"] = {"claude-acp": fake_agent_settings(script, state=data / "fake-state.json", log=output / "fake-agent.log")}
           (data / "config").mkdir()
           (data / "config/settings.json").write_text(json.dumps(settings))
           socket = Path(tempfile.mkdtemp(prefix="cod-rem-", dir="/tmp")) / "d.sock"
@@ -1479,6 +1488,7 @@ jobs:
           assert len(editors) == 1, editors
           pid = editors[0]
           tracked = {}
+          survivor_tracked = {}
           (output / "identity.json").write_text(json.dumps({"source_commit": head, "version": version, "pid": pid,
               "profile": str(data), "provider": "scripted fake ACP; no real-provider restore claim",
               "shortcut_input": "native GPUI in-process driver keys/hover/click; System Events Cmd-Q only"}, indent=2))
@@ -1544,10 +1554,10 @@ jobs:
                                             "started": " ".join(fields[2:7]), "command": fields[7]}
               return rows
 
-          def provider_tree():
+          def provider_tree(expected=1):
               rows = processes()
               provider = [p for p, row in rows.items() if "fake_acp_agent.py" in row["command"] and row["ppid"] == pid]
-              assert len(provider) == 1, {"matching_direct_providers": provider}
+              assert len(provider) == expected, {"matching_direct_providers": provider, "expected": expected}
               selected = set(provider)
               while True:
                   expanded = selected | {p for p, row in rows.items() if row["ppid"] in selected}
@@ -1555,6 +1565,11 @@ jobs:
                       break
                   selected = expanded
               return {p: rows[p] for p in selected}
+
+          def exact_present(identities):
+              rows = processes()
+              return {p: rows[p] for p, before in identities.items()
+                      if p in rows and rows[p]["started"] == before["started"]}
 
           try:
               wait(lambda s: s["window_active"] and len(s["worktrees"]) == 1, "ordinary project window")
@@ -1572,17 +1587,56 @@ jobs:
               wait(lambda s: (s.get("chat") or {}).get("status") == "working"
                    and "Reviewing the release notes." in (s.get("chat") or {}).get("transcript", ""), "real ACP working state")
               agent_workspace = driver.state()["workspaces"][0]["id"]
+              tracked = provider_tree()
               action("workspace: new workspace")
               state = wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "second workspace")
               shown = state["workspaces"][1]["id"]
+              action("workspace: add folder to project")
+              wait(lambda s: s["path_prompt"] is not None, "survivor folder picker")
+              keys("ctrl-a")
+              driver.type(str(survivor_repo))
+              wait(lambda s: s["path_prompt"] is not None
+                   and s["path_prompt"]["query"] == str(survivor_repo)
+                   and s["path_prompt"]["match_count"] == 1, "survivor folder matched")
+              keys("enter")
+              wait(lambda s: s["path_prompt"] is None
+                   and s["worktrees"] == [str(survivor_repo)], "survivor project shown")
+              wait(lambda s: s.get("agent_panel_ready") is True, "survivor panel ready")
+              action("agent: toggle focus")
+              action("agent: toggle new thread menu")
+              keys("end up enter")
+              wait(lambda s: (s.get("chat") or {}).get("agent") == "claude-acp", "survivor ACP agent")
+              driver.type("Review the independent release plan.")
+              keys("enter")
+              wait(lambda s: (s.get("chat") or {}).get("status") == "working"
+                   and "Reviewing the independent release plan." in (s.get("chat") or {}).get("transcript", ""), "survivor really active")
+              survivor_session = driver.state()["chat"]["session_id"]
+              assert survivor_session == "mac-survivor-session", survivor_session
+              all_providers = provider_tree(2)
+              survivor_tracked = {p: row for p, row in all_providers.items() if p not in tracked}
+              assert survivor_tracked and exact_present(tracked) == tracked, all_providers
               close_background("working", "01-working-close")
-              tracked = provider_tree()
               (output / "provider-before.json").write_text(json.dumps(list(tracked.values()), indent=2))
+              keys("enter")
+              state = wait(lambda s: s["prompt"] is None and s["workspace_count"] == 2
+                           and s["workspaces"][0]["status"] == "working"
+                           and (s.get("chat") or {}).get("status") == "working", "default Cancel keeps both active workspaces")
+              assert state["workspaces"][state["active_workspace"]]["id"] == shown, state
+              assert exact_present(tracked) == tracked and exact_present(survivor_tracked) == survivor_tracked
+              assert not control.exists() and not survivor_control.exists()
+              capture("02-cancel-preserved")
+              (output / "cancel-receipt.json").write_text(json.dumps({
+                  "target": list(tracked.values()), "survivor": list(survivor_tracked.values()),
+                  "target_after_cancel": list(exact_present(tracked).values()),
+                  "survivor_after_cancel": list(exact_present(survivor_tracked).values()),
+                  "target_control_released": control.exists(), "survivor_control_released": survivor_control.exists(),
+                  "shown_workspace": shown, "forced_provider_signal": "none"}, indent=2))
+              close_background("working", "03-explicit-close")
               keys("right")
               wait(lambda s: s["prompt"]["answers"][s["prompt"]["highlighted"]] == "Close", "Close selected")
               keys("enter")
               wait(lambda s: s["workspace_count"] == 1 and s["workspaces"][0]["id"] == shown, "explicit Close removes only target")
-              capture("02-surviving-workspace")
+              capture("04-active-surviving-workspace")
               observation_start = time.monotonic()
               end = observation_start + 12
               survivors = tracked
@@ -1605,7 +1659,22 @@ jobs:
               (output / "provider-close-receipt.json").write_text(json.dumps(receipt, indent=2))
               assert not survivors, receipt
               assert not control.exists(), receipt
-              print("PASS explicit Working Close and observed provider tree gone before app quit; scripted ACP", flush=True)
+              state = driver.state()
+              assert state["chat"]["session_id"] == survivor_session and state["chat"]["status"] == "working", state
+              assert exact_present(survivor_tracked) == survivor_tracked
+              survivor_control.touch()
+              state = wait(lambda s: (s.get("chat") or {}).get("status") == "done"
+                           and "Independent review complete." in (s.get("chat") or {}).get("transcript", ""), "surviving active provider finishes")
+              assert state["chat"]["session_id"] == survivor_session and not control.exists(), state
+              assert not exact_present(tracked)
+              capture("05-survivor-completed")
+              (output / "survivor-completion-receipt.json").write_text(json.dumps({
+                  "session_id": survivor_session, "survivor_before": list(survivor_tracked.values()),
+                  "survivor_after_completion": list(exact_present(survivor_tracked).values()),
+                  "target_after_completion": list(exact_present(tracked).values()),
+                  "target_control_released": control.exists(), "survivor_control_released": survivor_control.exists(),
+                  "status": state["chat"]["status"], "forced_provider_signal": "none"}, indent=2))
+              print("PASS native Cancel preserves target; explicit Close stops only target; active survivor completes", flush=True)
           finally:
               try:
                   capture("final")
@@ -1626,9 +1695,10 @@ jobs:
                   finally:
                       receipt["elapsed_seconds"] = time.monotonic() - quit_started
                       rows = processes()
-                      receipt["tracked_provider_survivors"] = [rows[p] for p, before in tracked.items()
+                      receipt["tracked_provider_survivors"] = [rows[p] for p, before in (tracked | survivor_tracked).items()
                           if p in rows and rows[p]["started"] == before["started"]]
                       (output / "quit-receipt.json").write_text(json.dumps(receipt, indent=2))
+                      assert not receipt["tracked_provider_survivors"], receipt
                       driver.close()
                       for name in ("Zed.log", "cod-stderr.log"):
                           source = data / "logs" / name
