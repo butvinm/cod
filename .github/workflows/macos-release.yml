@@ -1055,7 +1055,7 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          caffeinate -dimsu python3 - "$PWD/dist/Cod.app" "$PWD/smoke-artifacts/ordinary-qa" \
+          caffeinate -dimsu python3 - "$PWD/dist/Cod.app" "$PWD/smoke-artifacts/ordinary-qa" --nonempty-only \
             > smoke-artifacts/ordinary-qa.log 2>&1 <<'PY' || status=$?
           """Prepared ordinary macOS package walkthrough using the existing smoke Driver.
 
@@ -1066,6 +1066,8 @@ jobs:
           import os
           from pathlib import Path
           import plistlib
+          import re
+          import shlex
           import subprocess
           import sys
           import tempfile
@@ -1109,8 +1111,41 @@ jobs:
               driver = Driver(socket_path)
               pid_text = subprocess.check_output(["pgrep", "-f", str(app / "Contents/MacOS/zed")], text=True)
               pids = [int(x) for x in pid_text.split()]
-              assert len(pids) == 1, ("expected only this package editor", pids)
-              pid = pids[0]
+              (output / "initial-pgrep-pids.json").write_text(json.dumps(pids))
+              assert 0 < len(pids) <= 32, ("unexpected package process count", pids)
+              # One snapshot avoids requiring a short-lived helper to survive between
+              # pgrep and ps. Retain only this bundle's commands, never unrelated processes.
+              process_snapshot = subprocess.run(
+                  ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,command="],
+                  capture_output=True, text=True, timeout=10)
+              (output / "process-snapshot-stderr.txt").write_text(process_snapshot.stderr[-4096:])
+              process_snapshot.check_returncode()
+              expected_executable = str(app / "Contents/MacOS/zed")
+              observed = {}
+              editors = []
+              excluded = []
+              matching_lines = [line for line in process_snapshot.stdout.splitlines() if expected_executable in line]
+              (output / "initial-processes.txt").write_text("\n".join(matching_lines) + "\n")
+              for line in matching_lines:
+                  process_id, parent_id, command_line = line.split(None, 2)
+                  process_id = int(process_id)
+                  observed[process_id] = {"ppid": int(parent_id), "command": command_line}
+                  # The package also runs zed --printenv in a login-shell worker. Source
+                  # main.rs exits that explicit mode before UI startup. Keep its evidence.
+                  if re.search(r"(?:^|\s)--printenv(?:\s|$)", command_line):
+                      excluded.append(process_id)
+                  else:
+                      arguments = shlex.split(command_line)
+                      assert arguments[0] == expected_executable, ("unexpected package match", observed[process_id])
+                      assert arguments[1:3] == ["--user-data-dir", str(data)], ("unexpected profile", observed[process_id])
+                      editors.append(process_id)
+              (output / "process-selection.json").write_text(json.dumps({
+                  "initial_pids": pids, "observed": observed, "excluded_printenv": excluded, "editors": editors,
+                  "initial_pids_no_longer_present": sorted(set(pids) - set(observed)),
+              }, indent=2))
+              assert 0 < len(observed) <= 32, ("unexpected snapshot process count", observed)
+              assert len(editors) == 1, ("expected exactly one package UI editor", editors, observed)
+              pid = editors[0]
 
               def os_window(statement):
                   script = (f'tell application "System Events" to tell first process whose unix id is {pid} '
@@ -1356,7 +1391,9 @@ jobs:
               assert (app / "Contents/Resources/cod-commit.txt").read_text().strip() == APP_HEAD
               plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
               assert plist["CodCommit"] == APP_HEAD and plist["CFBundleVersion"] == "17"
-              for theme, fresh in (("One Dark", True), ("One Light", False)):
+              assert sys.argv[3:] in ([], ["--nonempty-only"]), "optional --nonempty-only only"
+              cases = (("One Light", False),) if sys.argv[3:] else (("One Dark", True), ("One Light", False))
+              for theme, fresh in cases:
                   ordinary(app, output / (theme.replace(" ", "-") + ("-fresh" if fresh else "-nonempty")), theme, fresh)
           PY
           cat smoke-artifacts/ordinary-qa.log
