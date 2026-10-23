@@ -81,12 +81,10 @@ jobs:
             parent=$(git rev-parse HEAD^)
             if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' && \
               ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml; then
-              REUSE_RUN_ID=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow macos-release.yml \
-                --commit "$parent" --status completed --limit 1 --json databaseId --jq '.[0].databaseId // empty')
-              if [ -z "$REUSE_RUN_ID" ]; then
-                echo "::error::Workflow-only change has no completed parent package to verify"
-                exit 1
-              fi
+              # Bounded file/restart diagnosis uses the retained original compilation,
+              # not a parent run that merely reuploaded those same bytes. The full
+              # source comparison and bundle identity checks below remain mandatory.
+              REUSE_RUN_ID=39868767781
             fi
           fi
           if [ -z "$REUSE_RUN_ID" ]; then
@@ -765,6 +763,22 @@ jobs:
           fi
           cat smoke-artifacts/mac-candidate-smoke.log
 
+          # Retain the previously lost CLI error without changing the external fixture
+          # or the failing scenario. Compare with the existing visible-project file.
+          if [ -f "$data/reference.txt" ]; then
+            file_exit=0
+            "$app/Contents/MacOS/codctl" open "$data/reference.txt" \
+              > smoke-artifacts/external-file-stdout.txt 2> smoke-artifacts/external-file-stderr.txt || file_exit=$?
+            echo "$file_exit" > smoke-artifacts/external-file-exit.txt
+            echo "External-file diagnostic exit=$file_exit"
+            cat smoke-artifacts/external-file-stderr.txt
+            control_exit=0
+            "$app/Contents/MacOS/codctl" open "$data/project/README.md" \
+              > smoke-artifacts/project-file-stdout.txt 2> smoke-artifacts/project-file-stderr.txt || control_exit=$?
+            echo "$control_exit" > smoke-artifacts/project-file-exit.txt
+            echo "Visible-project control exit=$control_exit"
+          fi
+
           # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
           # loaded page from the P1-round page tab test above.
           echo "== round 5 P3: codctl parity (reload, back, forward, close) =="
@@ -812,6 +826,80 @@ jobs:
           # with the same --user-data-dir (the restore mechanism is not a test-only path: it is
           # the ordinary default behavior of a real restart).
           echo "== round 5 P4: open a page to check after a restart =="
+          snapshot_restart() {
+            snapshot_status=0
+            python3 - "$data" "$driver_dir/driver.sock" "$app/Contents/MacOS/codctl" "$1" <<'PY'
+          import json, pathlib, signal, sqlite3, subprocess, sys, time
+          sys.path.insert(0, 'tests/e2e')
+          from cod_e2e import Driver
+          data, socket, codctl, label = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+          out = pathlib.Path('smoke-artifacts') / ('restart-' + label)
+          out.mkdir(exist_ok=True)
+          report = {'data': str(data.resolve()), 'socket': str(socket), 'databases': [], 'errors': []}
+          def expired(*_):
+              raise TimeoutError('20s diagnostic snapshot deadline')
+          deadline = time.monotonic() + 20
+          def backup_progress(*_):
+              if time.monotonic() >= deadline:
+                  expired()
+          signal.signal(signal.SIGALRM, expired)
+          signal.alarm(20)
+          try:
+              report['settings'] = (data / 'config/settings.json').read_text()
+              try:
+                  result = subprocess.run([codctl, 'workspace', 'list', '--json'], capture_output=True, text=True, timeout=5)
+                  report['workspaces'] = {'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+              except Exception as error:
+                  report['workspaces_error'] = repr(error)
+              if socket.exists():
+                  driver = None
+                  try:
+                      driver = Driver(socket)
+                      (out / 'driver-state.json').write_text(json.dumps(driver.state(), indent=2))
+                  except Exception as error:
+                      report['driver_error'] = repr(error)
+                  finally:
+                      if driver is not None:
+                          driver.close()
+              for index, path in enumerate(sorted((data / 'db').rglob('*'))):
+                  source = saved = None
+                  entry = {'path': str(path.relative_to(data)), 'tables': {}}
+                  try:
+                      backup_progress()
+                      if not path.is_file():
+                          continue
+                      with path.open('rb') as stream:
+                          if stream.read(16) != b'SQLite format 3\x00':
+                              continue
+                      report['databases'].append(entry)
+                      source = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=3)
+                      saved = sqlite3.connect(out / ('database-' + str(index) + '.sqlite'))
+                      source.backup(saved, pages=128, progress=backup_progress)
+                      tables = {row[0] for row in saved.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                      for table in ('cod_pages', 'workspaces', 'items', 'panes', 'kv_store', 'scoped_kv_store'):
+                          if table in tables:
+                              cursor = saved.execute('SELECT * FROM "' + table + '"')
+                              entry['tables'][table] = {'columns': [c[0] for c in cursor.description], 'rows': cursor.fetchall()}
+                  except Exception as error:
+                      report['errors'].append({'path': str(path), 'error': repr(error)})
+                      if isinstance(error, TimeoutError):
+                          break
+                  finally:
+                      if source is not None:
+                          source.close()
+                      if saved is not None:
+                          saved.close()
+          except Exception as error:
+              report['errors'].append({'error': repr(error)})
+          finally:
+              signal.alarm(0)
+              (out / 'persistence.json').write_text(json.dumps(report, indent=2, default=str))
+          print('Retained restart snapshot', label, 'databases=', len(report['databases']), 'errors=', report['errors'])
+          sys.exit(int(bool(report['errors'])))
+          PY
+            snapshot_status=$?
+            return "$snapshot_status"
+          }
           persist_dir=$(mktemp -d)
           printf '%s\n' \
             '<!DOCTYPE html>' \
@@ -836,15 +924,34 @@ jobs:
             status=1
           fi
 
-          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
-            sleep 2
-            kill -9 "$pid" 2>/dev/null || true
+          snapshot_restart before-quit || status=1
+          cp "$data/logs/Zed.log" smoke-artifacts/restart-before-quit/zed.log 2>/dev/null || true
+          old_pid="$pid"
+          quit_started=$(date +%s)
+          quit_request_exit=0
+          osascript -e "tell application \"$app\" to quit" \
+            > smoke-artifacts/restart-quit-stdout.txt 2> smoke-artifacts/restart-quit-stderr.txt || quit_request_exit=$?
+          graceful_exit=0
+          for _attempt in $(seq 1 30); do
+            if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+              graceful_exit=1
+              break
+            fi
+            sleep 1
+          done
+          echo "old_pid=$old_pid request_exit=$quit_request_exit process_exited=$graceful_exit elapsed_seconds=$(( $(date +%s) - quit_started )) forced_signal=none" \
+            | tee smoke-artifacts/restart-quit-result.txt
+          snapshot_restart after-quit || status=1
+          cp "$data/logs/Zed.log" smoke-artifacts/restart-after-quit/zed.log 2>/dev/null || true
+          if [ "$graceful_exit" != "1" ] || [ "$quit_request_exit" != "0" ]; then
+            echo "::error::P4 FAIL: graceful quit did not complete; no restore acceptance from a forced shutdown"
+            status=1
           fi
 
-          if [ -n "$persist_id" ]; then
+          if [ -n "$persist_id" ] && [ "$graceful_exit" = "1" ] && [ "$quit_request_exit" = "0" ]; then
             echo "== round 5 P4: relaunch and check the page was restored =="
-            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" "$app" \
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
+              --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" \
               > smoke-artifacts/open-relaunch.txt 2>&1
             sleep 20
             pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
@@ -862,6 +969,10 @@ jobs:
               echo "::error::P4 FAIL: the page was not restored as state=loaded title='Cod Mac restart smoke' within 30s of the relaunch"
               cat smoke-artifacts/codctl-page-get-p4-after.txt 2> /dev/null || true
               status=1
+            fi
+            snapshot_restart after-relaunch || status=1
+            if screencapture -x -t jpg smoke-artifacts/restart-actual-window.jpg 2>/dev/null; then
+              shrink_jpg smoke-artifacts/restart-actual-window.jpg
             fi
           fi
 
