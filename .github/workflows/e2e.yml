@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - master
+      - fix/81-final-linux-startup
 
 permissions:
   contents: read
@@ -50,6 +51,10 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          if [ "$GITHUB_REF" = refs/heads/fix/81-final-linux-startup ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$EVENT_NAME" != pull_request ]; then
             echo "Decision: $EVENT_NAME event, building and running the end-to-end tests"
             echo "code=true" >> "$GITHUB_OUTPUT"
@@ -92,7 +97,7 @@ jobs:
 
       # The build packages of linux-release.yml, then what the tests need at run time: the browser runtime libraries (as in check-preview.yml), sway as the headless compositor, grim for screenshots, mesa-vulkan-drivers for software Vulkan, dbus for dbus-run-session.
       - name: Install Linux dependencies
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' || github.ref == 'refs/heads/fix/81-final-linux-startup'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -104,6 +109,58 @@ jobs:
             libxkbcommon0 libxkbcommon-x11-0 libpango-1.0-0 libxcomposite1 libxdamage1 libxrandr2 \
             libwebkit2gtk-4.1-0 libfontconfig1 xz-utils util-linux \
             sway grim dbus
+
+      # Temporary branch-only verification of final release bytes. No build or publication.
+      - name: Download and verify the final Linux package
+        if: github.ref == 'refs/heads/fix/81-final-linux-startup'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p final-package target/e2e-artifacts
+          gh api repos/cod-editor/cod/releases/assets/672831447 \
+            -H 'Accept: application/octet-stream' > final-package/cod-linux-x86_64.tar.xz
+          echo '9a778c5b9118662099bcf3f0c85f4ce421aef0f527f8e55901399ee357c25e06  final-package/cod-linux-x86_64.tar.xz' | sha256sum -c -
+          test "$(stat -c %s final-package/cod-linux-x86_64.tar.xz)" = 86459760
+          tar -xJf final-package/cod-linux-x86_64.tar.xz -C final-package
+          echo 'f36f960455f4b0fabe10caa351a5ac93e03f39ee3deb2def6ec799a611bc06a0  final-package/cod/cod' | sha256sum -c -
+          cmp script/cod-wayland.sh final-package/cod/cod-wayland.sh
+          sha256sum final-package/cod-linux-x86_64.tar.xz final-package/cod/cod \
+            script/cod-wayland.sh final-package/cod/cod-wayland.sh \
+            script/e2e tests/e2e/cod_e2e.py tests/e2e/test_22_open_file.py \
+            > target/e2e-artifacts/identity-before.txt
+          cp final-package/cod/cef-manifest target/e2e-artifacts/
+          grep -Fx 'version=154.0.34' final-package/cod/cef-manifest
+          grep -Fx 'sha256=2e6417f4b72170518113ad643a768d337ada3ad5a69ec24963c3438f9f714047' final-package/cod/cef-manifest
+          gh release download cef-154.0.34 --repo cod-editor/cod \
+            --pattern cod-cef-154.0.34-linux-x86_64.tar.xz --dir final-package
+          echo '2e6417f4b72170518113ad643a768d337ada3ad5a69ec24963c3438f9f714047  final-package/cod-cef-154.0.34-linux-x86_64.tar.xz' | sha256sum -c -
+          tar -xJf final-package/cod-cef-154.0.34-linux-x86_64.tar.xz -C final-package
+          (cd final-package/cef && sha256sum -c SHA256SUMS)
+          sha256sum final-package/cod-cef-154.0.34-linux-x86_64.tar.xz \
+            final-package/cef/libcef.so >> target/e2e-artifacts/identity-before.txt
+
+      - name: Open a file with the actual final package without building
+        if: github.ref == 'refs/heads/fix/81-final-linux-startup'
+        shell: bash
+        run: |
+          COD_E2E_BIN="$PWD/final-package/cod/cod" \
+            COD_CEF_DIR="$PWD/final-package/cef" \
+            COD_E2E_ARTIFACTS="$PWD/target/e2e-artifacts/final-startup" \
+            script/e2e test_22_open_file.OpenFileTest.test_open_file_with_the_file_finder \
+            2>&1 | tee target/e2e-artifacts/startup-check.log
+
+      - name: Verify final runtime identity and unchanged executable
+        if: always() && github.ref == 'refs/heads/fix/81-final-linux-startup'
+        run: |
+          echo 'f36f960455f4b0fabe10caa351a5ac93e03f39ee3deb2def6ec799a611bc06a0  final-package/cod/cod' | sha256sum -c -
+          sha256sum final-package/cod/cod target/e2e-run/cod/cod \
+            target/e2e-run/cod/cod-wayland.sh > target/e2e-artifacts/identity-after.txt
+          cmp final-package/cod/cod target/e2e-run/cod/cod
+          cmp final-package/cod/cod-wayland.sh target/e2e-run/cod/cod-wayland.sh
+          grep -F '0.0.1+stable.27.e458d753922fbef5f10d036ef3a704784695aca4' \
+            target/e2e-artifacts/final-startup/test_22_open_file.OpenFileTest.test_open_file_with_the_file_finder/logs/Zed.log \
+            > target/e2e-artifacts/runtime-identity.txt
+          test -s target/e2e-artifacts/final-startup/test_22_open_file.OpenFileTest.test_open_file_with_the_file_finder/screenshot.png
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.code == 'true'
@@ -210,7 +267,7 @@ jobs:
 
       # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.
       - name: Upload artifacts
-        if: always() && steps.changes.outputs.code == 'true'
+        if: always() && (steps.changes.outputs.code == 'true' || github.ref == 'refs/heads/fix/81-final-linux-startup')
         uses: actions/upload-artifact@v4
         with:
           name: e2e-artifacts-${{ github.event.pull_request.head.sha || github.sha }}
