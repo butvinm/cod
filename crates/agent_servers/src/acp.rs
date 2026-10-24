@@ -276,7 +276,7 @@ pub struct AcpConnection {
     agent_capabilities: acp::AgentCapabilities,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
-    child: Option<Child>,
+    child: RefCell<Option<Child>>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -688,12 +688,14 @@ impl AcpConnection {
     ) -> Result<Self> {
         let original_command = command.clone();
         let transport::StdioProcess {
-            mut child,
+            child,
             incoming,
             outgoing,
             stderr,
             debug_log,
         } = transport::spawn_stdio(&project, command, cx)?;
+        // A cancelled handshake still owns a process, before AcpConnection can own it.
+        let mut child = StartingChild(Some(child));
         let sessions = Rc::new(RefCell::new(HashMap::default()));
 
         let (release_channel, version): (Option<&str>, String) = cx.update(|cx| {
@@ -735,6 +737,9 @@ impl AcpConnection {
         }
         .boxed_local();
         let status_fut = child
+            .0
+            .as_mut()
+            .expect("startup child is present")
             .status()
             .map(|status| {
                 status.map_err(|error| anyhow!("failed to wait for agent server exit: {error}"))
@@ -927,7 +932,7 @@ impl AcpConnection {
             _dispatch_task: dispatch_task,
             _wait_task: wait_task,
             _stderr_task: stderr_task,
-            child: Some(child),
+            child: RefCell::new(child.0.take()),
         })
     }
 
@@ -963,7 +968,7 @@ impl AcpConnection {
             agent_capabilities,
             request_elicitations,
             defaults,
-            child: None,
+            child: RefCell::new(None),
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
@@ -1479,11 +1484,29 @@ fn emit_load_error_to_all_sessions(
     }
 }
 
-impl Drop for AcpConnection {
+struct StartingChild(Option<Child>);
+
+impl Drop for StartingChild {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
+        if let Some(child) = self.0.as_mut() {
             child.kill().log_err();
         }
+    }
+}
+
+impl AcpConnection {
+    /// Stops this owned transport, including all of its sessions. Session-only close
+    /// must keep using the protocol so other sessions on the connection survive.
+    pub fn shutdown(&self) {
+        if let Some(mut child) = self.child.borrow_mut().take() {
+            child.kill().log_err();
+        }
+    }
+}
+
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

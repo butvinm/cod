@@ -1,4 +1,5 @@
 pub mod active_file_name;
+pub mod cod_links;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -31,12 +32,23 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
+    COD_UNNAMED_WORKSPACE, CodShownName, is_unnamed_default, member_name_and_folders,
+    tab_display_name,
+};
+pub use multi_workspace::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
 pub use multi_workspace::{
+    CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, cod_rollup,
+    cod_workspace_status,
+};
+pub use multi_workspace::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
+pub use multi_workspace::cod_set_workspace_name;
+// Cod (#28): agent chats of a closed workspace, and the fresh chat of a new workspace.
+pub use multi_workspace::{cod_set_workspace_removed_hook, cod_take_fresh_chat};
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
     MoveProjectToNewWindow, MoveProjectUp, MultiWorkspace, MultiWorkspaceEvent, NewThread,
@@ -1729,6 +1741,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Cod (#37): the terminals of the workspace know its ID, so codctl acts on it by default.
+        if let Some(id) = workspace_id {
+            ::project::terminals::cod_set_terminal_env(
+                project.entity_id(),
+                "COD_WORKSPACE",
+                Some(i64::from(id).to_string()),
+                cx,
+            );
+        }
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             cx.subscribe(&trusted_worktrees, |_, worktrees_store, e, cx| {
                 if let TrustedWorktreesEvent::Trusted(..) = e {
@@ -5339,7 +5360,7 @@ impl Workspace {
 
         if let Ok(url) = Url::parse(url_or_path) {
             match url.scheme() {
-                "http" | "https" => cx.open_url(url_or_path),
+                "http" | "https" => self.cod_open_link(url_or_path, window, cx),
                 "file" => open_abs_path(self, PathBuf::from(url.path()), cx),
                 _ => cx.open_url(url_or_path),
             }
@@ -6082,6 +6103,58 @@ impl Workspace {
             self.center.swap(&self.active_pane, &to, cx);
             cx.notify();
         }
+    }
+
+    /// The split that holds `pane` directly, for `codctl pane resize`: its axis, `pane`'s size
+    /// along it and the split's whole size along it, from the pane tree itself. `resize_pane`
+    /// resizes within exactly this split, so a percentage of any other span (a geometric guess
+    /// from neighboring panes can take in panes of an outer split) resizes to the wrong size.
+    /// None when `pane` is the only pane or has not been laid out yet.
+    pub fn cod_containing_split(&self, pane: &Entity<Pane>) -> Option<(Axis, Pixels, Pixels)> {
+        fn parent_of<'a>(member: &'a Member, pane: &Entity<Pane>) -> Option<&'a PaneAxis> {
+            let Member::Axis(axis) = member else {
+                return None;
+            };
+            if axis
+                .members
+                .iter()
+                .any(|child| matches!(child, Member::Pane(candidate) if candidate == pane))
+            {
+                return Some(axis);
+            }
+            axis.members.iter().find_map(|child| parent_of(child, pane))
+        }
+        fn union_of_panes(
+            member: &Member,
+            workspace: &Workspace,
+            union: &mut Option<Bounds<Pixels>>,
+        ) {
+            match member {
+                Member::Pane(pane) => {
+                    if let Some(bounds) = workspace.bounding_box_for_pane(pane) {
+                        *union = Some(union.map_or(bounds, |so_far| so_far.union(&bounds)));
+                    }
+                }
+                Member::Axis(axis) => {
+                    for child in &axis.members {
+                        union_of_panes(child, workspace, union);
+                    }
+                }
+            }
+        }
+
+        let split = parent_of(&self.center.root, pane)?;
+        let pane_bounds = self.bounding_box_for_pane(pane)?;
+        let mut whole = None;
+        for child in &split.members {
+            union_of_panes(child, self, &mut whole);
+        }
+        let whole = whole?;
+        let along = |bounds: &Bounds<Pixels>| match split.axis {
+            Axis::Horizontal => bounds.size.width,
+            Axis::Vertical => bounds.size.height,
+        };
+        Some((split.axis, along(&pane_bounds), along(&whole)))
     }
 
     pub fn move_pane_to_border(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
@@ -9938,6 +10011,14 @@ impl Render for Workspace {
                         .tab_group()
                         .role(gpui::Role::Toolbar)
                         .aria_label("Title bar")
+                        .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| {
+                            window.focus_next(cx);
+                            cx.notify();
+                        }))
+                        .on_action(cx.listener(|_, _: &menu::SelectPrevious, window, cx| {
+                            window.focus_prev(cx);
+                            cx.notify();
+                        }))
                         .on_key_down(cx.listener(
                             |workspace, event: &gpui::KeyDownEvent, window, cx| {
                                 if event.keystroke.modifiers.modified() {
@@ -13211,10 +13292,27 @@ pub fn with_active_or_new_workspace(
     cx: &mut App,
     f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + 'static,
 ) {
-    match cx
+    // Cod #77 V1/C3: `cx.active_window()` is the window with keyboard focus, which the platform
+    // does not always report right away (for example right after a command palette entry closes
+    // and before focus returns to the window behind it); a headless compositor with no keyboard
+    // never reports one. Opening a new window then gave a fresh profile a second, mostly-empty
+    // window on its first command (Show Welcome after closing onboarding). The first fallback is
+    // the last Cod window the platform reported active that is still open
+    // (`multi_workspace::cod_last_focused_window`). The last resort, when no window was ever
+    // reported active, is any open `MultiWorkspace` window: the last one `cx.windows()` lists,
+    // which is slot order, not focus or creation order. Any open window is a safer target than
+    // a new one for a shared, window-agnostic action like this.
+    let multi_workspace = cx
         .active_window()
         .and_then(|w| w.downcast::<MultiWorkspace>())
-    {
+        .or_else(|| multi_workspace::cod_last_focused_window(cx))
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .rev()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        });
+    match multi_workspace {
         Some(multi_workspace) => {
             cx.defer(move |cx| {
                 multi_workspace

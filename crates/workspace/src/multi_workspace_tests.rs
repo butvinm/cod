@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::item::test::TestItem;
+use crate::multi_workspace::{cod_clear_last_focused_window, cod_set_last_focused_window};
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
@@ -1730,4 +1732,313 @@ async fn test_nearest_retained_workspace_skips_disconnected_workspace(cx: &mut T
             "a disconnected workspace should not be selected as a fallback"
         );
     });
+}
+
+/// Cod (#25 AC5): a window saved as PAY-1234, OPS-77, started again with OPS-77 shown and
+/// PAY-1234 pending, and the workspace PAY-1234 that the pending member's load creates.
+/// Returns the window, OPS-77, PAY-1234 and PAY-1234's id.
+async fn cod_pending_load_fixture(
+    cx: &mut TestAppContext,
+) -> (
+    Entity<MultiWorkspace>,
+    &mut VisualTestContext,
+    Entity<Workspace>,
+    Entity<Workspace>,
+    WorkspaceId,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/billing-api", json!({ "README.md": "" }))
+        .await;
+    fs.insert_tree("/infra", json!({ "README.md": "" })).await;
+    let project_ops = Project::test(fs.clone(), ["/infra".as_ref()], cx).await;
+    let project_pay = Project::test(fs, ["/billing-api".as_ref()], cx).await;
+    let (multi_workspace, cx) = setup_multi_workspace(&[project_ops], cx);
+    let ops =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    let pay_id = WorkspaceId::from_i64(1234);
+    let ops_id = WorkspaceId::from_i64(77);
+    ops.update(cx, |workspace, _| workspace.set_database_id(ops_id));
+    multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.cod_begin_restore(&[pay_id, ops_id]);
+        multi_workspace.cod_add_pending_workspace(pay_id, vec![PathBuf::from("/billing-api")]);
+    });
+    let pay = multi_workspace.update_in(cx, |_, window, cx| {
+        cx.new(|cx| {
+            let mut workspace = Workspace::test_new(project_pay, window, cx);
+            workspace.set_database_id(pay_id);
+            workspace
+        })
+    });
+    (multi_workspace, cx, ops, pay, pay_id)
+}
+
+#[gpui::test]
+async fn test_cod_newest_click_wins_over_a_pending_load_that_shows_its_workspace(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        // A click on the pending PAY-1234 starts its load...
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        // ...then a click on OPS-77, shown already, comes before the load creates PAY-1234.
+        multi_workspace.cod_show_member(CodMember::Live(ops.clone()), window, cx);
+        // The load creates PAY-1234 and shows it, as `OpenMode::Activate` does.
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &ops,
+            "the newest click (OPS-77) must stay shown"
+        );
+        assert_eq!(
+            multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+            vec![pay.clone(), ops.clone()],
+            "the loaded workspace must join the window at its saved place"
+        );
+    });
+
+    // A later click on the loaded PAY-1234 shows it.
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_show_member(CodMember::Live(pay.clone()), window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}
+
+#[gpui::test]
+async fn test_cod_a_pending_load_shows_its_workspace_without_a_newer_request(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &pay,
+            "the only request must show PAY-1234"
+        );
+        assert_eq!(
+            multi_workspace.workspaces().cloned().collect::<Vec<_>>(),
+            vec![pay.clone(), ops.clone()],
+            "the loaded workspace must join the window at its saved place"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_cod_tab_click_survives_a_load_shown_between_press_and_release(
+    cx: &mut TestAppContext,
+) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        // A click on the pending PAY-1234 started its load...
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        // ...the button goes down on the OPS-77 tab...
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        // ...and before it comes up the load shows PAY-1234, whose title bar now draws the tabs.
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            multi_workspace.workspace(),
+            &pay,
+            "a press alone must not show a workspace"
+        );
+        assert!(multi_workspace.cod_tab_pressed());
+    });
+
+    // The release over the OPS-77 tab of the new title bar completes the click.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_release_tab(&CodMember::Live(ops.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(shown, "the release over the pressed workspace's tab is a click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &ops);
+        assert!(!multi_workspace.cod_tab_pressed());
+    });
+}
+
+#[gpui::test]
+async fn test_cod_tab_release_elsewhere_is_no_click(cx: &mut TestAppContext) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Down on OPS-77, up on PAY-1234: no click, as in Zed.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        multi_workspace.cod_release_tab(&CodMember::Live(pay.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!shown, "a release over another tab is no click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+        assert!(!multi_workspace.cod_tab_pressed(), "the release ends the press");
+    });
+
+    // Down on OPS-77, up outside the tabs, then up over OPS-77 without a new press: no click.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Live(ops.clone()), cx);
+        multi_workspace.cod_cancel_tab_press();
+        multi_workspace.cod_release_tab(&CodMember::Live(ops.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(!shown, "a release without a press on the tab is no click");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}
+
+#[gpui::test]
+async fn test_cod_pending_tab_press_matches_its_loaded_tab(cx: &mut TestAppContext) {
+    let (multi_workspace, cx, ops, pay, pay_id) = cod_pending_load_fixture(cx).await;
+    // The button goes down on the tab of PAY-1234 while it is still pending; the release lands
+    // on the tab drawn for the loaded PAY-1234.
+    let shown = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.cod_press_tab(&CodMember::Pending(pay_id), cx);
+        multi_workspace.cod_test_begin_load(pay_id, cx);
+        multi_workspace.activate(pay.clone(), None, window, cx);
+        multi_workspace.cod_show_member(CodMember::Live(ops.clone()), window, cx);
+        multi_workspace.cod_release_tab(&CodMember::Live(pay.clone()), window, cx)
+    });
+    cx.run_until_parked();
+    assert!(shown, "a pending tab and its loaded tab are the same tab");
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(multi_workspace.workspace(), &pay);
+    });
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &mut TestAppContext) {
+    // Issue #77 C3: with two windows and no active window (nothing has keyboard focus, as in
+    // the headless test compositor that first found this), a shared action like "zed: show
+    // welcome" must reach the window that was focused most recently, not whichever `cx.windows()`
+    // happens to enumerate last.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let workspace_b = window_b
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let windows_before = cx.update(|cx| cx.windows().len());
+
+    // The test platform makes the newest window active; leave no window active so the fallbacks are what is tested.
+    if let Some(active) = cx.update(|cx| cx.active_window()) {
+        VisualTestContext::from_window(active, cx).deactivate_window();
+    }
+
+    // B was focused, then the OLDER window A. The last-resort fallback (the last window `cx.windows()` lists) picks B here, so only the last-focused record can make the action reach A.
+    cx.update(|cx| cod_set_last_focused_window(window_b, cx));
+    cx.update(|cx| cod_set_last_focused_window(window_a, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the last-focused older window A, not the fallback window B"
+    );
+
+    // Clearing B's record (as B's window releasing would) while A is the current record must not clear A's.
+    cx.update(|cx| cod_clear_last_focused_window(window_b, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "clearing a different window's record must not clear the current one"
+    );
+
+    // Once A's own record is cleared (A releasing), nothing is recorded: the action still reaches an already-open window (which one is slot order, not a promise), never a new one.
+    cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
+    let reached = cod_workspace_reached_without_active_window(cx);
+    assert!(
+        reached == workspace_a || reached == workspace_b,
+        "with no record the action falls back to an open window's workspace"
+    );
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "no new window may be opened while a Cod window is open"
+    );
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_follows_real_window_activation(
+    cx: &mut TestAppContext,
+) {
+    // Issue #77 C3, end to end through the activation observer `MultiWorkspace::new` registers: the platform reports B active and then the older A active, then focus leaves every window (as when a command palette entry closes). The action must reach A.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+
+    window_b
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    window_a
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    VisualTestContext::from_window(window_a.into(), cx).deactivate_window();
+
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the window the platform last reported active (A)"
+    );
+}
+
+/// Runs `with_active_or_new_workspace` while no window is active and returns the workspace the action reached.
+fn cod_workspace_reached_without_active_window(cx: &mut TestAppContext) -> Entity<Workspace> {
+    assert_eq!(
+        cx.update(|cx| cx.active_window()),
+        None,
+        "precondition: no window is active, so the fallbacks are what is tested"
+    );
+    // `with_active_or_new_workspace` requires a `Send` callback, so the result travels through an `Arc<Mutex<_>>`.
+    let seen: Arc<Mutex<Option<Entity<Workspace>>>> = Arc::new(Mutex::new(None));
+    cx.update(|cx| {
+        let seen = seen.clone();
+        with_active_or_new_workspace(cx, move |_workspace, _window, cx| {
+            seen.lock().unwrap().replace(cx.entity().clone());
+        });
+    });
+    cx.run_until_parked();
+    seen.lock().unwrap().take().expect("the action reached a workspace")
 }

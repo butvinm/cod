@@ -3422,12 +3422,15 @@ version = "0.1.0"
 dependencies = [
  "cef",
  "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
 ]
 
 [[package]]
 name = "cod_e2e_driver"
 version = "0.1.0"
 dependencies = [
+ "agent_ui",
  "anyhow",
  "command_palette",
  "editor",
@@ -3436,13 +3439,48 @@ dependencies = [
  "gpui",
  "libc",
  "log",
+ "markdown_preview",
+ "onboarding",
  "open_path_prompt",
  "picker",
  "project_panel",
  "serde",
  "serde_json",
  "settings",
+ "title_bar",
  "ui_prompt",
+ "web_view",
+ "workspace",
+ "workspace_overview",
+]
+
+[[package]]
+name = "codctl"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "codctl_server"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "anyhow",
+ "codctl",
+ "editor",
+ "futures 0.3.34",
+ "git_ui",
+ "git_ui_core",
+ "gpui",
+ "libc",
+ "log",
+ "project",
+ "serde_json",
+ "tempfile",
+ "web_view",
  "workspace",
 ]
 
@@ -21587,8 +21625,10 @@ name = "web_view"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2 0.6.2",
  "command_palette",
+ "db",
  "editor",
  "file_finder",
  "futures 0.3.34",
@@ -21597,6 +21637,7 @@ dependencies = [
  "gtk",
  "image",
  "log",
+ "menu",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -21604,9 +21645,16 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-web-kit",
  "paths",
+ "project",
+ "rand 0.9.4",
  "serde_json",
+ "settings",
  "smallvec",
+ "tempfile",
+ "theme",
+ "theme_settings",
  "ui",
+ "url",
  "util",
  "webkit2gtk",
  "workspace",
@@ -23185,6 +23233,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace_overview"
+version = "0.1.0"
+dependencies = [
+ "fuzzy_nucleo",
+ "gpui",
+ "picker",
+ "project",
+ "project_panel",
+ "title_bar",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "worktree"
 version = "0.1.0"
 dependencies = [
@@ -23701,7 +23764,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.23.2"
+version = "0.0.1"
 dependencies = [
  "acp_thread",
  "acp_tools",
@@ -23729,6 +23792,7 @@ dependencies = [
  "client",
  "clock",
  "cod_e2e_driver",
+ "codctl_server",
  "codestral",
  "collab_ui",
  "collections",
@@ -23869,6 +23933,7 @@ dependencies = [
  "windows 0.62.2",
  "windows_resources",
  "workspace",
+ "workspace_overview",
  "zed-reqwest",
  "zed_actions",
  "zed_credentials_provider",

@@ -1816,6 +1816,40 @@ impl ThreadView {
     /// it as a follow-up message. The queued remainder auto-processes when the
     /// command turn stops, so e.g. `/compact do X` compacts and then runs `do X`
     /// rather than discarding it.
+    /// Sends `text` the way `send` would send it from the message box while the thread is idle,
+    /// without reading or clearing the box (`codctl session send`, RC review residual): a leading
+    /// built-in command (for example `/compact`) runs bare and any text after it is queued, as
+    /// `send_command_queueing_remainder` does for typed text; anything else is sent as one
+    /// message. `/login` and `/logout` open interactive UI in the box, so here they stay text.
+    pub(crate) fn cod_send_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let native_command =
+            leading_native_command(text, self.session_capabilities.read().available_commands());
+        let Some(command_name) = native_command else {
+            let contents = vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                text.to_owned(),
+            ))];
+            self.send_content(Task::ready(Ok(Some((contents, Vec::new())))), false, window, cx);
+            return;
+        };
+        let remainder = strip_leading_command(text, &command_name);
+        if !remainder.trim().is_empty() {
+            self.add_to_queue(
+                vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(remainder))],
+                Vec::new(),
+                window,
+                cx,
+            );
+        }
+        let command_block =
+            acp_v1::ContentBlock::Text(acp_v1::TextContent::new(format!("/{command_name}")));
+        self.send_content(
+            Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+            true,
+            window,
+            cx,
+        );
+    }
+
     fn send_command_queueing_remainder(
         &mut self,
         message_editor: Entity<MessageEditor>,
@@ -1960,8 +1994,13 @@ impl ThreadView {
                 this.set_editor_is_expanded(false, cx);
             })?;
 
-            let _ = this.update(cx, |this, cx| {
-                this.list_state.scroll_to_end();
+            let _ = this.update_in(cx, |this, window, cx| {
+                // A message sent while the keyboard is on a link in a reply (for example by `codctl session send`) must not scroll that link out of view (Cod D26 QA F1): the view stays where it is, as when the user has scrolled up.
+                if this.cod_focused_reply_entry(window, cx).is_some() {
+                    this.list_state.pause_following_tail();
+                } else {
+                    this.list_state.scroll_to_end();
+                }
                 cx.notify();
             });
 
@@ -7328,6 +7367,231 @@ impl ThreadView {
     ) {
         let page_height = self.list_state.viewport_bounds().size.height;
         self.list_state.scroll_by(page_height * 0.9);
+        cx.notify();
+    }
+
+    /// The markdown of the newest agent reply in the transcript (Cod #28).
+    pub fn cod_last_reply_markdown(&self, cx: &App) -> Option<Entity<Markdown>> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                AgentThreadEntry::AssistantMessage(message) => {
+                    message.chunks.iter().rev().find_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            block.markdowns().last().cloned()
+                        }
+                        AssistantMessageChunk::Thought { .. } => None,
+                    })
+                }
+                _ => None,
+            })
+    }
+
+    /// Moves the keyboard focus into the newest agent reply, so Tab and Shift-Tab reach its links (Cod #28).
+    /// Without a reply the action goes on to the parents.
+    fn focus_last_reply(
+        &mut self,
+        _: &FocusLastReply,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(markdown) = self.cod_last_reply_markdown(cx) else {
+            cx.propagate();
+            return;
+        };
+        self.list_state.scroll_to_end();
+        markdown.update(cx, |markdown, cx| markdown.cod_clear_link_focus(cx));
+        window.focus(&markdown.read(cx).focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Every agent reply's markdown blocks, in reading order (RC review B7/C4): unlike
+    /// `cod_last_reply_markdown`, which only enters the newest reply, this is every block of
+    /// every reply, so Tab and Shift-Tab can keep moving once they run out of links in one
+    /// block, instead of stopping there. Each block comes with the index of its thread entry,
+    /// which is also its item in `list_state`.
+    fn cod_all_reply_markdowns(&self, cx: &App) -> Vec<(usize, Entity<Markdown>)> {
+        self.thread
+            .read(cx)
+            .entries()
+            .iter()
+            .enumerate()
+            .flat_map(|(entry_ix, entry)| match entry {
+                AgentThreadEntry::AssistantMessage(message) => message
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message { block, .. } => {
+                            block.markdowns().cloned().collect::<Vec<_>>()
+                        }
+                        AssistantMessageChunk::Thought { .. } => Vec::new(),
+                    })
+                    .map(|markdown| (entry_ix, markdown))
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// The thread entry (also its `list_state` item) of the reply block that has the keyboard focus, if any (Cod D26 QA F1).
+    fn cod_focused_reply_entry(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.cod_all_reply_markdowns(cx)
+            .into_iter()
+            .find(|(_, markdown)| markdown.read(cx).focus_handle(cx).is_focused(window))
+            .map(|(entry_ix, _)| entry_ix)
+    }
+
+    /// Whether the reply that has the keyboard focus reaches into the visible part of the chat, None without a focused reply (Cod D26 QA F1, for the end-to-end driver).
+    pub fn cod_focused_reply_visible(&self, window: &Window, cx: &App) -> Option<bool> {
+        let entry_ix = self.cod_focused_reply_entry(window, cx)?;
+        let viewport = self.list_state.viewport_bounds();
+        Some(
+            self.list_state
+                .bounds_for_item(entry_ix)
+                .is_some_and(|bounds| bounds.intersects(&viewport)),
+        )
+    }
+
+    /// Whether moving further in this direction within `markdown`'s own links would do nothing:
+    /// either it has no links at all, or the link that already has the keyboard focus is the
+    /// last one (moving forward) or the first one (moving backward) (RC review B7/C4).
+    /// `Markdown::move_link_focus` does not report this itself: at either end it keeps the focus
+    /// right where it is instead of saying there is nowhere left to go, so plain Tab/Shift-Tab
+    /// alone never leaves a block that has at least one link. The handler below uses this to
+    /// step in before that happens.
+    ///
+    /// Compares the focused link's position (`Markdown::focused_link_index`), not its
+    /// destination (RC review D26 new defect #5): a block whose links are `[u, v, u]` has the
+    /// same destination at both ends, so comparing destinations mistook the first `u` for the
+    /// last one and left the block one Tab too early, before ever reaching `v`.
+    fn cod_markdown_link_navigation_exhausted(
+        markdown: &Entity<Markdown>,
+        forward: bool,
+        cx: &App,
+    ) -> bool {
+        let markdown = markdown.read(cx);
+        Self::cod_link_navigation_at_edge(
+            markdown.cod_link_bounds().len(),
+            markdown.focused_link_index(),
+            forward,
+        )
+    }
+
+    /// The boundary math `cod_markdown_link_navigation_exhausted` uses, pulled out so it can be
+    /// tested directly (RC review D26 new defect #5) without a painted `Markdown`: whether the
+    /// link at `focused_index` (by position, out of `link_count` links) is the last one moving
+    /// forward or the first one moving backward. No links, or no link focused, both count as
+    /// exhausted-moving-forward's opposite cases already handled by the caller: no links is
+    /// exhausted either way; no focused link is never exhausted (there is always somewhere to
+    /// go: the first or last link).
+    fn cod_link_navigation_at_edge(
+        link_count: usize,
+        focused_index: Option<usize>,
+        forward: bool,
+    ) -> bool {
+        if link_count == 0 {
+            return true;
+        }
+        match focused_index {
+            Some(index) => {
+                if forward {
+                    index + 1 >= link_count
+                } else {
+                    index == 0
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Moves the keyboard focus to the next (or previous) reply block in reading order, so
+    /// Tab/Shift-Tab keep moving once the focused block has nowhere left to go in that direction
+    /// (RC review B7/C4), instead of stopping there for the rest of the transcript. Runs in the
+    /// capture phase, before `markdown::FocusNextLink`/`FocusPreviousLink`'s own bubble-phase
+    /// handler on the focused block would otherwise keep re-selecting that block's own last (or
+    /// first) link; stopping the action here (`cx.stop_propagation`) skips that bubble phase
+    /// entirely for this key press. A block reached this way starts with no link of its own
+    /// focused, so the next Tab/Shift-Tab lands on its first (or last) link the same way entering
+    /// a reply already does. Does nothing (letting the action proceed as before) without a
+    /// currently focused block, while that block still has somewhere to go on its own, or at
+    /// either end of the transcript.
+    fn cod_focus_adjacent_reply_markdown(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let markdowns = self.cod_all_reply_markdowns(cx);
+        let Some(current_index) = markdowns
+            .iter()
+            .position(|(_, markdown)| markdown.read(cx).focus_handle(cx).is_focused(window))
+        else {
+            return;
+        };
+        if !Self::cod_markdown_link_navigation_exhausted(&markdowns[current_index].1, forward, cx)
+        {
+            return;
+        }
+        let next_index = if forward {
+            current_index.checked_add(1)
+        } else {
+            current_index.checked_sub(1)
+        };
+        let Some((entry_ix, markdown)) = next_index.and_then(|index| markdowns.get(index)) else {
+            return;
+        };
+        // A reply outside the visible part of the list cannot keep the keyboard focus: the
+        // executed beta found links in older replies unreachable. Laid out is not enough, since
+        // the list also lays out items in its off-screen overdraw, and a focus moved there is
+        // lost by the next frame. While the list follows its tail, every layout also puts the
+        // scroll position back at the end, so tail-following pauses (as when the user scrolls
+        // up) and a reply that does not reach into the viewport is shown from its top.
+        self.list_state.pause_following_tail();
+        let viewport = self.list_state.viewport_bounds();
+        let visible = self
+            .list_state
+            .bounds_for_item(*entry_ix)
+            .is_some_and(|bounds| bounds.intersects(&viewport));
+        if !visible {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: *entry_ix,
+                offset_in_item: px(0.),
+            });
+        }
+        markdown.update(cx, |markdown, cx| markdown.cod_clear_link_focus(cx));
+        window.focus(&markdown.read(cx).focus_handle(cx), cx);
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn cod_capture_focus_next_link(
+        &mut self,
+        _: &markdown::FocusNextLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cod_focus_adjacent_reply_markdown(true, window, cx);
+    }
+
+    fn cod_capture_focus_previous_link(
+        &mut self,
+        _: &markdown::FocusPreviousLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cod_focus_adjacent_reply_markdown(false, window, cx);
+    }
+
+    fn focus_message_editor(
+        &mut self,
+        _: &FocusMessageEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.message_editor.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -12749,6 +13013,10 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::open_add_context_menu))
             .on_action(cx.listener(Self::scroll_output_page_up))
             .on_action(cx.listener(Self::scroll_output_page_down))
+            .on_action(cx.listener(Self::focus_last_reply))
+            .capture_action(cx.listener(Self::cod_capture_focus_next_link))
+            .capture_action(cx.listener(Self::cod_capture_focus_previous_link))
+            .on_action(cx.listener(Self::focus_message_editor))
             .on_action(cx.listener(Self::scroll_output_line_up))
             .on_action(cx.listener(Self::scroll_output_line_down))
             .on_action(cx.listener(Self::scroll_output_to_top))
@@ -13089,7 +13357,7 @@ pub(crate) fn open_link(
                 }
             }
             MentionUri::Fetch { url } => {
-                cx.open_url(url.as_str());
+                workspace.cod_open_link(url.as_str(), window, cx);
             }
             MentionUri::Diagnostics { .. } => {}
             MentionUri::TerminalSelection { .. } => {}
@@ -13259,6 +13527,69 @@ mod tests {
         // Unknown command, or not a slash command at all.
         assert_eq!(leading_native_command("/unknown foo", &commands), None);
         assert_eq!(leading_native_command("just a message", &commands), None);
+    }
+
+    #[test]
+    fn test_cod_link_navigation_at_edge_uses_position_not_destination() {
+        // RC review D26 new defect #5: a block whose links are destinations [u, v, u] (the
+        // first and last share a destination) used to compare the focused link's destination
+        // against the boundary link's destination. That check could not tell the first `u`
+        // (index 0) apart from the last `u` (index 2), so it treated index 0 as already
+        // exhausted moving forward and left the block one Tab too early, before Tab ever
+        // reached `v` (index 1) in between.
+        //
+        // The position-based replacement, tested here directly, only calls index 2 exhausted
+        // moving forward (and only index 0 exhausted moving backward), so `v` is always reached
+        // first.
+        let link_count = 3;
+
+        // Moving forward from the first link (index 0): not exhausted, `v` is still ahead, even
+        // though index 0's destination equals index 2's.
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(0),
+            true
+        ));
+        // Moving forward from the middle link (index 1, `v`): not exhausted either.
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(1),
+            true
+        ));
+        // Only the real last link (index 2) is exhausted moving forward.
+        assert!(ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(2),
+            true
+        ));
+
+        // Symmetric moving backward: only the real first link (index 0) is exhausted.
+        assert!(ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(0),
+            false
+        ));
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(1),
+            false
+        ));
+        assert!(!ThreadView::cod_link_navigation_at_edge(
+            link_count,
+            Some(2),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_cod_link_navigation_at_edge_handles_no_links_or_no_focus() {
+        // No links at all: nowhere to go, in either direction.
+        assert!(ThreadView::cod_link_navigation_at_edge(0, None, true));
+        assert!(ThreadView::cod_link_navigation_at_edge(0, None, false));
+        // Links exist but none is focused yet: never exhausted (there is always a first/last
+        // link to move to).
+        assert!(!ThreadView::cod_link_navigation_at_edge(3, None, true));
+        assert!(!ThreadView::cod_link_navigation_at_edge(3, None, false));
     }
 
     #[test]

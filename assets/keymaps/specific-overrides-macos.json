@@ -51,4 +51,12 @@
       "cmd-l": "pane::SplitRight",
     },
   },
+  {
+    // Cod (#26): Left and Right jump between the workspace rows of the overview.
+    "context": "WorkspaceOverview > Picker > Editor",
+    "bindings": {
+      "left": "workspace_overview::SelectPreviousWorkspace",
+      "right": "workspace_overview::SelectNextWorkspace",
+    },
+  },
 ]

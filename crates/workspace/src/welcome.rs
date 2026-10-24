@@ -33,7 +33,7 @@ pub struct OpenRecentProject {
 actions!(
     zed,
     [
-        /// Show the Zed welcome screen
+        /// Show the Cod welcome screen
         ShowWelcome
     ]
 );
@@ -258,6 +258,17 @@ pub struct WelcomePage {
 }
 
 impl WelcomePage {
+    /// The greeting this page draws, read only (issue #77 AC6, see
+    /// `cod_e2e_driver::cod_welcome_state`): the driver has no other way to read it, and the
+    /// first-use report found it still says "Zed" even on a fresh Cod profile.
+    pub fn cod_welcome_label(&self) -> &'static str {
+        if self.fallback_to_recent_projects {
+            "Welcome back to Cod"
+        } else {
+            "Welcome to Cod"
+        }
+    }
+
     pub fn new(
         workspace: WeakEntity<Workspace>,
         fallback_to_recent_projects: bool,
@@ -460,11 +471,7 @@ impl Render for WelcomePage {
                 .into_any_element()
         };
 
-        let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Zed"
-        } else {
-            "Welcome to Zed"
-        };
+        let welcome_label = self.cod_welcome_label();
 
         h_flex()
             .key_context("Welcome")
@@ -497,7 +504,8 @@ impl Render for WelcomePage {
                             )
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("The editor for what's next")
+                                    // #77 F5: Cod's own subtitle, not Zed's "The editor for what's next".
+                                    Label::new("Workspaces for agent-driven development")
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),

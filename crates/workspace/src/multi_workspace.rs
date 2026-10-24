@@ -25,15 +25,30 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+mod cod_names;
+pub use cod_names::{
+    COD_UNNAMED_WORKSPACE, CodShownName, is_unnamed_default, member_name_and_folders,
+    tab_display_name,
+};
+mod cod_status;
+pub use cod_status::{
+    CodEntry, CodEntryKind, CodEntryOpen, CodStatus, CodStatusStore, cod_rollup,
+    cod_workspace_status,
+};
 mod cod_workspaces;
 pub use cod_workspaces::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
-    RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
+    RenameWorkspaceModal, cod_last_focused_window, cod_workspace_name, cod_workspace_name_by_id,
 };
+#[cfg(test)]
+pub(crate) use cod_workspaces::{cod_clear_last_focused_window, cod_set_last_focused_window};
 pub use cod_workspaces::{
     CodRemoteMemberOpen, cod_pending_remote_member, cod_set_remote_member_opener,
 };
 pub(crate) use cod_workspaces::init_workspace_names;
+pub use cod_workspaces::cod_set_workspace_name;
+// Cod (#28): agent chats of a closed workspace, and the fresh chat of a new workspace.
+pub use cod_workspaces::{cod_set_workspace_removed_hook, cod_take_fresh_chat};
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
@@ -358,6 +373,14 @@ pub struct MultiWorkspace {
     cod_pending_remote: std::collections::HashMap<WorkspaceId, RemoteConnectionOptions>,
     /// Cod (#24): true while a pending member loads; other activation requests wait for it.
     cod_materializing: bool,
+    /// Cod (#25 AC5): the pending member loading now and the stamp of the request that asked
+    /// for it, until the load shows (or only adds) the workspace it creates. See
+    /// `cod_join_loading_member`.
+    cod_loading: Option<(WorkspaceId, u64)>,
+    /// Cod (#25 AC5): the workspace tab the left button is down on, shared by the title bars of
+    /// all members so its release still counts after the shown workspace changed. See
+    /// `cod_press_tab`.
+    cod_pressed_tab: Option<cod_workspaces::CodTabPress>,
     /// Cod (#24): this window's key in the Cod window registry. A restored window takes the
     /// key it was saved under.
     cod_window_key: String,
@@ -398,12 +421,28 @@ impl MultiWorkspace {
     }
 
     pub fn new(workspace: Entity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let release_subscription = cx.on_release(|this: &mut MultiWorkspace, _cx| {
+        // Issue #77 C3: tracks this window as the last focused Cod window whenever the platform
+        // reports it active, and clears that record when it releases, so
+        // `with_active_or_new_workspace` can reach the window a person was last actually looking
+        // at (see `cod_workspaces::cod_last_focused_window`) instead of a window enumeration
+        // order that is not focus history.
+        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+        let release_subscription = cx.on_release(move |this: &mut MultiWorkspace, cx| {
             if let Some(task) = this._serialize_task.take() {
                 task.detach();
             }
             for task in std::mem::take(&mut this.pending_removal_tasks) {
                 task.detach();
+            }
+            if let Some(window_handle) = window_handle {
+                cod_workspaces::cod_clear_last_focused_window(window_handle, cx);
+            }
+        });
+        let activation_subscription = cx.observe_window_activation(window, |_this, window, cx| {
+            if window.is_window_active()
+                && let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>()
+            {
+                cod_workspaces::cod_set_last_focused_window(window_handle, cx);
             }
         });
         let settings_subscription = cx.observe_global_in::<settings::SettingsStore>(window, {
@@ -457,6 +496,8 @@ impl MultiWorkspace {
             cod_pending: std::collections::HashMap::new(),
             cod_pending_remote: std::collections::HashMap::new(),
             cod_materializing: false,
+            cod_loading: None,
+            cod_pressed_tab: None,
             // Cod (#24): a restored window has its saved key from its restore owner; a window
             // opened for a moving project takes its reserved key after it is built
             // (`cod_set_window_key`).
@@ -467,7 +508,7 @@ impl MultiWorkspace {
             cod_group_move: None,
             cod_moving_ids: Vec::new(),
             _serialize_task: None,
-            _subscriptions: vec![release_subscription, settings_subscription],
+            _subscriptions: vec![release_subscription, settings_subscription, activation_subscription],
             previous_focus_handle: None,
         }
     }
@@ -1620,6 +1661,12 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Cod (#25 AC5): a pending member's load shows the workspace it creates, unless a newer
+        // request came in while it loaded; then the workspace only joins the window.
+        if !self.cod_join_loading_member(&workspace, window, cx) {
+            return;
+        }
+
         if self.workspace() == &workspace {
             self.focus_active_workspace(window, cx);
             return;
@@ -1710,6 +1757,10 @@ impl MultiWorkspace {
             workspace._serialize_workspace_task.take();
         });
 
+        if !keep_name {
+            // Confirmed removal must stop the panel even if other handles retain the workspace.
+            cod_workspaces::run_workspace_removed_hook(workspace, cx);
+        }
         if let Some(workspace_id) = workspace.read(cx).database_id() {
             let db = crate::persistence::WorkspaceDb::global(cx);
             // Cod (#24): a removed workspace loses its name on every removal path (palette close,
@@ -1723,6 +1774,7 @@ impl MultiWorkspace {
             let kvp = db::kvp::KeyValueStore::global(cx);
             if !keep_name {
                 cod_workspaces::forget_workspace_name(workspace_id, cx);
+                cod_status::cod_forget_workspace_status(workspace_id, cx);
             }
             self.cod_unrestored_workspace_ids
                 .retain(|id| *id != workspace_id);

@@ -1,4 +1,5 @@
 mod application_menu;
+pub mod cod_workspace_tabs;
 pub mod collab;
 mod onboarding_banner;
 mod plan_chip;
@@ -6,6 +7,8 @@ mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
+use crate::cod_workspace_tabs::{CodTabsLayout, CodTabsState, render_cod_workspace_tabs};
+use std::{cell::RefCell, rc::Rc};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
@@ -60,6 +63,11 @@ use workspace::{
 use zed_actions::OpenRemote;
 
 pub use onboarding_banner::restore_banner;
+
+/// Cod (#25, D25): the title bar holds only the window controls, the workspace tabs and "+".
+/// Zed's project name, branch picker, sign-in button and user menu stay off whatever the
+/// settings say; their code stays so that upstream merges stay small.
+const COD_SHOW_ZED_ITEMS: bool = false;
 
 const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
@@ -207,6 +215,9 @@ pub struct TitleBar {
     update_version: Entity<UpdateVersion>,
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
+    /// Cod (#25): the workspace tabs as they were last drawn.
+    cod_tabs: Rc<RefCell<CodTabsLayout>>,
+    cod_tabs_state: CodTabsState,
 }
 
 impl Render for TitleBar {
@@ -218,6 +229,11 @@ impl Render for TitleBar {
                 .and_then(|ws| ws.read(cx).multi_workspace().cloned())
             {
                 self.multi_workspace = Some(mw.clone());
+                // Cod (#25): the tabs follow the window's workspace list.
+                if let Some(multi_workspace) = mw.upgrade() {
+                    self._subscriptions
+                        .push(cx.observe(&multi_workspace, |_, _, cx| cx.notify()));
+                }
                 self.platform_titlebar.update(cx, |titlebar, _cx| {
                     titlebar.set_multi_workspace(mw);
                 });
@@ -293,13 +309,16 @@ impl Render for TitleBar {
             }
         }
 
+        let cod_tabs = self.render_cod_tabs(window, cx);
         children.push(
             h_flex()
+                .min_w_0()
                 .h_full()
                 .gap_0p5()
                 .map(|title_bar| {
-                    let mut render_project_items = title_bar_settings.show_branch_name
-                        || title_bar_settings.show_project_items;
+                    let mut render_project_items = COD_SHOW_ZED_ITEMS
+                        && (title_bar_settings.show_branch_name
+                            || title_bar_settings.show_project_items);
                     title_bar
                         .when_some(
                             self.application_menu.clone().filter(|_| !show_menus),
@@ -333,6 +352,7 @@ impl Render for TitleBar {
                                     },
                                 )
                         })
+                        .children(cod_tabs)
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .into_any_element(),
@@ -371,12 +391,13 @@ impl Render for TitleBar {
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
                 .when(
-                    user.is_none()
+                    COD_SHOW_ZED_ITEMS
+                        && user.is_none()
                         && is_signed_out_or_auth_error
                         && TitleBarSettings::get_global(cx).show_sign_in,
                     |this| this.child(self.render_sign_in_button(cx)),
                 )
-                .when(is_signing_in, |this| {
+                .when(COD_SHOW_ZED_ITEMS && is_signing_in, |this| {
                     this.child(
                         Label::new("Signing in…")
                             .size(LabelSize::Small)
@@ -390,9 +411,10 @@ impl Render for TitleBar {
                             ),
                     )
                 })
-                .when(TitleBarSettings::get_global(cx).show_user_menu, |this| {
-                    this.child(self.render_user_menu_button(cx))
-                })
+                .when(
+                    COD_SHOW_ZED_ITEMS && TitleBarSettings::get_global(cx).show_user_menu,
+                    |this| this.child(self.render_user_menu_button(cx)),
+                )
                 .into_any_element(),
         );
 
@@ -491,6 +513,12 @@ impl TitleBar {
             ));
         }
         subscriptions.push(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
+        // Cod (#25): the tabs follow the window's workspace list and the workspace statuses.
+        if let Some(multi_workspace) = multi_workspace.as_ref().and_then(|mw| mw.upgrade()) {
+            subscriptions.push(cx.observe(&multi_workspace, |_, _, cx| cx.notify()));
+        }
+        let cod_status_store = workspace::CodStatusStore::global(cx);
+        subscriptions.push(cx.observe(&cod_status_store, |_, _, cx| cx.notify()));
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(&trusted_worktrees, |_, _, _, cx| {
                 cx.notify();
@@ -521,11 +549,60 @@ impl TitleBar {
             update_version,
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
+            cod_tabs: Rc::default(),
+            cod_tabs_state: CodTabsState::default(),
         };
 
         this.observe_diagnostics(cx);
 
         this
+    }
+
+    /// Cod (#25): the workspace tabs and "+", None while the window's workspace list is not
+    /// known yet.
+    fn render_cod_tabs(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
+        Some(render_cod_workspace_tabs(
+            &multi_workspace,
+            self.cod_tabs.clone(),
+            &mut self.cod_tabs_state,
+            window,
+            cx,
+        ))
+    }
+
+    /// Cod (#25): the workspace tabs and "+" as they were last drawn (read by the end-to-end
+    /// driver).
+    pub fn cod_tabs_layout(&self) -> CodTabsLayout {
+        self.cod_tabs.borrow().clone()
+    }
+
+    /// Cod (#25): which of Zed's own title bar items the title bar renders now, by the same
+    /// conditions `render` uses (read by the end-to-end driver). "application_menu" is the
+    /// Linux and Windows menu button.
+    pub fn cod_visible_items(&self, cx: &App) -> Vec<&'static str> {
+        let settings = TitleBarSettings::get_global(cx);
+        let signed_out = self.user_store.read(cx).current_user().is_none();
+        let mut items = Vec::new();
+        if self.application_menu.is_some() {
+            items.push("application_menu");
+        }
+        if COD_SHOW_ZED_ITEMS && settings.show_project_items {
+            items.push("project_name");
+        }
+        if COD_SHOW_ZED_ITEMS
+            && settings.show_branch_name
+            && ProjectSettings::get_global(cx).git.enabled.status
+        {
+            items.push("branch_picker");
+        }
+        if COD_SHOW_ZED_ITEMS && signed_out && settings.show_sign_in {
+            items.push("sign_in");
+        }
+        if COD_SHOW_ZED_ITEMS && settings.show_user_menu {
+            items.push("user_menu");
+        }
+        items
     }
 
     fn worktree_count(&self, cx: &App) -> usize {

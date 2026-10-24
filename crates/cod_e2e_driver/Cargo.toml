@@ -14,6 +14,7 @@ path = "src/cod_e2e_driver.rs"
 doctest = false
 
 [dependencies]
+agent_ui.workspace = true
 anyhow.workspace = true
 command_palette.workspace = true
 editor.workspace = true
@@ -21,14 +22,19 @@ file_finder.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+markdown_preview.workspace = true
+onboarding.workspace = true
 open_path_prompt.workspace = true
 picker.workspace = true
 project_panel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+title_bar.workspace = true
 ui_prompt.workspace = true
+web_view.workspace = true
 workspace.workspace = true
+workspace_overview.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

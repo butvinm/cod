@@ -5,6 +5,93 @@
 
 use std::io::{self, Read, Write};
 
+/// The most bytes a reported address can carry on the wire (RC review #1): the engine truncates
+/// any longer address to this many bytes on a character boundary, so Cod's side must compare
+/// against the same truncation to recognize its own agent document after a long page loads.
+pub const MAX_URL_BYTES: usize = 8192;
+
+/// Every line an agent page's bootstrap script prints on Cod's behalf starts with this (RC
+/// review B5), so the engine can tell a bridge call apart from the page's own console output and
+/// give it a larger byte limit than ordinary diagnostics. Shared with `web_view::agent_bridge`,
+/// which defines the rest of the bridge wire format (the JSON payload after this prefix). No real
+/// page is expected to start a log line this way.
+pub const BRIDGE_PREFIX: &str = "cod:bridge:";
+
+/// How many bridge lines may queue beyond the ordinary console backlog, on each side of the
+/// helper connection. A bridge line must not be dropped just because ordinary console output
+/// filled the backlog, but a page that floods bridge-prefixed lines (only a `--js` page can) must
+/// not grow memory without bound either. A user's click sends one line, so this is far above
+/// any real page.
+pub const BRIDGE_HEADROOM: usize = 64;
+
+/// The name of the sentinel bridge call the engine sends in place of a bridge console line it
+/// cannot carry whole (RC review B5): `args` is always empty. Cod's side recognizes this name
+/// specially and closes the page instead of leaving `codctl open --html --wait` blocked forever
+/// on a value it will never receive.
+pub const BRIDGE_OVERSIZED_ACTION: &str = "__bridge_oversized__";
+
+/// The most bytes a bridge call's console line keeps (RC review B5): far more than ordinary
+/// diagnostics need, so a real agent-page submission is never silently cut into invalid JSON and
+/// lost, while still comfortably inside the protocol's own 1 MiB message budget alongside the
+/// `Console` message's own tag, page id and length-prefix overhead.
+pub const MAX_BRIDGE_BYTES: usize = 65536;
+
+/// Cuts `text` to at most `limit` bytes on a character boundary, so no message can exceed what
+/// the receiving side accepts. Shared by the engine (outgoing diagnostics) and Cod's side (RC
+/// review #1), so both agree on exactly where a long address gets cut.
+pub fn limited(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
+/// What the engine's `on_console_message` should put on the wire for one console line (RC
+/// review B5): ordinary diagnostics are cut to `console_limit` as before, but a bridge call
+/// (`BRIDGE_PREFIX`) that still fits under `MAX_BRIDGE_BYTES` goes out whole, and one that does
+/// not becomes the sentinel `BRIDGE_OVERSIZED_ACTION` call instead of silently truncated, invalid
+/// JSON. A real browser engine is not required to exercise this from Rust, so it is a plain
+/// function of its inputs and unit-tested directly.
+pub fn console_payload(text: &str, console_limit: usize) -> String {
+    if !text.starts_with(BRIDGE_PREFIX) {
+        return limited(text, console_limit);
+    }
+    if text.len() <= MAX_BRIDGE_BYTES {
+        return text.to_owned();
+    }
+    // Cod accepts a bridge call only with its document's token, which Cod's bootstrap writes as
+    // the last field of the call, so the sentinel carries the token over from the call's tail.
+    match bridge_token_at_end(text) {
+        Some(token) => format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}},\"t\":\"{token}\"}}"
+        ),
+        None => format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}"),
+    }
+}
+
+/// The token of a bridge call whose JSON ends with `,"t":"<token>"}`, as Cod's bootstrap writes
+/// it. Only base64 characters, and no more than `MAX_BRIDGE_TOKEN_BYTES` of them, count as a
+/// token: a page that forges a huge one must not make the sentinel itself too large to send.
+fn bridge_token_at_end(text: &str) -> Option<&str> {
+    let rest = text.strip_suffix("\"}")?;
+    let start = rest.rfind(",\"t\":\"")? + ",\"t\":\"".len();
+    let token = &rest[start..];
+    (!token.is_empty()
+        && token.len() <= MAX_BRIDGE_TOKEN_BYTES
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')))
+    .then_some(token)
+}
+
+/// The longest token `bridge_token_at_end` accepts. Cod's tokens are 16 random bytes in base64,
+/// 24 characters.
+const MAX_BRIDGE_TOKEN_BYTES: usize = 64;
+
 pub const KEY_RAW_DOWN: u8 = 0;
 pub const KEY_UP: u8 = 2;
 pub const KEY_CHAR: u8 = 3;
@@ -21,8 +108,33 @@ pub const EVENT_MIDDLE_BUTTON: u32 = 1 << 5;
 pub const EVENT_RIGHT_BUTTON: u32 = 1 << 6;
 pub const EVENT_COMMAND: u32 = 1 << 7;
 
+/// The `action` of `ToBrowser::Navigate`.
+pub const NAVIGATE_BACK: u8 = 0;
+pub const NAVIGATE_FORWARD: u8 = 1;
+pub const NAVIGATE_RELOAD: u8 = 2;
+
 const MAX_MESSAGE: u32 = 1 << 20;
 const MAX_FRAME_BYTES: usize = 1 << 28;
+
+/// Bytes a `Create` message spends on everything but its `url` field: the tag, `page`, `width`,
+/// `height`, `scale` and the URL's own length prefix (RC review B4).
+const CREATE_FIXED_BYTES: usize = 1 + 4 + 4 + 4 + 4 + 4;
+
+/// Whether a `Create` message carrying a URL this long would fit under the protocol's one
+/// message size limit (RC review B4): a page large enough to fail this must be refused before it
+/// is ever sent, instead of exceeding `MAX_MESSAGE` and taking down the helper's connection, and
+/// every page tab with it.
+pub fn create_message_fits(url_len: usize) -> bool {
+    CREATE_FIXED_BYTES
+        .checked_add(url_len)
+        .is_some_and(|total| total <= MAX_MESSAGE as usize)
+}
+
+/// The largest `url` a `Create` message can carry under the protocol's message size limit (RC
+/// review B4), for a clear error message that names the limit.
+pub fn max_create_url_len() -> usize {
+    MAX_MESSAGE as usize - CREATE_FIXED_BYTES
+}
 
 /// Messages from Cod to the helper.
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +202,11 @@ pub enum ToBrowser {
     Close {
         page: u32,
     },
+    /// Back, forward or reload: one of the `NAVIGATE_*` constants.
+    Navigate {
+        page: u32,
+        action: u8,
+    },
 }
 
 /// Messages from the helper to Cod.
@@ -101,7 +218,12 @@ pub enum FromBrowser {
     Title { page: u32, title: String },
     Address { page: u32, url: String },
     Loading { page: u32, loading: bool },
-    Console { page: u32, message: String },
+    /// `source` is the URL CEF attributes the line to (RC review B2 for `--js` pages): the main
+    /// document's own address for a script that runs in it, a different address (or data: URL)
+    /// for one that runs in a subframe. Cod's side uses it to tell its own bootstrap script's
+    /// bridge calls, which only ever run in the main document, from a subframe forging the same
+    /// `cod:bridge:` line.
+    Console { page: u32, message: String, source: String },
     Closed { page: u32 },
     /// BGRA pixels, `width * height * 4` bytes.
     Frame {
@@ -110,6 +232,14 @@ pub enum FromBrowser {
         height: u32,
         bgra: Vec<u8>,
     },
+    /// The main frame could not load `url`.
+    LoadFailed {
+        page: u32,
+        url: String,
+        error: String,
+    },
+    /// The page asked for a new window; the helper cancelled it and Cod routes the URL like a link.
+    PopupRequested { page: u32, url: String },
 }
 
 struct Body(Vec<u8>);
@@ -221,6 +351,15 @@ fn bad(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Drains an oversized message's bytes so the stream stays framed, then reports it as
+/// `InvalidInput`, distinct from `bad`'s `InvalidData`: a caller can tell "one bad message,
+/// still a live connection" apart from "the stream itself is corrupt" (RC review B4).
+fn skip_oversized(input: &mut impl Read, length: usize) -> io::Result<io::Error> {
+    let mut discard = vec![0u8; length];
+    input.read_exact(&mut discard)?;
+    Ok(io::Error::new(io::ErrorKind::InvalidInput, "oversized message refused"))
+}
+
 impl ToBrowser {
     pub fn write_to(&self, out: &mut impl Write) -> io::Result<()> {
         match self {
@@ -301,14 +440,21 @@ impl ToBrowser {
                 .u16(*character)
                 .u32(*modifiers),
             Self::Close { page } => Body::new(11).u32(*page),
+            Self::Navigate { page, action } => Body::new(12).u32(*page).u8(*action),
         }
         .send(out)
     }
 
     pub fn read_from(input: &mut impl Read) -> io::Result<Self> {
         let length = read_length(input)?;
-        if length == 0 || length > MAX_MESSAGE as usize {
+        if length == 0 {
             return Err(bad("bad message length"));
+        }
+        if length > MAX_MESSAGE as usize {
+            // Cod itself refuses to send a `Create` this large (RC review B4), so this is
+            // defensive: still consume the bytes so the stream stays framed, and let the caller
+            // keep every other page tab alive instead of treating the connection as corrupt.
+            return Err(skip_oversized(input, length)?);
         }
         let mut message = vec![0; length];
         input.read_exact(&mut message)?;
@@ -377,6 +523,10 @@ impl ToBrowser {
                 modifiers: fields.u32()?,
             },
             11 => Self::Close { page },
+            12 => Self::Navigate {
+                page,
+                action: fields.u8()?,
+            },
             _ => return Err(bad("unknown message")),
         })
     }
@@ -391,8 +541,14 @@ impl FromBrowser {
             Self::Title { page, title } => Body::new(4).u32(*page).string(title),
             Self::Address { page, url } => Body::new(5).u32(*page).string(url),
             Self::Loading { page, loading } => Body::new(6).u32(*page).bool(*loading),
-            Self::Console { page, message } => Body::new(7).u32(*page).string(message),
+            Self::Console { page, message, source } => {
+                Body::new(7).u32(*page).string(message).string(source)
+            }
             Self::Closed { page } => Body::new(8).u32(*page),
+            Self::LoadFailed { page, url, error } => {
+                Body::new(10).u32(*page).string(url).string(error)
+            }
+            Self::PopupRequested { page, url } => Body::new(11).u32(*page).string(url),
             Self::Frame {
                 page,
                 width,
@@ -456,8 +612,18 @@ impl FromBrowser {
             7 => Self::Console {
                 page: fields.u32()?,
                 message: fields.string()?,
+                source: fields.string()?,
             },
             8 => Self::Closed { page: fields.u32()? },
+            10 => Self::LoadFailed {
+                page: fields.u32()?,
+                url: fields.string()?,
+                error: fields.string()?,
+            },
+            11 => Self::PopupRequested {
+                page: fields.u32()?,
+                url: fields.string()?,
+            },
             _ => return Err(bad("unknown message")),
         })
     }
@@ -533,6 +699,14 @@ mod tests {
                 modifiers: 0,
             },
             ToBrowser::Close { page: 3 },
+            ToBrowser::Navigate {
+                page: 3,
+                action: NAVIGATE_BACK,
+            },
+            ToBrowser::Navigate {
+                page: 3,
+                action: NAVIGATE_RELOAD,
+            },
         ];
         for message in messages {
             let mut bytes = Vec::new();
@@ -560,6 +734,27 @@ mod tests {
         let mut input = bytes.as_slice();
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), frame);
         assert_eq!(FromBrowser::read_from(&mut input).unwrap(), title);
+    }
+
+    #[test]
+    fn load_failures_and_popups_round_trip() {
+        let messages = [
+            FromBrowser::LoadFailed {
+                page: 4,
+                url: "http://127.0.0.1:9/tracker/PAY-1234".into(),
+                error: "ERR_CONNECTION_REFUSED".into(),
+            },
+            FromBrowser::PopupRequested {
+                page: 4,
+                url: "http://127.0.0.1:9/wiki/Home".into(),
+            },
+        ];
+        for message in messages {
+            let mut bytes = Vec::new();
+            message.write_to(&mut bytes).unwrap();
+            let decoded = FromBrowser::read_from(&mut bytes.as_slice()).unwrap();
+            assert_eq!(decoded, message);
+        }
     }
 
     fn frame_header(length: u32, page: u32, width: u32, height: u32) -> Vec<u8> {
@@ -666,5 +861,69 @@ mod tests {
         write_frame(&mut bytes, 1, 2, 2, &[0; 16]).unwrap();
         bytes[0] = bytes[0].wrapping_add(1);
         assert!(FromBrowser::read_from(&mut bytes.as_slice()).is_err());
+    }
+
+    // RC review B5: a bridge call well over the old 4096-byte diagnostic cap must still cross
+    // the wire whole, not truncated into invalid JSON that `codctl open --html --wait` never
+    // answers for.
+
+    #[test]
+    fn a_bridge_call_over_the_old_console_cap_still_crosses_whole() {
+        let value = "x".repeat(20_000);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}}}}");
+        assert!(line.len() > 4096, "the fixture must exceed the old cap");
+        assert!(line.len() <= MAX_BRIDGE_BYTES, "the fixture must fit the new one");
+        assert_eq!(console_payload(&line, 4096), line);
+    }
+
+    #[test]
+    fn ordinary_console_output_still_gets_the_small_cap() {
+        let line = "x".repeat(20_000);
+        assert!(!line.starts_with(BRIDGE_PREFIX));
+        let payload = console_payload(&line, 4096);
+        assert_eq!(payload.len(), 4096);
+    }
+
+    #[test]
+    fn a_bridge_call_over_the_new_cap_becomes_the_oversized_sentinel_instead_of_garbled_json() {
+        let value = "x".repeat(200_000);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}}}}");
+        assert!(line.len() > MAX_BRIDGE_BYTES);
+        let payload = console_payload(&line, 4096);
+        let expected = format!("{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}}}}");
+        assert_eq!(payload, expected);
+    }
+
+    // RC review residual: Cod acts only on bridge calls with their document's token, so the
+    // sentinel for an oversized call must keep the call's token or the page would never close.
+    #[test]
+    fn the_oversized_sentinel_keeps_the_calls_document_token() {
+        let value = "x".repeat(200_000);
+        let line = format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{\"value\":\"{value}\"}},\"t\":\"q+8/Zz==\"}}"
+        );
+        let payload = console_payload(&line, 4096);
+        let expected = format!(
+            "{BRIDGE_PREFIX}{{\"name\":\"{BRIDGE_OVERSIZED_ACTION}\",\"args\":{{}},\"t\":\"q+8/Zz==\"}}"
+        );
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn only_base64_at_the_end_of_a_call_counts_as_its_token() {
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":"abc+/="}"#), Some("abc+/="));
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":"a\"b"}"#), None);
+        assert_eq!(bridge_token_at_end(r#"{"args":{},"t":""}"#), None);
+        assert_eq!(bridge_token_at_end(r#"{"args":{"t":"x"}}"#), None);
+    }
+
+    // RC delta review: a forged token of megabytes copied into the sentinel made the sentinel
+    // exceed the protocol's message limit, which disconnected every browser tab.
+    #[test]
+    fn a_forged_huge_token_is_not_copied_into_the_sentinel() {
+        let token = "A".repeat(2 << 20);
+        let line = format!("{BRIDGE_PREFIX}{{\"name\":\"submit\",\"args\":{{}},\"t\":\"{token}\"}}");
+        let payload = console_payload(&line, 4096);
+        assert!(payload.len() < 200);
     }
 }

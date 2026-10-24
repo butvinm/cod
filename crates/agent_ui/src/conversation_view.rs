@@ -95,7 +95,8 @@ use crate::ui::{AgentNotification, AgentNotificationEvent};
 use crate::{
     Agent, AgentDiffPane, AgentInitialContent, AgentPanel, AgentPanelEvent, AllowAlways, AllowOnce,
     AuthorizeToolCall, ClearMessageQueue, CycleFavoriteModels, CycleModeSelector,
-    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, Follow, KeepAll, NewThread,
+    CycleThinkingEffort, EditFirstQueuedMessage, ExpandMessageEditor, FocusLastReply,
+    FocusMessageEditor, Follow, KeepAll, NewThread,
     OpenAddContextMenu, OpenAgentDiff, RejectAll, RejectOnce, RemoveFirstQueuedMessage,
     ScrollOutputLineDown, ScrollOutputLineUp, ScrollOutputPageDown, ScrollOutputPageUp,
     ScrollOutputToBottom, ScrollOutputToNextMessage, ScrollOutputToPreviousMessage,
@@ -1621,12 +1622,33 @@ impl ConversationView {
         }
     }
 
+    pub(crate) fn cod_cancel_all_sessions(&self, cx: &mut App) {
+        if let Some(connected) = self.as_connected() {
+            let threads: Vec<_> = connected
+                .conversation
+                .read(cx)
+                .threads
+                .values()
+                .cloned()
+                .collect();
+            for thread in threads {
+                thread.update(cx, |thread, cx| thread.cancel(cx).detach());
+            }
+        }
+    }
+
     pub fn parent_id(&self) -> ThreadId {
         self.thread_id
     }
 
     pub fn is_loading(&self) -> bool {
         matches!(self.server_state, ServerState::Loading { .. })
+    }
+
+    /// Whether this chat's connection ended in an error instead of connecting or loading (RC
+    /// review new defect #3): a reload with no root thread to show, and none coming.
+    pub fn has_load_error(&self) -> bool {
+        matches!(self.server_state, ServerState::LoadError { .. })
     }
 
     fn handle_thread_event(
@@ -3595,7 +3617,10 @@ fn render_agent_markdown(
     let workspace = workspace.clone();
     let worktree_roots = code_span_resolver.worktree_roots(cx);
     let resolver = code_span_resolver.clone();
+    let mention_resolver = code_span_resolver.clone();
     MarkdownElement::new(markdown, style)
+        .keyboard_links()
+        .on_text_mention_link(move |text, cx| mention_resolver.try_resolve(text, cx))
         .code_block_renderer(markdown::CodeBlockRenderer::Default {
             copy_button_visibility: markdown::CopyButtonVisibility::VisibleOnHover,
             wrap_button_visibility: markdown::WrapButtonVisibility::VisibleOnHover,

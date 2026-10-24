@@ -735,6 +735,7 @@ fn main() {
         image_viewer::init(cx);
         web_view::init(cx);
         cod_e2e_driver::init(cx);
+        codctl_server::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 
@@ -745,6 +746,7 @@ fn main() {
         go_to_line::init(cx);
         file_finder::init(cx);
         tab_switcher::init(cx);
+        workspace_overview::init(cx);
         outline::init(cx);
         call_hierarchy::init(cx);
         project_symbols::init(cx);

@@ -205,7 +205,7 @@ pub fn show_onboarding_view(app_state: Arc<AppState>, cx: &mut App) -> Task<anyh
     )
 }
 
-struct Onboarding {
+pub struct Onboarding {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     user_store: Entity<UserStore>,
@@ -214,6 +214,13 @@ struct Onboarding {
 }
 
 impl Onboarding {
+    /// The page's own header greeting, read only (issue #77 F5/AC6, see
+    /// `cod_e2e_driver::cod_welcome_state`): a fresh profile shows this page before the welcome
+    /// page, and it carried its own "Welcome to Zed" text.
+    pub fn cod_header_label(&self) -> &'static str {
+        "Welcome to Cod"
+    }
+
     fn new(workspace: &Workspace, cx: &mut App) -> Entity<Self> {
         let font_family_cache = theme::FontFamilyCache::global(cx);
 
@@ -355,11 +362,16 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        // #77 F5: the header matches the welcome
+                                                        // page's own Cod text; other Zed mentions
+                                                        // further down this page (for example
+                                                        // "Zed Agent", keymap names) are left as
+                                                        // is, a remaining rough edge.
+                                                        Headline::new(self.cod_header_label())
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
+                                                        Label::new("Workspaces for agent-driven development")
                                                             .color(Color::Muted)
                                                             .size(LabelSize::Small)
                                                             .italic(),

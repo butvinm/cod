@@ -1356,6 +1356,84 @@ impl ThreadMetadataStore {
     }
 }
 
+/// Cod (#28): the chats of a Cod workspace (see `ThreadMetadataDb::cod_assign_chat`).
+impl ThreadMetadataStore {
+    /// Puts the chat with this provider session id into the workspace as its last tab, unless it
+    /// already belongs to one. It changes nothing while the thread's row is not written yet; the
+    /// agent panel calls it again each time it saves its state.
+    pub fn cod_assign_chat(
+        &self,
+        session_id: &acp::SessionId,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = self.db.clone();
+        let session_id = session_id.0.to_string();
+        cx.background_spawn(async move { db.cod_assign_chat(session_id, workspace_id).await })
+    }
+
+    /// Puts the chat with this thread id into the workspace as its last tab, unless it already
+    /// belongs to one (RC review C7). A draft never gets a provider session id, so
+    /// `cod_assign_chat` above can never claim it; without this a draft's chat belongs to no
+    /// workspace at all, so it is skipped when a workspace's chats come back after a restart and
+    /// is never swept up when the workspace closes for good.
+    pub fn cod_assign_chat_by_thread_id(
+        &self,
+        thread_id: ThreadId,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<()>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.cod_assign_chat_by_thread_id(thread_id, workspace_id).await })
+    }
+
+    /// The provider session ids of the workspace's chats, in tab order.
+    pub fn cod_workspace_sessions(
+        &self,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<Vec<acp::SessionId>>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move {
+            Ok(db
+                .cod_workspace_sessions(workspace_id)?
+                .into_iter()
+                .map(acp::SessionId::new)
+                .collect())
+        })
+    }
+
+    /// The thread ids of the workspace's parked drafts, in tab order (RC review C7
+    /// continuation): see `ThreadMetadataDb::cod_workspace_draft_thread_ids`.
+    pub fn cod_workspace_draft_thread_ids(
+        &self,
+        workspace_id: i64,
+        cx: &App,
+    ) -> Task<anyhow::Result<Vec<ThreadId>>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.cod_workspace_draft_thread_ids(workspace_id) })
+    }
+
+    /// Deletes the chats of a workspace that left its window for good.
+    pub fn cod_delete_workspace_chats(&self, workspace_id: i64, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            let thread_ids = cx
+                .background_spawn(async move { db.cod_workspace_thread_ids(workspace_id) })
+                .await
+                .log_err()
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                for thread_id in thread_ids {
+                    this.delete(thread_id, cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+    }
+}
+
 impl Global for ThreadMetadataStore {}
 
 #[derive(Clone, Debug)]
@@ -1462,10 +1540,94 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        // Cod (#28): the Cod workspace a chat belongs to and its place among that workspace's
+        // chat tabs. The chat itself stays keyed by the provider's session id.
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN cod_workspace_id INTEGER;
+            ALTER TABLE sidebar_threads ADD COLUMN cod_tab_order INTEGER;
+        ),
     ];
 }
 
 db::static_connection!(ThreadMetadataDb, []);
+
+/// Cod (#28): agent chats belong to a Cod workspace. A chat is the row of its provider session
+/// id; Cod adds the workspace id and the tab order to that row and makes no ids of its own.
+impl ThreadMetadataDb {
+    /// Puts the chat with this session id into the workspace as its last tab. A chat that
+    /// already belongs to a workspace stays where it is.
+    pub async fn cod_assign_chat(
+        &self,
+        session_id: String,
+        workspace_id: i64,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "UPDATE sidebar_threads SET cod_workspace_id = ?1, \
+                 cod_tab_order = (SELECT COALESCE(MAX(cod_tab_order), -1) + 1 \
+                     FROM sidebar_threads WHERE cod_workspace_id = ?1) \
+                 WHERE session_id = ?2 AND cod_workspace_id IS NULL",
+            )?;
+            let i = stmt.bind(&workspace_id, 1)?;
+            stmt.bind(&session_id, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    /// Puts the chat with this thread id into the workspace as its last tab (RC review C7): the
+    /// same assignment as `cod_assign_chat` above, keyed by the row's stable local id instead of
+    /// its (possibly absent) provider session id, for drafts.
+    pub async fn cod_assign_chat_by_thread_id(
+        &self,
+        thread_id: ThreadId,
+        workspace_id: i64,
+    ) -> anyhow::Result<()> {
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "UPDATE sidebar_threads SET cod_workspace_id = ?1, \
+                 cod_tab_order = (SELECT COALESCE(MAX(cod_tab_order), -1) + 1 \
+                     FROM sidebar_threads WHERE cod_workspace_id = ?1) \
+                 WHERE thread_id = ?2 AND cod_workspace_id IS NULL",
+            )?;
+            let i = stmt.bind(&workspace_id, 1)?;
+            stmt.bind(&thread_id, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    /// The provider session ids of the workspace's chats, in tab order.
+    pub fn cod_workspace_sessions(&self, workspace_id: i64) -> anyhow::Result<Vec<String>> {
+        self.select_bound::<i64, String>(
+            "SELECT session_id FROM sidebar_threads \
+             WHERE cod_workspace_id = ?1 AND session_id IS NOT NULL \
+             ORDER BY cod_tab_order ASC",
+        )?(workspace_id)
+    }
+
+    /// The rows of the workspace's chats.
+    pub fn cod_workspace_thread_ids(&self, workspace_id: i64) -> anyhow::Result<Vec<ThreadId>> {
+        self.select_bound::<i64, ThreadId>(
+            "SELECT thread_id FROM sidebar_threads WHERE cod_workspace_id = ?1",
+        )?(workspace_id)
+    }
+
+    /// The rows of the workspace's parked drafts (no provider session id yet), in tab order (RC
+    /// review C7 continuation): kept apart from `cod_workspace_sessions`, which excludes them
+    /// with `session_id IS NOT NULL`, so a draft parked in this workspace and never sent before
+    /// quitting is still enumerated, and restored with the rest of the workspace's chats, after
+    /// a restart.
+    pub fn cod_workspace_draft_thread_ids(&self, workspace_id: i64) -> anyhow::Result<Vec<ThreadId>> {
+        self.select_bound::<i64, ThreadId>(
+            "SELECT thread_id FROM sidebar_threads \
+             WHERE cod_workspace_id = ?1 AND session_id IS NULL \
+             ORDER BY cod_tab_order ASC",
+        )?(workspace_id)
+    }
+}
 
 impl ThreadMetadataDb {
     #[allow(dead_code)]
@@ -1971,6 +2133,124 @@ mod tests {
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
         assert_eq!(rows[0].title().as_deref(), Some("User Title"));
+    }
+
+    // Cod (#28): chats belong to a Cod workspace, keyed by the provider's session id.
+    #[gpui::test]
+    async fn test_cod_chats_are_kept_per_workspace_in_tab_order(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let folder = PathList::new(&[Path::new("/billing-api")]);
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let rounding = make_metadata(
+            "claude-session-rounding",
+            "fix invoice rounding",
+            now,
+            folder.clone(),
+        );
+        let migration = make_metadata(
+            "codex-session-migration",
+            "review migration",
+            now,
+            folder.clone(),
+        );
+        let postgres = make_metadata("claude-session-postgres", "upgrade postgres", now, folder);
+        let rounding_id = rounding.thread_id;
+        let migration_id = migration.thread_id;
+        for row in [rounding.clone(), migration, postgres] {
+            db.save(row).await.unwrap();
+        }
+
+        // A session without a row yet changes nothing.
+        for (session_id, workspace_id) in [
+            ("claude-session-unknown", 1),
+            ("claude-session-rounding", 1),
+            ("codex-session-migration", 1),
+            ("claude-session-postgres", 2),
+            // A chat stays in the workspace it was made in, and saving it again keeps that.
+            ("claude-session-rounding", 2),
+        ] {
+            db.cod_assign_chat(session_id.to_string(), workspace_id)
+                .await
+                .unwrap();
+        }
+        db.save(ThreadMetadata {
+            interacted_at: Some(now),
+            ..rounding
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.cod_workspace_sessions(1).unwrap(),
+            vec![
+                "claude-session-rounding".to_string(),
+                "codex-session-migration".to_string()
+            ]
+        );
+        assert_eq!(
+            db.cod_workspace_sessions(2).unwrap(),
+            vec!["claude-session-postgres".to_string()]
+        );
+        assert_eq!(db.cod_workspace_sessions(3).unwrap(), Vec::<String>::new());
+
+        let mut ids = db.cod_workspace_thread_ids(1).unwrap();
+        ids.sort_by_key(|id| id.to_key_string());
+        let mut expected = vec![rounding_id, migration_id];
+        expected.sort_by_key(|id| id.to_key_string());
+        assert_eq!(ids, expected);
+    }
+
+    // RC review C7 continuation: `cod_workspace_sessions`, the query restart enumeration used
+    // to rely on exclusively, excludes rows with no provider session id (`session_id IS NOT
+    // NULL`), so a draft parked in a workspace and never sent before quitting was skipped and
+    // never came back after a restart even though `cod_assign_chat_by_thread_id` had already
+    // assigned its row to the workspace.
+    #[gpui::test]
+    async fn test_cod_workspace_draft_thread_ids_enumerates_parked_drafts(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let folder = PathList::new(&[Path::new("/billing-api")]);
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let mut draft = make_metadata("ignored-draft-session", "", now, folder.clone());
+        draft.session_id = None;
+        let draft_id = draft.thread_id;
+        db.save(draft).await.unwrap();
+
+        let sent = make_metadata("claude-session-rounding", "fix invoice rounding", now, folder);
+        db.save(sent).await.unwrap();
+
+        db.cod_assign_chat_by_thread_id(draft_id, 1).await.unwrap();
+        db.cod_assign_chat("claude-session-rounding".to_string(), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.cod_workspace_sessions(1).unwrap(),
+            vec!["claude-session-rounding".to_string()],
+            "sanity: the sent chat is enumerated the same way as before"
+        );
+        assert_eq!(
+            db.cod_workspace_draft_thread_ids(1).unwrap(),
+            vec![draft_id],
+            "a parked draft owned by the workspace must be enumerated too, by thread id, so \
+             restart enumeration restores it along with the workspace's other chats"
+        );
+        assert_eq!(
+            db.cod_workspace_draft_thread_ids(2).unwrap(),
+            Vec::<ThreadId>::new(),
+            "a workspace that owns no draft reports none"
+        );
     }
 
     #[gpui::test]

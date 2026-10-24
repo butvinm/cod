@@ -11,13 +11,15 @@ use std::{
 use db::kvp::KeyValueStore;
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Global, Task, TaskExt as _, WeakEntity, Window, actions,
+    Global, PromptLevel, Task, TaskExt as _, WeakEntity, Window, actions,
 };
 use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt as _;
 
-use super::{HeldWorkspace, MultiWorkspace};
+use super::{
+    COD_UNNAMED_WORKSPACE, HeldWorkspace, MultiWorkspace, cod_status::cod_has_running_session,
+};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
 /// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
@@ -37,6 +39,43 @@ pub type CodRemoteMemberOpen = std::sync::Arc<
 struct CodRemoteMemberOpener(CodRemoteMemberOpen);
 
 impl Global for CodRemoteMemberOpener {}
+
+/// Issue #77 C3: the last Cod window the platform reported active, tracked by an activation
+/// observer each `MultiWorkspace` window registers at creation (`MultiWorkspace::new`) and
+/// cleared when that window releases. Read through `cod_last_focused_window`, which also checks
+/// the window is still open, so a shared action (for example "zed: show welcome") can reach the
+/// window a person was last actually looking at instead of enumerating `cx.windows()` in
+/// creation order, which is not focus history and is not reliable the moment after a command
+/// palette entry closes and before the platform reports any window active again.
+#[derive(Default)]
+struct CodLastFocusedWindow(Option<gpui::WindowHandle<MultiWorkspace>>);
+
+impl Global for CodLastFocusedWindow {}
+
+/// Records `window` as the last focused Cod window; called only when the platform actually
+/// reports it active, from the activation observer `MultiWorkspace::new` registers.
+pub fn cod_set_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    cx.set_global(CodLastFocusedWindow(Some(window)));
+}
+
+/// Clears the record when `window` releases, so a closed window is never handed back.
+pub fn cod_clear_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    if let Some(last) = cx.try_global::<CodLastFocusedWindow>()
+        && last.0 == Some(window)
+    {
+        cx.set_global(CodLastFocusedWindow(None));
+    }
+}
+
+/// The last focused Cod window, if the platform has reported one active and it is still open
+/// (not yet closed or in the middle of closing).
+pub fn cod_last_focused_window(cx: &App) -> Option<gpui::WindowHandle<MultiWorkspace>> {
+    let window = cx.try_global::<CodLastFocusedWindow>()?.0?;
+    cx.windows()
+        .into_iter()
+        .any(|open| open == window.into())
+        .then_some(window)
+}
 
 /// Cod (#24): registers how a pending remote member is opened (see `CodRemoteMemberOpen`).
 pub fn cod_set_remote_member_opener(open: CodRemoteMemberOpen, cx: &mut App) {
@@ -103,6 +142,35 @@ actions!(
 pub enum CodMember {
     Live(Entity<Workspace>),
     Pending(WorkspaceId),
+}
+
+/// Cod (#25 AC5): the workspace tab the left button went down on, kept by the window's
+/// `MultiWorkspace` rather than by the tab element. Each workspace draws its own title bar, so
+/// when a pending workspace finishes loading between the press and the release, the release
+/// lands on a tab of another title bar. The tab is known by its workspace id and by its
+/// workspace entity, so a pending member's press matches the same member once it is loaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CodTabPress {
+    id: Option<WorkspaceId>,
+    entity: Option<gpui::EntityId>,
+}
+
+impl CodTabPress {
+    fn of(member: &CodMember, cx: &App) -> Self {
+        Self {
+            id: MultiWorkspace::cod_member_id(member, cx),
+            entity: match member {
+                CodMember::Live(workspace) => Some(workspace.entity_id()),
+                CodMember::Pending(_) => None,
+            },
+        }
+    }
+
+    /// Whether `other` stands for the same workspace tab.
+    fn same_tab(&self, other: &Self) -> bool {
+        (self.id.is_some() && self.id == other.id)
+            || (self.entity.is_some() && self.entity == other.entity)
+    }
 }
 
 /// The key-value scope that holds the workspace names, keyed by workspace id.
@@ -219,6 +287,82 @@ pub(super) async fn delete_stored_workspace_name(
     kvp.scoped(NAMES_SCOPE).delete(name_key(id)).await
 }
 
+/// Cod (#28) hook: what else goes when a workspace leaves its window for good, next to its name.
+/// The agent panel registers the deletion of the workspace's chats (agent_ui crate).
+struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(&Entity<Workspace>, &mut App)>);
+
+impl Global for CodWorkspaceRemovedHook {}
+
+/// Cod (#28): registers what runs when a workspace leaves its window for good.
+pub fn cod_set_workspace_removed_hook(
+    hook: impl Fn(&Entity<Workspace>, &mut App) + 'static,
+    cx: &mut App,
+) {
+    cx.set_global(CodWorkspaceRemovedHook(std::rc::Rc::new(hook)));
+}
+
+/// Cod (#28) hook: the workspaces made by "workspace: new workspace" whose agent panel has not
+/// started their fresh chat yet. The agent panel takes the flag when it loads.
+#[derive(Default)]
+struct CodFreshChatWorkspaces(RefCell<std::collections::HashSet<gpui::EntityId>>);
+
+impl Global for CodFreshChatWorkspaces {}
+
+/// Cod (#28): whether the workspace with this entity id was made by "workspace: new workspace"
+/// and still waits for its fresh chat. The flag is cleared, so only the first caller starts it.
+pub fn cod_take_fresh_chat(workspace: gpui::EntityId, cx: &mut App) -> bool {
+    cx.default_global::<CodFreshChatWorkspaces>()
+        .0
+        .borrow_mut()
+        .remove(&workspace)
+}
+
+/// Cod (#28): runs the registered hook for a workspace that left its window for good.
+pub(super) fn run_workspace_removed_hook(workspace: &Entity<Workspace>, cx: &mut App) {
+    if let Some(hook) = cx
+        .try_global::<CodWorkspaceRemovedHook>()
+        .map(|hook| hook.0.clone())
+    {
+        (*hook)(workspace, cx);
+    }
+}
+
+/// Cod (#25 review): each window's most recent explicit "show this workspace" request, as a
+/// stamp that grows by one on every such request, whether it names a pending member to load or
+/// a loaded one to switch to, and whether or not it changes which workspace ends up shown.
+///
+/// `MultiWorkspace::active_workspace_id` alone cannot tell a fresh request apart from no request
+/// at all: a click on the workspace that is already active leaves it unchanged (`activate` returns
+/// early without touching it). A pending member's background load must still be able to tell
+/// whether some request, for it or any other member, arrived while it ran, so that request's
+/// completion (also when it wakes from waiting its turn behind another member's load, and however
+/// it was asked for: a tab click, a path opened from the CLI, or a saved window being restored)
+/// can tell a stale load from the newest one and never override the newest request's result
+/// (`cod_show_member`, `cod_activate_pending`; #25 AC5,
+/// `test_ac5_newest_click_wins_over_a_still_loading_tabs_completion`). Keyed by the window's
+/// `MultiWorkspace` entity, since each window's requests are independent.
+#[derive(Default)]
+struct CodActivationIntents(RefCell<HashMap<gpui::EntityId, u64>>);
+
+impl Global for CodActivationIntents {}
+
+impl CodActivationIntents {
+    /// Records a fresh activation request for `window` and returns its stamp.
+    fn bump(cx: &mut App, window: gpui::EntityId) -> u64 {
+        let mut map = cx.default_global::<CodActivationIntents>().0.borrow_mut();
+        let next = map.get(&window).copied().unwrap_or(0) + 1;
+        map.insert(window, next);
+        next
+    }
+
+    /// The stamp of the most recent activation request for `window`, 0 when none was made yet.
+    fn current(cx: &App, window: gpui::EntityId) -> u64 {
+        cx.try_global::<CodActivationIntents>()
+            .map(|intents| intents.0.borrow().get(&window).copied().unwrap_or(0))
+            .unwrap_or(0)
+    }
+}
+
 /// The field of "workspace: rename workspace": it proposes the current name, enter saves the
 /// typed text, escape keeps the old name.
 pub struct RenameWorkspaceModal {
@@ -298,12 +442,24 @@ impl MultiWorkspace {
             return;
         };
         let app_state = self.workspace().read(cx).app_state().clone();
+        // Cod (#28) hook: the new workspace opens with a fresh agent chat (see
+        // `cod_take_fresh_chat`). The flag is set as the workspace is made, before its agent
+        // panel loads.
+        let mark_fresh_chat: Box<
+            dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send,
+        > = Box::new(|_workspace, _window, cx| {
+            let id = cx.entity_id();
+            cx.default_global::<CodFreshChatWorkspaces>()
+                .0
+                .borrow_mut()
+                .insert(id);
+        });
         Workspace::new_local(
             Vec::new(),
             app_state,
             Some(window_handle),
             None,
-            None,
+            Some(mark_fresh_chat),
             OpenMode::Activate,
             cx,
         )
@@ -551,11 +707,70 @@ impl MultiWorkspace {
         self.cod_pending.insert(id, paths);
     }
 
+    /// Cod (#25 AC5): called by `activate`; false when `activate` must not show `workspace`.
+    ///
+    /// Every load path of a pending member shows the workspace it creates as soon as it creates
+    /// it (`OpenMode::Activate`, `open_workspace_by_id`, the remote opener), long before the
+    /// load's completion checks the request stamp. When that activation is the loading member's
+    /// (only its first one is checked: nothing else holds the new workspace before it), the
+    /// workspace joins the window at its saved place, not at the end, and is shown only when no
+    /// newer request (a click on another tab, for example) came in while it loaded. Any other
+    /// activation is left alone.
+    pub(super) fn cod_join_loading_member(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((id, stamp)) = self.cod_loading else {
+            return true;
+        };
+        if workspace.read(cx).database_id() != Some(id) {
+            return true;
+        }
+        self.cod_loading = None;
+        // Read while the member is still listed as pending, at its saved place.
+        let order = self.cod_saved_workspace_ids(cx);
+        let key = workspace.read(cx).project_group_key(cx);
+        let index = self.hold(workspace.clone(), window, cx);
+        self.pin(index, key, cx);
+        self.cod_order_workspaces(&order, cx);
+        CodActivationIntents::current(cx, cx.entity_id()) == stamp
+    }
+
+    /// Cod (#25 AC5): marks the member `id` as loading for a fresh request, as
+    /// `cod_activate_pending` does, without loading anything; returns the request's stamp.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cod_test_begin_load(&mut self, id: WorkspaceId, cx: &mut Context<Self>) -> u64 {
+        let window_entity = cx.entity_id();
+        let stamp = CodActivationIntents::bump(cx, window_entity);
+        self.cod_loading = Some((id, stamp));
+        stamp
+    }
+
     /// Loads a pending member in the foreground and shows it, at its place in the window
     /// order and with its id. On failure it stays pending, so a later switch tries again.
     pub(super) fn cod_activate_pending(
         &mut self,
         id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        // Cod (#25 review): this call is itself a fresh "show this workspace" request, however
+        // it was asked for (a tab click through `cod_show_member`, a path opened from the CLI):
+        // bump the window's activation intent and keep this request's own stamp, so its load
+        // can tell whether a still newer request (for this id again, or any other) arrived first.
+        let window_entity = cx.entity_id();
+        let activation_intent = CodActivationIntents::bump(cx, window_entity);
+        self.cod_load_pending(id, activation_intent, window, cx)
+    }
+
+    /// Loads the pending member `id` for the request stamped `activation_intent`, and shows it
+    /// unless a newer request came in meanwhile (see `cod_activate_pending`).
+    fn cod_load_pending(
+        &mut self,
+        id: WorkspaceId,
+        activation_intent: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
@@ -567,8 +782,11 @@ impl MultiWorkspace {
             return cx.spawn_in(window, async move |this, cx| {
                 done_rx.await.ok();
                 this.update_in(cx, |this, window, cx| {
+                    // Cod (#25 AC5): a queued request keeps its own stamp when its turn comes.
+                    // It is no newer than the requests that came in while it waited, so a click
+                    // on another tab meanwhile still wins; the member loads without being shown.
                     if this.cod_pending.contains_key(&id) {
-                        return this.cod_activate_pending(id, window, cx);
+                        return this.cod_load_pending(id, activation_intent, window, cx);
                     }
                     let loaded = this
                         .held
@@ -577,7 +795,10 @@ impl MultiWorkspace {
                         .find(|workspace| workspace.read(cx).database_id() == Some(id));
                     match loaded {
                         Some(workspace) => {
-                            if *this.workspace() != workspace {
+                            let window_entity = cx.entity_id();
+                            if CodActivationIntents::current(cx, window_entity) == activation_intent
+                                && *this.workspace() != workspace
+                            {
                                 this.activate(workspace, None, window, cx);
                             }
                             Task::ready(Ok(()))
@@ -598,6 +819,7 @@ impl MultiWorkspace {
         let order: Vec<WorkspaceId> = self.cod_saved_workspace_ids(cx);
         let app_state = self.workspace().read(cx).app_state().clone();
         self.cod_materializing = true;
+        self.cod_loading = Some((id, activation_intent));
         cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = if let Some(connection) = remote {
                 // A remote member loads its exact saved row over its saved connection.
@@ -638,6 +860,7 @@ impl MultiWorkspace {
             };
             this.update_in(cx, |this, window, cx| {
                 this.cod_materializing = false;
+                this.cod_loading = None;
                 let loaded = this
                     .held
                     .iter()
@@ -650,14 +873,22 @@ impl MultiWorkspace {
                         this.cod_unrestored_workspace_ids
                             .retain(|other| *other != id);
                         this.cod_order_workspaces(&order, cx);
-                        if *this.workspace() != workspace {
-                            this.activate(workspace, None, window, cx);
+                        // Cod (#25 review): keep the newest user intent. A request for another
+                        // workspace (one already loaded, so `activate`'s early return left
+                        // `active_workspace_id` unchanged even if it names the one already shown,
+                        // or another pending one now loading in its place) may have run while
+                        // this one was loading; stay there instead of switching back to the one
+                        // that just finished loading.
+                        let window_entity = cx.entity_id();
+                        if CodActivationIntents::current(cx, window_entity) == activation_intent {
+                            if *this.workspace() != workspace {
+                                this.activate(workspace.clone(), None, window, cx);
+                            }
+                            // The items are loaded now: the shown workspace's active item takes
+                            // the keys, unless the user opened a modal in it meanwhile. Focusing
+                            // only the pane is not enough while the platform window is inactive.
+                            workspace.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                         }
-                        // The items are loaded now: the shown workspace's active item takes the
-                        // keys, unless the user opened a modal in it meanwhile. Focusing only the
-                        // pane is not enough while the platform window is inactive.
-                        let shown = this.workspace().clone();
-                        shown.update(cx, |shown, cx| shown.cod_focus_restored(window, cx));
                     }
                     (Ok(()), None) => {
                         log::error!("Workspace {id:?} loaded but is not in its window; it stays pending");
@@ -690,17 +921,79 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let doomed = self.workspace().clone();
+        self.cod_close_live_workspace(doomed, window, cx);
+    }
+
+    /// Issue #77 F3: the same close (consent to save, pick a replacement, detach) as
+    /// `close_workspace`, but for a given workspace rather than always the active one, so a
+    /// tab's own close button can close a workspace that is not shown. A pending (not loaded)
+    /// member has no live `Workspace` to close this way; its tab has no close button instead
+    /// (see `cod_workspace_tabs.rs`), so this is never called for one.
+    pub fn cod_close_live_workspace(
+        &mut self,
+        doomed: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
             return;
         };
-        let doomed = self.workspace().clone();
         let app_state = doomed.read(cx).app_state().clone();
+        let shown_before = self.workspace().clone();
         cx.spawn_in(window, async move |this, cx| {
+            // #77 C2: closing a workspace detaches it, which runs
+            // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs, "the workspace's
+            // agent chats go with it") and permanently deletes its chat history. That would
+            // silently stop an agent session that is still generating or waiting for the user's
+            // permission, with no way back. Ask first, the same prompt style as the
+            // unsaved-buffer one just below. Issue #81: decided from the session entries, not
+            // the rolled-up status, where any entry in Error (a failed page, an earlier failed
+            // chat) outranks Working. A workspace whose sessions are all done, failed or idle
+            // does not prompt. This is the one shared path CloseWorkspace and a tab's own close
+            // button both use; codctl's own `workspace close` (codctl_server.rs) does not go
+            // through it: without --force it only asks about unsaved files.
+            let id = cx.update(|_window, cx| doomed.read(cx).database_id())?;
+            let running = match id {
+                Some(id) => cx.update(|_window, cx| cod_has_running_session(id, cx))?,
+                None => false,
+            };
+            if running {
+                // Issue #81: the prompt can be for a background tab, so it names the workspace
+                // the way its tab does. Cancel comes first because Zed's prompts highlight the
+                // first answer and Enter picks it: Enter must not stop the agent and delete its
+                // chat.
+                let name = this
+                    .update(cx, |this, cx| this.cod_shown_name(&doomed, cx))?
+                    .unwrap_or_else(|| COD_UNNAMED_WORKSPACE.to_string());
+                let message = format!(
+                    "An agent in `{name}` is still working. Close the workspace and stop it?"
+                );
+                let answer = doomed.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &message,
+                        None,
+                        &["Cancel", "Close"],
+                        cx,
+                    )
+                })?;
+                if !matches!(answer.await, Ok(1)) {
+                    return anyhow::Ok(());
+                }
+            }
+            // The unsaved-edits prompt shows the workspace it asks about (Zed's
+            // `save_all_internal` activates it), which switches away from the shown workspace
+            // when a background tab is closed.
             let consent = doomed
                 .update_in(cx, |workspace, window, cx| {
                     workspace.save_all_internal(SaveIntent::Close, false, window, cx)
                 })?
                 .await?;
+            // Issue #81: whatever the answer, the user is back on the workspace they were using.
+            this.update_in(cx, |this, window, cx| {
+                this.cod_show_again_after_close_prompt(&shown_before, &doomed, window, cx)
+            })?;
             if !consent {
                 return anyhow::Ok(());
             }
@@ -714,12 +1007,19 @@ impl MultiWorkspace {
 
             // The replacement is the member before the closed one (else the one after it), loaded
             // or pending; a listed member whose saved data was not found is skipped.
-            let replacement = this.update(cx, |this, cx| {
+            // Issue #77 F3: a replacement is only shown when the closed workspace is the one
+            // shown: it was shown before the close, or the workspace shown then is gone.
+            // Closing a background tab leaves the shown workspace as it was.
+            let (replacement, was_active) = this.update(cx, |this, cx| {
+                let was_active = *this.workspace() == doomed;
                 let members = this.cod_members(cx);
                 let index = members.iter().position(|member| match member {
                     CodMember::Live(workspace) => *workspace == doomed,
                     CodMember::Pending(_) => false,
-                })?;
+                });
+                let Some(index) = index else {
+                    return (None, was_active);
+                };
                 let candidates: Vec<(usize, CodMember)> = members
                     .into_iter()
                     .enumerate()
@@ -731,14 +1031,15 @@ impl MultiWorkspace {
                             }
                     })
                     .collect();
-                candidates
+                let replacement = candidates
                     .iter()
                     .rev()
                     .find(|(position, _)| *position < index)
                     .or_else(|| candidates.iter().find(|(position, _)| *position > index))
-                    .map(|(_, member)| member.clone())
+                    .map(|(_, member)| member.clone());
+                (replacement, was_active)
             })?;
-            match replacement {
+            match replacement.filter(|_| was_active) {
                 Some(CodMember::Live(replacement)) => {
                     this.update_in(cx, |this, window, cx| {
                         this.activate(replacement, None, window, cx);
@@ -750,7 +1051,7 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
-                None => {
+                None if was_active => {
                     cx.update(|_window, cx| {
                         Workspace::new_local(
                             Vec::new(),
@@ -764,6 +1065,8 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
+                // Not active: nothing was shown, so nothing needs to replace it.
+                None => {}
             }
 
             this.update(cx, |this, cx| {
@@ -777,6 +1080,20 @@ impl MultiWorkspace {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Issue #81: shows `previous` again when a close prompt switched from it to `doomed`, the
+    /// workspace being closed, as long as `previous` is still in the window.
+    fn cod_show_again_after_close_prompt(
+        &mut self,
+        previous: &Entity<Workspace>,
+        doomed: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if previous != doomed && self.workspace() == doomed && self.held_index(previous).is_some() {
+            self.activate(previous.clone(), None, window, cx);
+        }
     }
 
     /// The ids to save as the window's workspace list: the held workspaces in window order, then
@@ -875,6 +1192,117 @@ impl MultiWorkspace {
         self.serialize(cx);
         cx.notify();
     }
+
+    /// Cod (#25, #26): the members the window shows (tabs, overview), in window order: the
+    /// loaded workspaces and the pending ones that have saved data. A listed member whose saved
+    /// data was not found is left out, as it cannot be shown.
+    pub fn cod_shown_members(&self, cx: &App) -> Vec<CodMember> {
+        self.cod_members(cx)
+            .into_iter()
+            .filter(|member| match member {
+                CodMember::Live(_) => true,
+                CodMember::Pending(id) => self.cod_pending.contains_key(id),
+            })
+            .collect()
+    }
+
+    /// Cod (#25, #26): the workspace id of a member, None for a loaded workspace that has none
+    /// yet.
+    pub fn cod_member_id(member: &CodMember, cx: &App) -> Option<WorkspaceId> {
+        match member {
+            CodMember::Live(workspace) => workspace.read(cx).database_id(),
+            CodMember::Pending(id) => Some(*id),
+        }
+    }
+
+    /// Cod (#26): when the loaded member with this id was last shown in this window, as a
+    /// stamp that grows with each switch; None for pending members and members never shown.
+    pub fn cod_last_activated(&self, id: WorkspaceId, cx: &App) -> Option<u64> {
+        self.held
+            .iter()
+            .find(|held| held.workspace.read(cx).database_id() == Some(id))
+            .and_then(|held| held.activated_at)
+    }
+
+    /// Cod (#25 AC5): the left button went down on the tab of `member`. The tab acts on the
+    /// release, as a Zed tab acts on a click (`cod_release_tab`).
+    pub fn cod_press_tab(&mut self, member: &CodMember, cx: &App) {
+        self.cod_pressed_tab = Some(CodTabPress::of(member, cx));
+    }
+
+    /// Cod (#25 AC5): the left button came up over the tab of `member`. When it went down on the
+    /// same workspace's tab, in this title bar or in the one shown before a pending workspace
+    /// finished loading, the member is shown, as on a click. Returns whether it was. Either way
+    /// the press is over.
+    pub fn cod_release_tab(
+        &mut self,
+        member: &CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pressed) = self.cod_pressed_tab.take() else {
+            return false;
+        };
+        if !pressed.same_tab(&CodTabPress::of(member, cx)) {
+            return false;
+        }
+        self.cod_show_member(member.clone(), window, cx);
+        true
+    }
+
+    /// Cod (#25 AC5): the left button came up anywhere but over a tab, so a pending press is no
+    /// click, as in Zed.
+    pub fn cod_cancel_tab_press(&mut self) {
+        self.cod_pressed_tab = None;
+    }
+
+    /// Cod (#25 AC5): whether a press on a workspace tab waits for its release.
+    pub fn cod_tab_pressed(&self) -> bool {
+        self.cod_pressed_tab.is_some()
+    }
+
+    /// Cod (#25): shows the member, loading it first when it is pending. See
+    /// `cod_show_member_awaiting` for a caller that needs the outcome instead of fire-and-forget.
+    pub fn cod_show_member(
+        &mut self,
+        member: CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cod_show_member_awaiting(member, window, cx)
+            .detach_and_log_err(cx);
+    }
+
+    /// Cod (#25, RC review A4): the same request `cod_show_member` makes for a tab click, as a
+    /// task a caller can await instead of fire-and-forget.
+    ///
+    /// `codctl workspace focus` used to call `activate` and `cod_show_pending` directly, without
+    /// this bump: a pending member B already loading would then finish after a CLI `workspace
+    /// focus A` and still switch away from A, because the stale-load check
+    /// (`cod_join_loading_member`) only ever compares against the window's activation stamp, and
+    /// the CLI focus never touched it. Routing both the tab click and the CLI command through
+    /// this one bump keeps every "show this workspace" request, however it was asked for,
+    /// indistinguishable to that check.
+    pub fn cod_show_member_awaiting(
+        &mut self,
+        member: CodMember,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        // Cod (#25 review): a fresh request even when `member` is the one already shown, so a
+        // pending member loading elsewhere knows a newer request came in (see
+        // `CodActivationIntents` and `cod_activate_pending`, which bumps again for its own
+        // request when `member` is pending: that is still the authoritative stamp for its load).
+        let window_entity = cx.entity_id();
+        CodActivationIntents::bump(cx, window_entity);
+        match member {
+            CodMember::Live(workspace) => {
+                self.activate(workspace, None, window, cx);
+                Task::ready(Ok(()))
+            }
+            CodMember::Pending(id) => self.cod_show_pending(id, window, cx),
+        }
+    }
 }
 
 /// Cod (#24): the main repository folder of a linked git worktree, read from its `.git` file
@@ -891,4 +1319,22 @@ fn cod_linked_worktree_main_path(folder: &std::path::Path) -> Option<std::path::
         project::repo_identity_path(&common, util::paths::PathStyle::local()).to_path_buf();
     // A folder whose identity is the folder itself is not a linked worktree of another one.
     (identity != folder).then_some(identity)
+}
+
+/// Cod (#37): names the workspace like "workspace: rename workspace" does (None removes the
+/// name) and shows the new name in the window title when the workspace is the one shown.
+pub fn cod_set_workspace_name(
+    workspace: &Entity<Workspace>,
+    name: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let id = workspace.read(cx).database_id();
+    set_workspace_name(id, name, cx);
+    workspace.update(cx, |workspace, cx| {
+        if workspace.owns_window_chrome() {
+            workspace.refresh_window_state(window, cx);
+        }
+        cx.notify();
+    });
 }

@@ -10,6 +10,7 @@
 //! - A failed request replies `{"ok":false,"error":"..."}`.
 //!
 //! Keys enter the window the way the Linux platform layer delivers them: `Window::dispatch_event` with `PlatformInput::KeyDown` and `KeyUp`, and when the key down is not handled and carries text, the window's text input receives that text (`Window::dispatch_keystroke` does both).
+//! A keystroke with modifiers is wrapped in `PlatformInput::ModifiersChanged`: the modifiers go down before the key and up after it, so views that act when the modifiers are released (the ctrl-tab switcher) finish as they do for a user.
 //! So the keymap, the focus and the text input behave as they do for a user. The driver never dispatches actions and never calls into views; `state` only reads what the window shows.
 //! Keys go to the window the platform names active. Without a keyboard (the headless sway of the tests has none) the platform names none; then keys go to the newest open workspace window, the one the compositor focuses.
 //! The socket is served on background threads. Every request is handed to one foreground task through a channel, so the GPUI thread never waits for a client.
@@ -17,6 +18,12 @@
 //! Some views keep what they show private. Read-only getters added for this driver (test hooks, no behavior change): `CommandPaletteDelegate::highlighted_command_name` and `listed_query` (command_palette), `ZedPromptRenderer::message`, `detail`, `answers` and `highlighted_answer` (ui_prompt), `ProjectPanel::listed_entries` (project_panel).
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
+mod cod_chat_state;
+mod cod_markdown_preview_state;
+mod cod_overview_state;
+mod cod_tabs_state;
+mod cod_welcome_state;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -38,6 +45,8 @@ use workspace::{
     CodMember, ItemHandle, MultiWorkspace, Pane, Workspace, WorkspaceSettings, dock::PanelHandle as _,
 };
 
+mod cod_pages_state;
+
 /// The environment variable that names the driver socket.
 pub const SOCKET_ENV: &str = "COD_E2E_SOCKET";
 
@@ -46,6 +55,9 @@ const WINDOW_POLL: Duration = Duration::from_millis(50);
 
 /// The pause between two key presses of one request, so the app runs its event loop in between as it does for a person typing.
 const KEY_PAUSE: Duration = Duration::from_millis(10);
+
+/// The longest the driver waits for the window to draw before the first key press of a request (see `settle_frames`). Without frames (an idle or hidden window) it presses the keys after this.
+const FRAME_SETTLE_LIMIT: Duration = Duration::from_millis(250);
 
 /// Starts the driver when `COD_E2E_SOCKET` is set. Does nothing otherwise.
 #[cfg(unix)]
@@ -102,7 +114,7 @@ struct Memory {
 pub fn init(_cx: &mut App) {}
 
 /// One parsed request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Request {
     /// Key presses, in order.
     Keys(Vec<Keystroke>),
@@ -110,6 +122,20 @@ pub enum Request {
     Type(Vec<Keystroke>),
     /// Read what the window shows.
     State,
+    /// A left click at a window position, with the control key held when `ctrl` is set (#25, see
+    /// `cod_tabs_state`; the control modifier was added for #32 AC3's Ctrl-click on a URL).
+    Click { x: f32, y: f32, ctrl: bool },
+    /// Moves the mouse to a window position without pressing a button, so a test can check a
+    /// hover style (issue #77: the workspace tabs' hover background and close control).
+    Hover { x: f32, y: f32 },
+    /// Presses the left button at a window position without releasing it (issue #77 C1: a test
+    /// changes what the release would act on, for example removing another workspace through
+    /// codctl, between this and `MouseUp`).
+    MouseDown { x: f32, y: f32 },
+    /// Releases the left button at a window position, the other half of `MouseDown`.
+    MouseUp { x: f32, y: f32 },
+    /// The test fixture that sets a session or page status (#25, see `cod_tabs_state`).
+    SetEntry(cod_tabs_state::SetEntry),
 }
 
 #[derive(Deserialize)]
@@ -118,6 +144,25 @@ enum WireRequest {
     Keys { keys: String },
     Type { text: String },
     State,
+    Click {
+        x: f32,
+        y: f32,
+        #[serde(default)]
+        ctrl: bool,
+    },
+    Hover {
+        x: f32,
+        y: f32,
+    },
+    MouseDown {
+        x: f32,
+        y: f32,
+    },
+    MouseUp {
+        x: f32,
+        y: f32,
+    },
+    SetEntry(cod_tabs_state::SetEntry),
 }
 
 /// Parses one request line.
@@ -128,6 +173,26 @@ pub fn parse_request(line: &str) -> Result<Request> {
         WireRequest::Keys { keys } => Request::Keys(parse_keys(&keys)?),
         WireRequest::Type { text } => Request::Type(typed_keystrokes(&text)?),
         WireRequest::State => Request::State,
+        WireRequest::Click { x, y, ctrl } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::Click { x, y, ctrl }
+        }
+        WireRequest::Hover { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::Hover { x, y }
+        }
+        WireRequest::MouseDown { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::MouseDown { x, y }
+        }
+        WireRequest::MouseUp { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::MouseUp { x, y }
+        }
+        WireRequest::SetEntry(entry) => {
+            cod_tabs_state::check_set_entry(&entry)?;
+            Request::SetEntry(entry)
+        }
     })
 }
 
@@ -370,6 +435,7 @@ async fn run(
 ) -> Result<Option<Value>> {
     match request {
         Request::Keys(keystrokes) | Request::Type(keystrokes) => {
+            settle_frames(memory, cx).await;
             for (index, keystroke) in keystrokes.into_iter().enumerate() {
                 if index > 0 {
                     cx.background_executor().timer(KEY_PAUSE).await;
@@ -378,6 +444,13 @@ async fn run(
             }
             Ok(None)
         }
+        Request::Click { x, y, ctrl } => {
+            cod_tabs_state::click(x, y, ctrl, memory, cx).await.map(|()| None)
+        }
+        Request::Hover { x, y } => cod_tabs_state::hover(x, y, memory, cx).await.map(|()| None),
+        Request::MouseDown { x, y } => cod_tabs_state::mouse_down(x, y, memory, cx).await.map(|()| None),
+        Request::MouseUp { x, y } => cod_tabs_state::mouse_up(x, y, memory, cx).await.map(|()| None),
+        Request::SetEntry(entry) => cod_tabs_state::set_entry(entry, memory, cx).map(|()| None),
         Request::State => {
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
             let window_count = cx.update(|cx| cx.windows().len());
@@ -420,13 +493,52 @@ fn workspace_window(cx: &App, memory: &Memory) -> Option<WindowHandle<MultiWorks
 
 /// Presses one key: key down, then key up, as the platform layer delivers them.
 #[cfg(unix)]
+/// Waits until the window drew two more frames, at most `FRAME_SETTLE_LIMIT`, before a request presses keys.
+///
+/// Zed moves the focus to a popover menu (for example the agent panel's new thread menu) two frames after it opens (`ui::popover_menu::show_menu`). A person cannot type inside those two frames, but the driver could: its first key went to the old focus, so "end up enter" right after "agent: toggle new thread menu" picked another row than the test meant. The two frame callbacks registered here run after the ones the menu registered earlier (GPUI runs them in order), so the focus has moved when the keys arrive.
+#[cfg(unix)]
+async fn settle_frames(memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) {
+    use futures::FutureExt as _;
+
+    let Some(window) = cx.update(|cx| workspace_window(cx, &memory.borrow())) else {
+        return;
+    };
+    let (drawn, frames) = futures::channel::oneshot::channel::<()>();
+    let registered = cx.update_window(window.into(), |_, window, _| {
+        window.on_next_frame(move |window, _| {
+            window.on_next_frame(move |_, _| {
+                drawn.send(()).ok();
+            });
+        });
+    });
+    if registered.is_err() {
+        return;
+    }
+    let mut frames = frames.fuse();
+    let mut limit = cx.background_executor().timer(FRAME_SETTLE_LIMIT).fuse();
+    futures::select_biased! {
+        _ = frames => {}
+        _ = limit => log::debug!("e2e driver: no frame within {FRAME_SETTLE_LIMIT:?}; pressing the keys anyway"),
+    }
+}
+
 fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) -> Result<()> {
-    use gpui::{KeyDownEvent, KeyUpEvent, PlatformInput};
+    use gpui::{Capslock, KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, PlatformInput};
 
     let window = cx
         .update(|cx| workspace_window(cx, &memory.borrow()))
         .context("Cod has no workspace window")?;
     cx.update_window(window.into(), |_, window, cx| {
+        let modified = keystroke.modifiers.modified();
+        if modified {
+            window.dispatch_event(
+                PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers: keystroke.modifiers,
+                    capslock: Capslock::default(),
+                }),
+                cx,
+            );
+        }
         // The Linux platform layer gives unhandled text keys without modifiers other than shift to the text input.
         let types_text = keystroke.key_char.is_some()
             && keystroke.modifiers.is_subset_of(&Modifiers::shift());
@@ -443,6 +555,15 @@ fn press(keystroke: Keystroke, memory: &Rc<RefCell<Memory>>, cx: &mut AsyncApp) 
             );
         }
         window.dispatch_event(PlatformInput::KeyUp(KeyUpEvent { keystroke }), cx);
+        if modified {
+            window.dispatch_event(
+                PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers: Modifiers::none(),
+                    capslock: Capslock::default(),
+                }),
+                cx,
+            );
+        }
     })
     .context("the workspace window closed")
 }
@@ -580,10 +701,14 @@ fn read_state(
                         .map(|path| path.to_string_lossy().into_owned())
                         .collect();
                     return json!({
+                        // #77 C5: a stable identity, so a test can tell two workspaces of the
+                        // same (or now-numbered) name apart instead of asserting by position.
+                        "id": i64::from(*id),
                         "name": workspace::cod_workspace_name_by_id(*id, cx),
                         "worktrees": worktrees,
                         "drawn": false,
                         "remote": multi_workspace.cod_pending_is_remote(*id),
+                        "status": cod_tabs_state::member_status(member, cx),
                     });
                 }
             };
@@ -595,10 +720,12 @@ fn read_state(
                 }
             }
             json!({
+                "id": MultiWorkspace::cod_member_id(member, cx).map(i64::from),
                 "name": workspace_name(workspace, cx),
                 "worktrees": worktrees_of(workspace.read(cx), cx),
                 "drawn": drawn,
                 "remote": workspace.read(cx).project().read(cx).is_via_remote_server(),
+                "status": cod_tabs_state::member_status(member, cx),
             })
         })
         .collect();
@@ -674,6 +801,16 @@ fn read_state(
         let point = editor.selections.newest_anchor().head().to_point(&snapshot);
         json!({ "row": point.row + 1, "column": point.column + 1 })
     });
+    // Where the active pane's cursor was last drawn, in window pixels (#32 AC3): the end-to-end
+    // driver's Ctrl-click target for a URL in a code comment. The test moves the cursor there with
+    // the keyboard first (as "editor: open url" already does), then reads this field instead of
+    // computing text layout itself; `Pane::pixel_position_of_cursor` already exists for pane-split
+    // navigation (`pane_group.rs`), so this adds no new editor code.
+    let cursor_pixel_position = workspace
+        .active_pane()
+        .read(cx)
+        .pixel_position_of_cursor(cx)
+        .map(|point| json!({ "x": f32::from(point.x), "y": f32::from(point.y) }));
 
     // The command palette: its query, how many rows it lists, which row is highlighted, the query those rows belong to, and the command on the highlighted row.
     let palette_open = workspace
@@ -763,7 +900,7 @@ fn read_state(
     } else {
         None
     };
-    Ok(json!({
+    let mut state = json!({
         "active_tab": active_tab,
         "tabs": tabs,
         "worktrees": worktrees,
@@ -775,6 +912,7 @@ fn read_state(
         "panes": panes_json,
         "split": split,
         "cursor": cursor,
+        "cursor_pixel_position": cursor_pixel_position,
         "dirty_tabs": dirty_tabs,
         "unsaved_texts": unsaved_texts,
         "drawn_tabs": drawn_tabs,
@@ -788,7 +926,19 @@ fn read_state(
         "window_active": window_active,
         "focus": focus,
         "prompt": prompt,
-    }))
+        "title_bar": cod_tabs_state::title_bar_state(&active, cx),
+    });
+    // Set outside `json!` to keep the macro's recursion short.
+    state["overview"] = cod_overview_state::overview_state(workspace, window, cx);
+    state["pages"] = cod_pages_state::state(multi_workspace, window, cx);
+    state["chat"] = cod_chat_state::chat_state(workspace, window, cx);
+    state["markdown_preview"] = cod_markdown_preview_state::state(workspace, cx);
+    state["chat_tabs"] = cod_chat_state::chat_tabs_state(workspace, cx);
+    state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
+    state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
+    state["welcome"] = cod_welcome_state::state(workspace, cx);
+    state["onboarding_header"] = cod_welcome_state::onboarding_header(workspace, cx);
+    Ok(state)
 }
 
 /// What holds the window's focus, read only: null when nothing is focused, else `kind` is
@@ -1112,6 +1262,26 @@ mod tests {
             ])
         );
         assert_eq!(parse_request(r#"{"cmd":"state"}"#).unwrap(), Request::State);
+    }
+
+    #[test]
+    fn click_defaults_ctrl_to_false() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"click","x":12.5,"y":4}"#).unwrap(),
+            Request::Click { x: 12.5, y: 4., ctrl: false }
+        );
+        assert_eq!(
+            parse_request(r#"{"cmd":"click","x":12.5,"y":4,"ctrl":true}"#).unwrap(),
+            Request::Click { x: 12.5, y: 4., ctrl: true }
+        );
+    }
+
+    #[test]
+    fn parses_hover() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"hover","x":12.5,"y":4}"#).unwrap(),
+            Request::Hover { x: 12.5, y: 4. }
+        );
     }
 
     #[test]

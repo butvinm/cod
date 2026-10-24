@@ -4,6 +4,7 @@
 # A pull request that only changes docs (*.md, docs/**, LICENSE*) skips every step after "Detect code changes", and the job is still green.
 # Pushes to master run it too, which keeps the caches warm: only master writes them.
 # The job's status is the "Run end-to-end tests" step: every test_*.py, all local. The remote (SSH) tests need the remote server, which takes long to build, so they run only in the optional workflow "E2E remote (optional)" (e2e-remote.yml).
+# One locked build covers compilation and lockfile enforcement without a duplicate serial check.
 name: E2E
 
 on:
@@ -40,6 +41,9 @@ jobs:
           persist-credentials: false
           # A pull request checks out its merge commit; its first parent is the base, which is enough to list the changed files.
           fetch-depth: 2
+
+      - name: Check the app icons
+        run: sha256sum --check --strict --quiet script/cod-app-icons.sha256
 
       - name: Detect code changes
         id: changes
@@ -132,17 +136,21 @@ jobs:
           key: cef-${{ env.CEF_VERSION }}-linux-x86_64
 
       # The same command as in script/e2e, with the same environment as the release build.
+      # Pull requests from this repository write too: their entries are scoped to the pull
+      # request, so its next run hits the Cod crates it changed instead of missing the same
+      # ~120 units on every run (with READ_ONLY each miss was also counted as a write error).
+      # Pull requests from forks stay read-only.
       - name: Build
         if: steps.changes.outputs.code == 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
-          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          SCCACHE_GHA_RW_MODE: ${{ (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
         run: |
           echo "build started at $(date -u '+%H:%M:%S')"
           sccache --zero-stats
-          cargo build --profile release-fast -p zed -p cod_browser
+          cargo build --locked --profile release-fast -p zed -p cod_browser -p codctl
           sccache --show-stats
           echo "build finished at $(date -u '+%H:%M:%S')"
 
@@ -158,10 +166,47 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         env:
           SCCACHE_GHA_ENABLED: "true"
-          SCCACHE_GHA_RW_MODE: ${{ github.ref == 'refs/heads/master' && 'READ_WRITE' || 'READ_ONLY' }}
+          SCCACHE_GHA_RW_MODE: ${{ (github.ref == 'refs/heads/master' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && 'READ_WRITE' || 'READ_ONLY' }}
           RUSTC_WRAPPER: sccache
           CARGO_BUILD_JOBS: "8"
         run: script/e2e
+
+      # Reuse this successful build for downloaded-package QA without publishing a release.
+      # Packaging matches linux-release.yml; the existing CEF asset is read, never modified.
+      - name: Package the tested Linux candidate
+        if: steps.changes.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="cod-cef-$CEF_VERSION-linux-x86_64.tar.xz"
+          mkdir -p candidate-artifacts/cef-asset candidate-package/cod
+          gh release download "cef-$CEF_VERSION" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$asset.sha256" --dir candidate-artifacts/cef-asset
+          checksum=$(cat "candidate-artifacts/cef-asset/$asset.sha256")
+          [[ "$checksum" =~ ^[0-9a-f]{64}$ ]]
+          cp target/release-fast/zed candidate-package/cod/cod
+          cp target/release-fast/cod-browser candidate-package/cod/cod-browser
+          cp target/release-fast/codctl candidate-package/cod/codctl
+          strip candidate-package/cod/cod candidate-package/cod/cod-browser candidate-package/cod/codctl
+          cp script/cod-xwayland.sh script/cod-wayland.sh LICENSE-GPL LICENSE-APACHE README.md candidate-package/cod/
+          script/cod-linux-desktop-files candidate-package/cod
+          printf 'version=%s\nurl=%s/%s/releases/download/cef-%s/%s\nsha256=%s\n' \
+            "$CEF_VERSION" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$CEF_VERSION" "$asset" "$checksum" \
+            > candidate-package/cod/cef-manifest
+          git rev-parse HEAD > candidate-package/cod/cod-commit.txt
+          git rev-parse 'HEAD^{tree}' > candidate-package/cod/cod-tree.txt
+          tar -C candidate-package -cf - cod | xz -6 -T0 > candidate-artifacts/cod-linux-x86_64.tar.xz
+          (cd candidate-artifacts && sha256sum cod-linux-x86_64.tar.xz > cod-linux-x86_64.tar.xz.sha256)
+          cp candidate-package/cod/cod-commit.txt candidate-package/cod/cod-tree.txt candidate-artifacts/
+
+      - name: Upload the tested Linux package
+        if: steps.changes.outputs.code == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-linux-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate-artifacts
+          retention-days: 14
+          if-no-files-found: error
 
       # Every run, green or red, keeps its screenshots and logs. The name carries the tested commit (the pull request head), and run.txt inside names the checked-out commit.
       - name: Upload artifacts

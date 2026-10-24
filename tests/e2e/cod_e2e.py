@@ -565,14 +565,22 @@ class CodTestCase(unittest.TestCase):
 
     # The app
 
-    def start_cod(self, folder: Path | None, persistent: bool = False, timeout: float = DRIVER_START_TIMEOUT) -> None:
+    def start_cod(
+        self,
+        folder: Path | None,
+        persistent: bool = False,
+        timeout: float = DRIVER_START_TIMEOUT,
+        extra_settings: Mapping[str, Any] | None = None,
+    ) -> None:
         """Starts Cod on the folder (None: no folder) and connects to its driver. Cod is stopped when the test ends.
 
         persistent=True starts Cod without ZED_STATELESS, so it keeps its database and session in the test's data folder and restart_cod() can bring them back.
+        extra_settings are added to cod_settings() at this and every later start, for example the `agent_servers` entry of the fake agent (fake_acp_agent.fake_agent_settings).
         """
         if self.cod is not None:
             raise RuntimeError("Cod was already started in this test: use restart_cod() to start it again")
         self.cod = Cod(self.workdir, folder, persistent=persistent)
+        self.cod.extra_settings = dict(extra_settings or {})
         self.addCleanup(self._stop_cod)
         # Cleanups run last in, first out: the final artifacts are taken while Cod still runs.
         self.addCleanup(self._save_final_artifacts)
@@ -734,6 +742,11 @@ class CodTestCase(unittest.TestCase):
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
         (target / note_name).write_text(note)
+        # Keep the frames actually sampled by visual assertions; the later collection
+        # screenshot may show a different presented frame.
+        sampled = self.workdir / "sampled-frames"
+        if sampled.is_dir():
+            shutil.copytree(sampled, target / "sampled-frames")
         try:
             shot = subprocess.run(["grim", str(target / "screenshot.png")], capture_output=True, text=True, timeout=20)
             if shot.returncode != 0:

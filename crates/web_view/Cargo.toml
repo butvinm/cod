@@ -14,19 +14,36 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+db.workspace = true
+# The "web: open url" prompt is a one-line editor.
+editor.workspace = true
 futures.workspace = true
 gpui.workspace = true
 log.workspace = true
+menu.workspace = true
+project.workspace = true
+# A per-document Content-Security-Policy nonce, unpredictable to a page's own content (RC review
+# B1): generated after the page's own HTML is read, so nothing in it can carry a matching value.
+rand.workspace = true
 serde_json.workspace = true
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
 ui.workspace = true
+url.workspace = true
 util.workspace = true
 workspace.workspace = true
 
+[dev-dependencies]
+# The page table's `static_connection!` declares `open_test_db` under cfg(test), which needs the helper of `db`.
+db = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true
-# The spike driver checks the editor buffer and which modal opened.
+# The spike driver checks which modal opened.
 command_palette.workspace = true
-editor.workspace = true
 file_finder.workspace = true
 objc2.workspace = true
 objc2-app-kit = { workspace = true, features = [
@@ -45,13 +62,19 @@ objc2-foundation.workspace = true
 objc2-web-kit.workspace = true
 wry.workspace = true
 
+# image, paths and smallvec are used by the off-screen page-tab backend (offscreen.rs,
+# offscreen_driver.rs), which is widened to macOS too (issue #23 round 1): both platforms need
+# them, so they moved out of the Linux-only table below (build error on macOS otherwise: E0432/
+# E0433 unresolved import/cannot find crate, from the macOS run of #23 round 1's first push).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+image.workspace = true
+paths.workspace = true
+smallvec.workspace = true
+
 # WebKitGTK in an X11 child window. The versions match what wry 0.57 uses.
 [target.'cfg(target_os = "linux")'.dependencies]
 gdkx11 = "0.18"
 gtk = "0.18"
-image.workspace = true
-paths.workspace = true
-smallvec.workspace = true
 webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 wry = { workspace = true, features = ["os-webview"] }
 x11-dl = "2.21"
