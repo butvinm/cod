@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from pathlib import Path
 from typing import Any
 
-from cod_e2e import CodTestCase
+from cod_e2e import CodTestCase, processes_with_marker
+from cod_status_fixtures import CodStatusFixtures, drawn, title_bar
 from fake_acp_agent import fake_agent_settings
 from page_server import PageServer
 from test_39_codctl_sessions import Codctl
@@ -393,7 +395,7 @@ def chat_of(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-class WorkspaceChatsTest(CodTestCase):
+class WorkspaceChatsTest(CodStatusFixtures, CodTestCase):
     def open_chat(self, other_sessions: list[str]) -> dict[str, Any]:
         """Opens the agent panel of the active workspace, starts a chat with the fake agent from the new thread menu and returns the first state that shows it."""
         # The agent commands join the palette once the panel has loaded, a moment after the workspace.
@@ -502,6 +504,266 @@ class WorkspaceChatsTest(CodTestCase):
             self.type("And the tax lines?")
             self.keys("enter")
             self.wait_for_values("chat status", {"status": "error"}, lambda state: {"status": chat(state).get("status")}, 2)
+
+    # Issue #77 C2: closing a workspace through its tab's close button (or CloseWorkspace)
+    # while an agent in it is still generating or waiting for permission must ask first.
+
+    def start_a_working_chat(self) -> None:
+        """Starts Cod on billing-api with a fake agent that streams, then waits, and sends it a prompt: the chat in the first workspace is working."""
+        with self.step("start Cod on billing-api with a fake agent that streams, then waits"):
+            self.start_fake_agent_cod(
+                persistent=False,
+                turns=[{"steps": [{"chunk": "Reading src/invoice.rs."}, {"wait": "streamed"}, {"chunk": PAY_REPLY}, {"end": "end_turn"}]}],
+            )
+
+        with self.step("send a prompt: the chat is working"):
+            self.open_chat([])
+            self.type("Fix the rounding.")
+            self.keys("enter")
+            self.wait_for_values("chat status", {"status": "working"}, lambda state: {"status": chat(state).get("status")}, 10)
+
+    def test_ac7_closing_a_workspace_with_a_working_agent_asks_first(self) -> None:
+        repo = self.start_fake_agent_cod(persistent=False, turns=[
+            {"steps": [{"chunk": "Target working."}, {"wait": "target-finish"}]},
+            {"steps": [{"chunk": "Survivor working."}, {"wait": "survivor-finish"}]},
+        ])
+        self.start_chat("Review target.", "Target working.", [])
+        launcher_pid = self.cod.process.pid
+
+        def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            owned = set(processes_with_marker(self.cod.marker)) if direct_only else set()
+            rows = subprocess.check_output(
+                ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
+            )
+            found = {}
+            for row in rows.splitlines():
+                fields = row.split(None, 7)
+                if len(fields) == 8 and (not direct_only or int(fields[0]) in owned) and "fake_acp_agent.py" in fields[7]:
+                    found[int(fields[0])] = " ".join(fields[2:])
+            return found
+
+        target_processes = provider_processes()
+        self.expect_equal("one owned target provider", 1, len(target_processes))
+
+        with self.step("the workspace itself is working"):
+            state = self.wait_for(lambda state: state["workspaces"][0]["status"] == "working", 10, "the workspace itself working")
+
+        with self.step("add a second, idle workspace so closing the first does not leave an empty replacement"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] == 1
+                and state["modal"] is None
+                and len(title_bar(state)["tabs"]) == 2,
+                30,
+                "the second workspace, shown with both tabs drawn",
+            )
+            shown_id = state["workspaces"][1]["id"]
+
+        with self.step("start an unrelated working session in the shown workspace"):
+            self.add_folder(repo)
+            survivor_session = self.start_chat("Review survivor.", "Survivor working.", [PAY_SESSION])
+            survivor_processes = {pid: identity for pid, identity in provider_processes().items() if pid not in target_processes}
+            self.expect_equal("one separate survivor provider", 1, len(survivor_processes))
+
+        # Issue #81: the working workspace is a background tab here, so the prompt must say which
+        # workspace it is about, and Enter (the highlighted answer) must not stop the agent.
+        with self.step("hover the background working tab and click its close button: the confirmation names it"):
+            self.hover_tab(state, 0)
+            state = self.state()
+            close_bounds = title_bar(state)["tabs"][0]["close_bounds"]
+            if not drawn(close_bounds):
+                raise AssertionError(f"expected the working workspace's tab to have a close button, actual {close_bounds!r}")
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the agent-working confirmation")
+            self.expect_equal(
+                "confirmation message",
+                "An agent in `billing-api` is still working. Close the workspace and stop it?",
+                state["prompt"]["message"],
+            )
+            self.expect_equal("confirmation answers", ["Cancel", "Close"], state["prompt"]["answers"])
+            self.expect_equal("highlighted answer (the one Enter picks)", "Cancel", state["prompt"]["answers"][state["prompt"]["highlighted"]])
+
+        with self.step("Enter: Cancel, the workspace and the running session are kept, the shown workspace stays"):
+            self.keys("enter")
+            self.wait_for(lambda state: state["prompt"] is None, 10, "the prompt to close")
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["workspaces"][0]["status"] == "working",
+                10,
+                "both workspaces kept, the first still working",
+            )
+            self.expect_equal("the shown workspace, by id", shown_id, state["workspaces"][state["active_workspace"]]["id"])
+            self.expect_equal("Cancel keeps both exact provider processes", target_processes | survivor_processes, provider_processes())
+
+        with self.step("close the background working workspace explicitly: only its provider exits"):
+            self.hover_tab(state, 0)
+            state = self.state()
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the confirmation again")
+            self.keys("right")
+            self.wait_for(
+                lambda state: state["prompt"] is not None and state["prompt"]["answers"][state["prompt"]["highlighted"]] == "Close",
+                10,
+                "Close highlighted",
+            )
+            self.keys("enter")
+            state = self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the working workspace closed")
+            self.expect_equal("the remaining workspace, by id", shown_id, state["workspaces"][0]["id"])
+            self.wait_for(lambda _state: not (target_processes.items() & provider_processes(False).items()), 12, "the exact target provider exits before app quit")
+            self.expect_equal("the unrelated provider remains", survivor_processes, provider_processes())
+            self.expect_equal("the unrelated session remains", survivor_session, chat(self.state()).get("session_id"))
+            self.expect_equal("the unrelated session still working", "working", chat(self.state()).get("status"))
+            sampled = self.workdir / "sampled-frames"
+            sampled.mkdir(exist_ok=True)
+            subprocess.run(["grim", str(sampled / "provider-close-surviving-workspace.png")], check=True, timeout=20)
+            (sampled / "provider-close.json").write_text(json.dumps({
+                "target_before": target_processes, "survivor_before": survivor_processes,
+                "remaining_after_close": provider_processes(), "target_control_released": False,
+            }, indent=2))
+
+        with self.step("the surviving provider can finish its own work"):
+            (self.workdir / "survivor-finish").touch()
+            self.wait_for(lambda state: chat(state).get("status") == "done", 10, "unrelated work completes")
+            self.expect_equal("target was never released by the fixture", False, (self.workdir / "target-finish").exists())
+            (sampled / "survivor-done.json").write_text(json.dumps(self.state(), indent=2))
+            self.cod.quit()
+            remaining = (target_processes | survivor_processes).items() & provider_processes(False).items()
+            self.expect_equal("normal app quit leaves neither tracked provider", set(), remaining)
+            (sampled / "quit-receipt.json").write_text(json.dumps({
+                "launcher_pid": launcher_pid, "exited": True, "tracked_provider_survivors": list(remaining),
+                "forced_provider_signal": "none",
+            }, indent=2))
+
+    def test_ac7_close_background_workspace_during_provider_initialize(self) -> None:
+        """A workspace-owned provider must stop even before its ACP connection is ready."""
+        repo = self.make_repo("billing-api", BILLING_API)
+        survivor_repo = self.make_repo("ledger", {"README.md": "Unrelated workspace.\n"})
+        script = self.workdir / "agent-script.json"
+        log = self.workdir / "agent.log"
+        release = self.workdir / "initialize-finish"
+        script.write_text(json.dumps({"initialize_wait": release.name}))
+        self.start_cod(repo, persistent=False, extra_settings={
+            "agent_servers": {AGENT_ID: fake_agent_settings(script, log=log)},
+        })
+        self.wait_for(lambda state: [real(path) for path in state["worktrees"]] == [real(repo)], 30, "the target folder")
+
+        def provider_processes(direct_only: bool = True) -> dict[int, str]:
+            owned = set(processes_with_marker(self.cod.marker)) if direct_only else set()
+            rows = subprocess.check_output(
+                ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True,
+            )
+            found = {}
+            for row in rows.splitlines():
+                fields = row.split(None, 7)
+                if len(fields) == 8 and (not direct_only or int(fields[0]) in owned) and "fake_acp_agent.py" in fields[7]:
+                    found[int(fields[0])] = " ".join(fields[2:])
+            return found
+
+        with self.step("choose the fake agent and hold its initialize reply"):
+            self.wait_for(lambda state: state.get("agent_panel_ready") is True, 30, "the agent panel")
+            self.run_command("agent: toggle focus")
+            self.run_command("agent: toggle new thread menu")
+            self.keys("end up enter")
+            self.wait_for(
+                lambda _state: log.exists() and '"method": "initialize"' in log.read_text(),
+                10,
+                "the provider receives initialize without replying",
+            )
+            target_processes = provider_processes()
+            self.expect_equal("one owned initializing provider", 1, len(target_processes))
+            self.expect_equal("initialize remains held", False, release.exists())
+            self.expect_equal("no ACP initialize reply", False, "out " in log.read_text())
+
+        with self.step("open an unrelated workspace while target initialization remains pending"):
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == 2 and state["active_workspace"] == 1
+                and len(title_bar(state)["tabs"]) == 2 and state["modal"] is None,
+                30,
+                "the second workspace with both tabs drawn",
+            )
+            shown_id = state["workspaces"][1]["id"]
+            self.add_folder(survivor_repo)
+            state = self.wait_for(
+                lambda state: [real(path) for path in state["worktrees"]] == [real(survivor_repo)],
+                30,
+                "the unrelated folder remains usable",
+            )
+            self.expect_equal(
+                "pending provider is still alive before Close", target_processes,
+                dict(target_processes.items() & provider_processes(False).items()),
+            )
+            survivor_processes = {pid: identity for pid, identity in provider_processes().items() if pid not in target_processes}
+
+        with self.step("explicitly close the background initializing workspace"):
+            self.hover_tab(state, 0)
+            self.click_close_button(self.state(), 0)
+            state = self.wait_for(lambda state: state["workspace_count"] == 1, 10, "the pending workspace closes")
+            self.wait_for(
+                lambda _state: not (target_processes.items() & provider_processes(False).items()),
+                12,
+                "the exact pending provider exits before app quit",
+            )
+            state = self.state()
+            self.expect_equal("remaining workspace identity", shown_id, state["workspaces"][state["active_workspace"]]["id"])
+            self.expect_equal("remaining workspace folder", [real(survivor_repo)], [real(path) for path in state["worktrees"]])
+            self.expect_equal(
+                "any unrelated initializing provider remains", survivor_processes,
+                dict(survivor_processes.items() & provider_processes(False).items()),
+            )
+            self.expect_equal("remaining workspace has no modal or prompt", [None, None], [state["modal"], state["prompt"]])
+            self.expect_equal("target initialize was never released", False, release.exists())
+            self.expect_equal("target never replied to initialize", False, "out " in log.read_text())
+            sampled = self.workdir / "sampled-frames"
+            sampled.mkdir(exist_ok=True)
+            subprocess.run(["grim", str(sampled / "provider-initialize-close-survivor.png")], check=True, timeout=20)
+            (sampled / "provider-initialize-close.json").write_text(json.dumps({
+                "target_before": target_processes, "remaining_after_close": provider_processes(False),
+                "survivor_before": survivor_processes,
+                "initialize_control_released": False, "surviving_workspace_id": shown_id,
+                "state": state,
+            }, indent=2))
+
+    # Issue #81 (review B1): the confirmation is decided by the sessions, not by the workspace's
+    # rolled-up status, where an entry in error (a page that failed to load, an earlier failed
+    # chat) outranks working.
+
+    def test_ac7_a_working_agent_next_to_a_failed_page_still_asks_first(self) -> None:
+        self.start_a_working_chat()
+
+        with self.step("a page of the same workspace failed to load: the workspace rolls up to error"):
+            self.set_entry(0, "page-localhost", "error", title="localhost:3000", kind="page", context="localhost:3000")
+            self.wait_for(lambda state: state["workspaces"][0]["status"] == "error", 10, "the workspace rolled up to error")
+            self.expect_equal("the chat itself", "working", chat(self.state()).get("status"))
+
+        with self.step("add a second, idle workspace and show the first again"):
+            before = self.state()
+            self.run_command(NEW_WORKSPACE)
+            state = self.wait_for(
+                lambda state: state["workspace_count"] == before["workspace_count"] + 1
+                and state["active_workspace"] == 1
+                and state["modal"] is None
+                and len(title_bar(state)["tabs"]) == before["workspace_count"] + 1
+                and drawn(title_bar(state)["tabs"][0]["bounds"]),
+                30,
+                "the second workspace, shown with both tabs drawn",
+            )
+            self.click_tab(state, 0)
+            state = self.wait_for(lambda state: state["active_workspace"] == 0, 10, "back on the working workspace")
+
+        with self.step("click close: the agent-working confirmation shows although the workspace reads error"):
+            self.click_close_button(state, 0)
+            state = self.wait_for(lambda state: state["prompt"] is not None, 10, "the agent-working confirmation")
+            message = state["prompt"]["message"] or ""
+            if not message.startswith("An agent in"):
+                raise AssertionError(f"expected the agent-working confirmation, actual prompt {state['prompt']!r}")
+
+        with self.step("Cancel: the workspace and the running session are kept"):
+            self.keys("escape")
+            self.wait_for(lambda state: state["prompt"] is None, 10, "the prompt to close")
+            state = self.wait_for(lambda state: state["workspace_count"] == 2, 10, "both workspaces kept")
+            self.expect_equal("the chat after Cancel", "working", chat(state).get("status"))
 
     def test_ac2_a_new_workspace_opens_with_a_fresh_chat_ready_for_typing(self) -> None:
         with self.step("start Cod on billing-api with the fake agent"):

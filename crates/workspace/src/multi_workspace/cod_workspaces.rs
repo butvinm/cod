@@ -11,13 +11,15 @@ use std::{
 use db::kvp::KeyValueStore;
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    Global, Task, TaskExt as _, WeakEntity, Window, actions,
+    Global, PromptLevel, Task, TaskExt as _, WeakEntity, Window, actions,
 };
 use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt as _;
 
-use super::{HeldWorkspace, MultiWorkspace};
+use super::{
+    COD_UNNAMED_WORKSPACE, HeldWorkspace, MultiWorkspace, cod_status::cod_has_running_session,
+};
 use crate::{ModalView, OpenMode, SaveIntent, Workspace, WorkspaceId};
 
 /// Cod (#24): opens the saved remote workspace with this id (exact row) over its saved
@@ -37,6 +39,43 @@ pub type CodRemoteMemberOpen = std::sync::Arc<
 struct CodRemoteMemberOpener(CodRemoteMemberOpen);
 
 impl Global for CodRemoteMemberOpener {}
+
+/// Issue #77 C3: the last Cod window the platform reported active, tracked by an activation
+/// observer each `MultiWorkspace` window registers at creation (`MultiWorkspace::new`) and
+/// cleared when that window releases. Read through `cod_last_focused_window`, which also checks
+/// the window is still open, so a shared action (for example "zed: show welcome") can reach the
+/// window a person was last actually looking at instead of enumerating `cx.windows()` in
+/// creation order, which is not focus history and is not reliable the moment after a command
+/// palette entry closes and before the platform reports any window active again.
+#[derive(Default)]
+struct CodLastFocusedWindow(Option<gpui::WindowHandle<MultiWorkspace>>);
+
+impl Global for CodLastFocusedWindow {}
+
+/// Records `window` as the last focused Cod window; called only when the platform actually
+/// reports it active, from the activation observer `MultiWorkspace::new` registers.
+pub fn cod_set_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    cx.set_global(CodLastFocusedWindow(Some(window)));
+}
+
+/// Clears the record when `window` releases, so a closed window is never handed back.
+pub fn cod_clear_last_focused_window(window: gpui::WindowHandle<MultiWorkspace>, cx: &mut App) {
+    if let Some(last) = cx.try_global::<CodLastFocusedWindow>()
+        && last.0 == Some(window)
+    {
+        cx.set_global(CodLastFocusedWindow(None));
+    }
+}
+
+/// The last focused Cod window, if the platform has reported one active and it is still open
+/// (not yet closed or in the middle of closing).
+pub fn cod_last_focused_window(cx: &App) -> Option<gpui::WindowHandle<MultiWorkspace>> {
+    let window = cx.try_global::<CodLastFocusedWindow>()?.0?;
+    cx.windows()
+        .into_iter()
+        .any(|open| open == window.into())
+        .then_some(window)
+}
 
 /// Cod (#24): registers how a pending remote member is opened (see `CodRemoteMemberOpen`).
 pub fn cod_set_remote_member_opener(open: CodRemoteMemberOpen, cx: &mut App) {
@@ -250,13 +289,13 @@ pub(super) async fn delete_stored_workspace_name(
 
 /// Cod (#28) hook: what else goes when a workspace leaves its window for good, next to its name.
 /// The agent panel registers the deletion of the workspace's chats (agent_ui crate).
-struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(WorkspaceId, &mut App)>);
+struct CodWorkspaceRemovedHook(std::rc::Rc<dyn Fn(&Entity<Workspace>, &mut App)>);
 
 impl Global for CodWorkspaceRemovedHook {}
 
 /// Cod (#28): registers what runs when a workspace leaves its window for good.
 pub fn cod_set_workspace_removed_hook(
-    hook: impl Fn(WorkspaceId, &mut App) + 'static,
+    hook: impl Fn(&Entity<Workspace>, &mut App) + 'static,
     cx: &mut App,
 ) {
     cx.set_global(CodWorkspaceRemovedHook(std::rc::Rc::new(hook)));
@@ -279,12 +318,12 @@ pub fn cod_take_fresh_chat(workspace: gpui::EntityId, cx: &mut App) -> bool {
 }
 
 /// Cod (#28): runs the registered hook for a workspace that left its window for good.
-pub(super) fn run_workspace_removed_hook(id: WorkspaceId, cx: &mut App) {
+pub(super) fn run_workspace_removed_hook(workspace: &Entity<Workspace>, cx: &mut App) {
     if let Some(hook) = cx
         .try_global::<CodWorkspaceRemovedHook>()
         .map(|hook| hook.0.clone())
     {
-        (*hook)(id, cx);
+        (*hook)(workspace, cx);
     }
 }
 
@@ -882,17 +921,79 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let doomed = self.workspace().clone();
+        self.cod_close_live_workspace(doomed, window, cx);
+    }
+
+    /// Issue #77 F3: the same close (consent to save, pick a replacement, detach) as
+    /// `close_workspace`, but for a given workspace rather than always the active one, so a
+    /// tab's own close button can close a workspace that is not shown. A pending (not loaded)
+    /// member has no live `Workspace` to close this way; its tab has no close button instead
+    /// (see `cod_workspace_tabs.rs`), so this is never called for one.
+    pub fn cod_close_live_workspace(
+        &mut self,
+        doomed: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(window_handle) = window.window_handle().downcast::<MultiWorkspace>() else {
             return;
         };
-        let doomed = self.workspace().clone();
         let app_state = doomed.read(cx).app_state().clone();
+        let shown_before = self.workspace().clone();
         cx.spawn_in(window, async move |this, cx| {
+            // #77 C2: closing a workspace detaches it, which runs
+            // `cod_workspaces::run_workspace_removed_hook` (multi_workspace.rs, "the workspace's
+            // agent chats go with it") and permanently deletes its chat history. That would
+            // silently stop an agent session that is still generating or waiting for the user's
+            // permission, with no way back. Ask first, the same prompt style as the
+            // unsaved-buffer one just below. Issue #81: decided from the session entries, not
+            // the rolled-up status, where any entry in Error (a failed page, an earlier failed
+            // chat) outranks Working. A workspace whose sessions are all done, failed or idle
+            // does not prompt. This is the one shared path CloseWorkspace and a tab's own close
+            // button both use; codctl's own `workspace close` (codctl_server.rs) does not go
+            // through it: without --force it only asks about unsaved files.
+            let id = cx.update(|_window, cx| doomed.read(cx).database_id())?;
+            let running = match id {
+                Some(id) => cx.update(|_window, cx| cod_has_running_session(id, cx))?,
+                None => false,
+            };
+            if running {
+                // Issue #81: the prompt can be for a background tab, so it names the workspace
+                // the way its tab does. Cancel comes first because Zed's prompts highlight the
+                // first answer and Enter picks it: Enter must not stop the agent and delete its
+                // chat.
+                let name = this
+                    .update(cx, |this, cx| this.cod_shown_name(&doomed, cx))?
+                    .unwrap_or_else(|| COD_UNNAMED_WORKSPACE.to_string());
+                let message = format!(
+                    "An agent in `{name}` is still working. Close the workspace and stop it?"
+                );
+                let answer = doomed.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Warning,
+                        &message,
+                        None,
+                        &["Cancel", "Close"],
+                        cx,
+                    )
+                })?;
+                if !matches!(answer.await, Ok(1)) {
+                    return anyhow::Ok(());
+                }
+            }
+            // The unsaved-edits prompt shows the workspace it asks about (Zed's
+            // `save_all_internal` activates it), which switches away from the shown workspace
+            // when a background tab is closed.
             let consent = doomed
                 .update_in(cx, |workspace, window, cx| {
                     workspace.save_all_internal(SaveIntent::Close, false, window, cx)
                 })?
                 .await?;
+            // Issue #81: whatever the answer, the user is back on the workspace they were using.
+            this.update_in(cx, |this, window, cx| {
+                this.cod_show_again_after_close_prompt(&shown_before, &doomed, window, cx)
+            })?;
             if !consent {
                 return anyhow::Ok(());
             }
@@ -906,12 +1007,19 @@ impl MultiWorkspace {
 
             // The replacement is the member before the closed one (else the one after it), loaded
             // or pending; a listed member whose saved data was not found is skipped.
-            let replacement = this.update(cx, |this, cx| {
+            // Issue #77 F3: a replacement is only shown when the closed workspace is the one
+            // shown: it was shown before the close, or the workspace shown then is gone.
+            // Closing a background tab leaves the shown workspace as it was.
+            let (replacement, was_active) = this.update(cx, |this, cx| {
+                let was_active = *this.workspace() == doomed;
                 let members = this.cod_members(cx);
                 let index = members.iter().position(|member| match member {
                     CodMember::Live(workspace) => *workspace == doomed,
                     CodMember::Pending(_) => false,
-                })?;
+                });
+                let Some(index) = index else {
+                    return (None, was_active);
+                };
                 let candidates: Vec<(usize, CodMember)> = members
                     .into_iter()
                     .enumerate()
@@ -923,14 +1031,15 @@ impl MultiWorkspace {
                             }
                     })
                     .collect();
-                candidates
+                let replacement = candidates
                     .iter()
                     .rev()
                     .find(|(position, _)| *position < index)
                     .or_else(|| candidates.iter().find(|(position, _)| *position > index))
-                    .map(|(_, member)| member.clone())
+                    .map(|(_, member)| member.clone());
+                (replacement, was_active)
             })?;
-            match replacement {
+            match replacement.filter(|_| was_active) {
                 Some(CodMember::Live(replacement)) => {
                     this.update_in(cx, |this, window, cx| {
                         this.activate(replacement, None, window, cx);
@@ -942,7 +1051,7 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
-                None => {
+                None if was_active => {
                     cx.update(|_window, cx| {
                         Workspace::new_local(
                             Vec::new(),
@@ -956,6 +1065,8 @@ impl MultiWorkspace {
                     })?
                     .await?;
                 }
+                // Not active: nothing was shown, so nothing needs to replace it.
+                None => {}
             }
 
             this.update(cx, |this, cx| {
@@ -969,6 +1080,20 @@ impl MultiWorkspace {
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Issue #81: shows `previous` again when a close prompt switched from it to `doomed`, the
+    /// workspace being closed, as long as `previous` is still in the window.
+    fn cod_show_again_after_close_prompt(
+        &mut self,
+        previous: &Entity<Workspace>,
+        doomed: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if previous != doomed && self.workspace() == doomed && self.held_index(previous).is_some() {
+            self.activate(previous.clone(), None, window, cx);
+        }
     }
 
     /// The ids to save as the window's workspace list: the held workspaces in window order, then

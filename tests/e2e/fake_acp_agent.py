@@ -22,6 +22,7 @@ Cod starts it as a custom agent from the test settings (`agent_servers`, see `fa
     }
 
 - `session_ids`: the ids `session/new` returns, in order (the provider's own session ids; the app must keep them, never make its own). After the list runs out, `fake-session-<n>` is used.
+- `initialize_wait`: optionally withholds the initialize reply until this file exists in the control folder, to exercise closing a workspace during provider startup.
 - `turns`: one entry per `session/prompt`, in order over all sessions. A prompt without a turn left gets a single chunk "(no scripted reply)" and ends the turn.
 - Steps: `chunk` streams agent text (`agent_message_chunk`), `thought` streams agent thought text, `title` sends `session_info_update` with that title, `permission` sends a pending edit tool call and asks `session/request_permission` (the answer is recorded in the state file), `wait` blocks until the file of that name exists in the control folder, `sleep` waits that many seconds, `end` ends the turn with that stop reason (default `end_turn`), `error` fails the prompt with a JSON-RPC error carrying that message.
 - A turn without `end` or `error` ends with `end_turn` after its last step.
@@ -163,6 +164,10 @@ class Agent:
             return
         params = message.get("params") or {}
         if method == "initialize":
+            initialize_wait = self.script.get("initialize_wait")
+            if initialize_wait:
+                while not (self.control / initialize_wait).exists():
+                    time.sleep(WAIT_POLL)
             self.reply(
                 request_id,
                 {

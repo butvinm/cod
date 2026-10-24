@@ -23,6 +23,7 @@ futures.workspace = true
 gpui.workspace = true
 log.workspace = true
 markdown_preview.workspace = true
+onboarding.workspace = true
 open_path_prompt.workspace = true
 picker.workspace = true
 project_panel.workspace = true

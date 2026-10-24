@@ -25,7 +25,112 @@ const MAX_PENDING_CONSOLE: usize = 64;
 /// Console messages queued for sending and not yet written.
 static PENDING_CONSOLE: AtomicUsize = AtomicUsize::new(0);
 
+/// Logged once, the first time any page's `on_paint` fires on macOS (#23 round 3 diagnosis M2):
+/// off-screen rendering depends on CEF's own UI-thread message loop actually making progress
+/// (round 2 found it was not), so this one line makes the next failure visible without needing a
+/// full frame dump.
+#[cfg(target_os = "macos")]
+static FIRST_FRAME_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Logged once, for the first key event a page gets on macOS (#23 macOS key input), so a smoke
+/// run shows whether key presses reach cod-browser at all. Never the key itself.
+#[cfg(target_os = "macos")]
+static FIRST_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
+
 use protocol::{MAX_URL_BYTES, limited};
+
+/// The macOS virtual key code (`kVK_*`, US ANSI layout) of the key that types `character`, the
+/// character macOS itself puts in that key's events: `\t`, `\r`, 0x7F for backspace, the
+/// `NS*FunctionKey` private-use characters for arrows, Home, End, Page Up and Down, forward
+/// Delete, Insert (Help) and F1 to F12, and printable ASCII, shifted or not. None for anything
+/// else (#23 macOS key input). Only macOS uses it; it is compiled everywhere so its tests run on
+/// every platform.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_virtual_key(character: u16) -> Option<i32> {
+    let code = match character {
+        0x09 => 0x30,
+        0x0A | 0x0D => 0x24,
+        0x1B => 0x35,
+        0x08 | 0x7F => 0x33,
+        0x20 => 0x31,
+        0xF700 => 0x7E,
+        0xF701 => 0x7D,
+        0xF702 => 0x7B,
+        0xF703 => 0x7C,
+        0xF704 => 0x7A,
+        0xF705 => 0x78,
+        0xF706 => 0x63,
+        0xF707 => 0x76,
+        0xF708 => 0x60,
+        0xF709 => 0x61,
+        0xF70A => 0x62,
+        0xF70B => 0x64,
+        0xF70C => 0x65,
+        0xF70D => 0x6D,
+        0xF70E => 0x67,
+        0xF70F => 0x6F,
+        0xF727 | 0xF746 => 0x72,
+        0xF728 => 0x75,
+        0xF729 => 0x73,
+        0xF72B => 0x77,
+        0xF72C => 0x74,
+        0xF72D => 0x79,
+        _ => {
+            let ch = char::from_u32(u32::from(character))?;
+            match ch.to_ascii_lowercase() {
+                'a' => 0x00,
+                's' => 0x01,
+                'd' => 0x02,
+                'f' => 0x03,
+                'h' => 0x04,
+                'g' => 0x05,
+                'z' => 0x06,
+                'x' => 0x07,
+                'c' => 0x08,
+                'v' => 0x09,
+                'b' => 0x0B,
+                'q' => 0x0C,
+                'w' => 0x0D,
+                'e' => 0x0E,
+                'r' => 0x0F,
+                'y' => 0x10,
+                't' => 0x11,
+                '1' | '!' => 0x12,
+                '2' | '@' => 0x13,
+                '3' | '#' => 0x14,
+                '4' | '$' => 0x15,
+                '6' | '^' => 0x16,
+                '5' | '%' => 0x17,
+                '=' | '+' => 0x18,
+                '9' | '(' => 0x19,
+                '7' | '&' => 0x1A,
+                '-' | '_' => 0x1B,
+                '8' | '*' => 0x1C,
+                '0' | ')' => 0x1D,
+                ']' | '}' => 0x1E,
+                'o' => 0x1F,
+                'u' => 0x20,
+                '[' | '{' => 0x21,
+                'i' => 0x22,
+                'p' => 0x23,
+                'l' => 0x25,
+                'j' => 0x26,
+                '\'' | '"' => 0x27,
+                'k' => 0x28,
+                ';' | ':' => 0x29,
+                '\\' | '|' => 0x2A,
+                ',' | '<' => 0x2B,
+                '/' | '?' => 0x2C,
+                'n' => 0x2D,
+                'm' => 0x2E,
+                '.' | '>' => 0x2F,
+                '`' | '~' => 0x32,
+                _ => return None,
+            }
+        }
+    };
+    Some(code)
+}
 
 /// Whether a console line is forwarded at this pending-console backlog (RC review B5, final
 /// batch): an ordinary diagnostic only below `MAX_PENDING_CONSOLE`, a bridge call
@@ -97,13 +202,27 @@ impl PageState {
         self.out.send(Outgoing::Message(message)).ok();
     }
 
+    /// Runs `run` with this page's host, never while holding the `browser` lock (#23 macOS agent
+    /// page hang): on macOS `handle` runs on CEF's own UI thread, where `close_browser(1)` of a
+    /// windowless browser calls `on_before_close` synchronously, and that locks `browser` itself.
+    /// Holding the (non-reentrant) lock across the call deadlocked the UI thread on the first
+    /// page close, so every later page, agent or not, stayed "loading" forever. On Linux the
+    /// same call only posts a task to CEF's own UI thread, so releasing the lock first changes
+    /// nothing there.
     fn with_host(&self, run: impl FnOnce(&BrowserHost)) {
-        let Ok(slot) = self.browser.lock() else {
-            return;
-        };
-        if let Some(host) = slot.as_ref().and_then(|handle| handle.0.host()) {
+        if let Some(host) = self.browser().and_then(|browser| browser.host()) {
             run(&host);
         }
+    }
+
+    /// A reference to this page's browser, taken out of the `browser` lock, so no CEF call made
+    /// with it can re-enter a callback that needs that same lock (see `with_host`).
+    fn browser(&self) -> Option<Browser> {
+        self.browser
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|handle| handle.0.clone())
     }
 
     fn main_frame(&self) -> Option<Frame> {
@@ -130,14 +249,21 @@ wrap_app! {
             command_line: Option<&mut CommandLine>,
         ) {
             let Some(command_line) = command_line else { return };
-            command_line.append_switch_with_value(
-                Some(&"ozone-platform".into()),
-                Some(&"headless".into()),
-            );
+            // Ozone is Chromium's Linux windowing abstraction and "disable the /dev/shm cache" is
+            // a Linux container workaround: neither switch means anything on macOS, which has no
+            // Ozone platform and no /dev/shm, so both stay Linux-only (#23 round 1: widening this
+            // function to macOS must not add switches macOS does not understand).
+            #[cfg(target_os = "linux")]
+            {
+                command_line.append_switch_with_value(
+                    Some(&"ozone-platform".into()),
+                    Some(&"headless".into()),
+                );
+                command_line.append_switch(Some(&"disable-dev-shm-usage".into()));
+            }
             command_line.append_switch(Some(&"disable-gpu".into()));
             command_line.append_switch(Some(&"disable-gpu-compositing".into()));
             command_line.append_switch(Some(&"no-sandbox".into()));
-            command_line.append_switch(Some(&"disable-dev-shm-usage".into()));
         }
     }
 }
@@ -183,6 +309,10 @@ wrap_render_handler! {
             }
             // The same checked size the writer and the reader use, so a bogus size from the engine is dropped before any slice or copy is made.
             let (width, height) = (width as u32, height as u32);
+            #[cfg(target_os = "macos")]
+            if !FIRST_FRAME_LOGGED.swap(true, Ordering::AcqRel) {
+                eprintln!("cod-browser: first frame {width}x{height}");
+            }
             let Ok(length) = protocol::frame_byte_len(width, height) else {
                 eprintln!("cod-browser: dropped a frame of {width}x{height}");
                 return;
@@ -402,12 +532,108 @@ wrap_client! {
     }
 }
 
+/// Runs an arbitrary closure on CEF's own UI thread on macOS (#23 round 3 diagnosis M1).
+///
+/// Linux sets `multi_threaded_message_loop` (see `main`), so CEF spins its own UI thread and
+/// `handle`'s calls into `browser_host_create_browser` and the `BrowserHost`/`Frame` methods,
+/// made from this helper's reader thread, are the documented "callable from any thread" entry
+/// points that mode relies on. `multi_threaded_message_loop` is Windows/Linux only; without it,
+/// macOS round 2 showed the browser gets created (on_after_created still fired) but no further
+/// progress (the page's own HTTP request only reached the fixture server at process shutdown):
+/// evidence that those same calls need to run on the thread actually driving `run_message_loop`
+/// instead. `post_task(ThreadId::UI, ...)` is the marshaling cef-rs's own macOS examples use for
+/// exactly this.
+#[cfg(target_os = "macos")]
+fn post_to_ui_thread(work: impl FnOnce() + Send + 'static) {
+    let work: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::new(Mutex::new(Some(Box::new(work))));
+    post_task(ThreadId::UI, Some(&mut UiTask::new(work)));
+}
+
+#[cfg(target_os = "macos")]
+wrap_task! {
+    struct UiTask {
+        work: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Ok(mut slot) = self.work.lock() else { return };
+            if let Some(work) = slot.take() {
+                work();
+            }
+        }
+    }
+}
+
 fn switch_value(prefix: &str) -> Option<String> {
     std::env::args().find_map(|argument| argument.strip_prefix(prefix).map(str::to_owned))
 }
 
+/// macOS cannot dynamically link against "Chromium Embedded Framework.framework" the ordinary
+/// way (there is no stable on-disk path at link time, since the bundle can be installed
+/// anywhere): the framework has to be `dlopen`-ed at startup, before any other CEF call,
+/// including `api_hash` (#23 round 1). `cef::library_loader::LibraryLoader` resolves the
+/// framework relative to the running executable's own location inside the app bundle: `../
+/// Frameworks` for the main `cod-browser` executable (`Contents/MacOS/cod-browser`), or `../../..`
+/// for a copy running from one of the nested helper bundles this module points at
+/// (`helper_subprocess_path()`, see `script/bundle-cod-mac`). Keeping the returned loader alive
+/// for the rest of `main` matches every CEF Rust example (it unloads the framework on drop).
+///
+/// `is_helper` matches every "Cod Helper*" name (#23 round 4), not only the plain "Cod Helper":
+/// round 3 shipped only that one bundle and saw CEF start, create the browser and then make no
+/// further progress at all (no frame ever painted, no network request until the helper was
+/// killed). Chromium's macOS child-process launching derives a per-process-type executable path
+/// from `Settings::browser_subprocess_path` by inserting " (Type)" before ".app" and before the
+/// final path component whenever that path already looks like it points inside a nested app
+/// bundle, which it does here; it looks for that derived path on its own regardless of what this
+/// module points at, so the renderer, GPU, plugin and alerts process types all failed to launch
+/// (round 4's diagnosis). `script/bundle-cod-mac` now bundles all five names (plain, GPU,
+/// Renderer, Plugin, Alerts), so every one of them needs this same relative-path resolution.
+#[cfg(target_os = "macos")]
+fn load_framework() -> cef::library_loader::LibraryLoader {
+    let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
+    let is_helper = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("Cod Helper"));
+    let loader = cef::library_loader::LibraryLoader::new(&exe, is_helper);
+    if !loader.load() {
+        eprintln!("cod-browser: cannot load the CEF framework next to {}", exe.display());
+        std::process::exit(3);
+    }
+    loader
+}
+
+/// Where CEF should re-launch this same helper for its renderer, GPU and utility subprocesses on
+/// macOS (#23 round 1). This only needs to name the plain "Cod Helper.app": Chromium derives the
+/// four other process-type variants (GPU, Renderer, Plugin, Alerts) from this same path on its
+/// own, inserting " (Type)" before ".app" and before the final path component (see
+/// `load_framework`'s doc comment, round 4 diagnosis); `script/bundle-cod-mac` bundles all five
+/// names so every one of those derived paths actually exists.
+#[cfg(target_os = "macos")]
+fn helper_subprocess_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("cod-browser: cannot read its own executable path");
+    let macos_dir = exe.parent().expect("cod-browser: no Contents/MacOS parent");
+    let contents_dir = macos_dir.parent().expect("cod-browser: no Contents parent");
+    contents_dir
+        .join("Frameworks")
+        .join("Cod Helper.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("Cod Helper")
+}
+
 pub fn main() {
+    // Must happen before any other CEF call on macOS (see `load_framework`); a no-op on Linux,
+    // which links libcef the ordinary way, so `_library` only exists there to be dropped last.
+    #[cfg(target_os = "macos")]
+    let _library = load_framework();
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+    // Round 2 diagnosis (Q3b): must also happen before any other CEF call, for every process type
+    // (browser, renderer, GPU), the same as every cef-rs macOS example. See mac_app's own doc
+    // comment for why skipping this is the likely cause of round 1's silent crash.
+    #[cfg(target_os = "macos")]
+    crate::mac_app::setup();
     let args = cef::args::Args::new();
     let Some(command_line) = args.as_cmd_line() else {
         eprintln!("cod-browser: cannot read the command line");
@@ -450,15 +676,36 @@ pub fn main() {
     let pages: Pages = Arc::new(Mutex::new(HashMap::new()));
 
     let started = Instant::now();
+    // COD_BROWSER_LOG_VERBOSE=1 (#23 round 4 diagnosis H1) raises CEF's own log (cef.log) to
+    // verbose for a smoke run or a manual repro, without changing the production default.
+    let log_severity = if std::env::var("COD_BROWSER_LOG_VERBOSE").is_ok_and(|value| value == "1")
+    {
+        LogSeverity::VERBOSE
+    } else {
+        LogSeverity::WARNING
+    };
     let mut settings = Settings {
         windowless_rendering_enabled: 1,
-        multi_threaded_message_loop: 1,
         no_sandbox: 1,
         root_cache_path: CefString::from(cache.as_str()),
         log_file: CefString::from(format!("{cache}/cef.log").as_str()),
-        log_severity: LogSeverity::WARNING,
+        log_severity,
         ..Default::default()
     };
+    // Only Windows and Linux support `multi_threaded_message_loop` (CEF spins its own UI thread);
+    // on macOS it must stay 0 (the default) and the main thread runs `run_message_loop` instead,
+    // handled below. Round 2 found that macOS still needs `handle`'s calls marshaled onto that
+    // thread (`post_to_ui_thread`, #23 round 3 diagnosis M1), unlike Linux: this is the one
+    // deliberate difference `input_loop` has between the two platforms.
+    #[cfg(target_os = "linux")]
+    {
+        settings.multi_threaded_message_loop = 1;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let helper = helper_subprocess_path();
+        settings.browser_subprocess_path = CefString::from(&*helper.to_string_lossy());
+    }
     if let Ok(dir) = std::env::var("COD_CEF_DIR") {
         settings.resources_dir_path = CefString::from(dir.as_str());
         settings.locales_dir_path = CefString::from(format!("{dir}/locales").as_str());
@@ -492,6 +739,53 @@ pub fn main() {
     std::thread::spawn(move || write_loop(writer_stream, outgoing, writer_pages));
     out.send(Outgoing::Message(FromBrowser::Ready)).ok();
 
+    // Linux has CEF run its own UI thread (`multi_threaded_message_loop` above), so this thread
+    // is free to block reading the control socket directly, exactly as it always has.
+    //
+    // macOS has no such option: CEF's message loop must run on the thread that called
+    // `initialize` (`run_message_loop`, blocking until something calls `quit_message_loop`), so
+    // the control-socket read loop moves to its own thread instead, and this one blocks in
+    // `run_message_loop` until `input_loop` asks it to stop. `handle`'s own CEF calls do not
+    // change: see the `multi_threaded_message_loop` comment above for why they stay safe to call
+    // from this reader thread rather than the one actually running CEF's message loop.
+    #[cfg(target_os = "macos")]
+    {
+        let input_out = out.clone();
+        let input_pages = pages.clone();
+        std::thread::Builder::new()
+            .name("cod-browser-input".into())
+            .spawn(move || {
+                // `input_loop` only returns by calling `std::process::exit` itself (on the
+                // control socket closing), which ends the whole process immediately regardless
+                // of which thread called it, so `run_message_loop` below never actually has to
+                // return through `quit_message_loop`. It is still called here, defensively, in
+                // case `input_loop` is ever changed to return normally instead.
+                input_loop(stream, input_out, input_pages);
+                quit_message_loop();
+            })
+            .expect("cod-browser: cannot start the input thread");
+        // #23 round 3 diagnosis M1: makes it visible in cod-browser's own stderr (collected into
+        // cod-stderr.log) whether this thread ever actually enters and returns from the message
+        // loop, rather than inferring it indirectly from whether pages ever load.
+        eprintln!("cod-browser: entering run_message_loop");
+        run_message_loop();
+        eprintln!("cod-browser: run_message_loop returned");
+        shutdown();
+        std::process::exit(0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    input_loop(stream, out, pages);
+}
+
+/// Reads one `ToBrowser` message at a time from the control socket and runs it, until the socket
+/// closes (Cod exited) or sends something unreadable twice in a row is never the case here:
+/// `ToBrowser::read_from` already resyncs after a single oversized message (RC review B4).
+///
+/// On macOS (#23 round 3 diagnosis M1), this thread only does socket I/O and decoding: every
+/// `handle` call is marshaled onto CEF's own UI thread with `post_to_ui_thread` instead of
+/// running directly here. On Linux this is unchanged: `handle` still runs on this thread, exactly
+/// as before `multi_threaded_message_loop` was added for #16.
+fn input_loop(stream: UnixStream, out: mpsc::Sender<Outgoing>, pages: Pages) {
     let mut input = BufReader::new(stream);
     loop {
         let message = match ToBrowser::read_from(&mut input) {
@@ -509,6 +803,13 @@ pub fn main() {
                 std::process::exit(0);
             }
         };
+        #[cfg(target_os = "macos")]
+        {
+            let out = out.clone();
+            let pages = pages.clone();
+            post_to_ui_thread(move || handle(message, &out, &pages));
+        }
+        #[cfg(not(target_os = "macos"))]
         handle(message, &out, &pages);
     }
 }
@@ -600,6 +901,13 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
             background_color: 0xFFFF_FFFF,
             ..Default::default()
         };
+        // #23 macOS agent page hang: the scheme and length only, never the address itself.
+        #[cfg(target_os = "macos")]
+        eprintln!(
+            "cod-browser: creating page {page} ({} URL, {} bytes)",
+            url.split(':').next().unwrap_or_default(),
+            url.len()
+        );
         let created = browser_host_create_browser(
             Some(&window_info),
             Some(&mut PageClient::new(PageHandler { state })),
@@ -730,11 +1038,24 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
                 protocol::KEY_CHAR => KeyEventType::CHAR,
                 _ => KeyEventType::RAWKEYDOWN,
             };
+            // CEF on macOS ignores `windows_key_code`: it builds an NSEvent from
+            // `native_key_code`, which must be a macOS virtual key code, and treats an event
+            // with no character at all as a modifier change (#23 macOS key input). Cod sends the
+            // key's own character there on macOS (`offscreen.rs`), so the virtual key code comes
+            // from it; Linux keeps the Windows key code, as before.
+            #[cfg(target_os = "macos")]
+            let native_key_code = mac_virtual_key(character).unwrap_or(code);
+            #[cfg(not(target_os = "macos"))]
+            let native_key_code = code;
+            #[cfg(target_os = "macos")]
+            if !FIRST_KEY_LOGGED.swap(true, Ordering::AcqRel) {
+                eprintln!("cod-browser: first key event forwarded");
+            }
             let event = KeyEvent {
                 type_,
                 modifiers,
                 windows_key_code: code,
-                native_key_code: code,
+                native_key_code,
                 character,
                 unmodified_character: character,
                 ..Default::default()
@@ -743,19 +1064,23 @@ fn handle(message: ToBrowser, out: &mpsc::Sender<Outgoing>, pages: &Pages) {
         }
         ToBrowser::Close { .. } => {
             state.close_requested.store(true, Ordering::Release);
+            // #23 macOS agent page hang: shows in cod-stderr.log whether `on_before_close` ("closed
+            // and freed") ran inside this call, which is what deadlocked when the `browser` lock
+            // was still held here.
+            #[cfg(target_os = "macos")]
+            eprintln!("cod-browser: closing page {page}");
             state.with_host(|host| host.close_browser(1));
+            #[cfg(target_os = "macos")]
+            eprintln!("cod-browser: close_browser for page {page} returned");
         }
         ToBrowser::Navigate { action, .. } => {
-            let Ok(slot) = state.browser.lock() else {
-                return;
-            };
-            let Some(handle) = slot.as_ref() else {
+            let Some(browser) = state.browser() else {
                 return;
             };
             match action {
-                protocol::NAVIGATE_BACK => handle.0.go_back(),
-                protocol::NAVIGATE_FORWARD => handle.0.go_forward(),
-                _ => handle.0.reload(),
+                protocol::NAVIGATE_BACK => browser.go_back(),
+                protocol::NAVIGATE_FORWARD => browser.go_forward(),
+                _ => browser.reload(),
             }
         }
     }
@@ -789,6 +1114,33 @@ mod tests {
             &line,
             MAX_PENDING_CONSOLE + protocol::BRIDGE_HEADROOM
         ));
+    }
+
+    // #23 macOS key input: CEF on macOS reads the key from `native_key_code` alone, so Tab and
+    // Enter in a page (the agent page's Tab, Enter submit) need macOS's own key codes, not the
+    // Windows ones Cod sends as `code` (0x09 is kVK_ANSI_V there, 0x0D kVK_ANSI_W).
+    #[test]
+    fn named_keys_get_their_macos_virtual_key_codes() {
+        assert_eq!(mac_virtual_key(u16::from(b'\t')), Some(0x30));
+        assert_eq!(mac_virtual_key(u16::from(b'\r')), Some(0x24));
+        assert_eq!(mac_virtual_key(0x7F), Some(0x33));
+        assert_eq!(mac_virtual_key(0x1B), Some(0x35));
+        assert_eq!(mac_virtual_key(0xF702), Some(0x7B));
+        assert_eq!(mac_virtual_key(0xF728), Some(0x75));
+        assert_eq!(mac_virtual_key(0xF704), Some(0x7A));
+    }
+
+    // Letters, digits and punctuation map by the key that types them, shifted or not, so a key
+    // whose Windows code collides with a named key ('.' and Delete are both 0x2E) stays itself.
+    #[test]
+    fn printable_characters_map_to_the_key_that_types_them() {
+        assert_eq!(mac_virtual_key(u16::from(b'a')), Some(0x00));
+        assert_eq!(mac_virtual_key(u16::from(b'A')), Some(0x00));
+        assert_eq!(mac_virtual_key(u16::from(b'.')), Some(0x2F));
+        assert_eq!(mac_virtual_key(u16::from(b'!')), Some(0x12));
+        assert_eq!(mac_virtual_key(u16::from(b'\'')), Some(0x27));
+        assert_eq!(mac_virtual_key(0), None);
+        assert_eq!(mac_virtual_key(0x00E9), None);
     }
 
     #[test]

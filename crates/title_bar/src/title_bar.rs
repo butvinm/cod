@@ -7,7 +7,7 @@ mod title_bar_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
-use crate::cod_workspace_tabs::{CodTabsLayout, render_cod_workspace_tabs};
+use crate::cod_workspace_tabs::{CodTabsLayout, CodTabsState, render_cod_workspace_tabs};
 use std::{cell::RefCell, rc::Rc};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
@@ -217,6 +217,7 @@ pub struct TitleBar {
     _diagnostics_subscription: Option<gpui::Subscription>,
     /// Cod (#25): the workspace tabs as they were last drawn.
     cod_tabs: Rc<RefCell<CodTabsLayout>>,
+    cod_tabs_state: CodTabsState,
 }
 
 impl Render for TitleBar {
@@ -308,11 +309,11 @@ impl Render for TitleBar {
             }
         }
 
-        let cod_tabs = self.render_cod_tabs(cx);
+        let cod_tabs = self.render_cod_tabs(window, cx);
         children.push(
             h_flex()
-                .h_full()
                 .min_w_0()
+                .h_full()
                 .gap_0p5()
                 .map(|title_bar| {
                     let mut render_project_items = COD_SHOW_ZED_ITEMS
@@ -549,6 +550,7 @@ impl TitleBar {
             screen_share_popover_handle: PopoverMenuHandle::default(),
             _diagnostics_subscription: None,
             cod_tabs: Rc::default(),
+            cod_tabs_state: CodTabsState::default(),
         };
 
         this.observe_diagnostics(cx);
@@ -558,11 +560,13 @@ impl TitleBar {
 
     /// Cod (#25): the workspace tabs and "+", None while the window's workspace list is not
     /// known yet.
-    fn render_cod_tabs(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_cod_tabs(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
         Some(render_cod_workspace_tabs(
             &multi_workspace,
             self.cod_tabs.clone(),
+            &mut self.cod_tabs_state,
+            window,
             cx,
         ))
     }

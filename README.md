@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # Cod
 
 Cod is a desktop workspace for agent-driven development. It is the Zed editor plus a small set of its own: agent chats, web pages in panes, review, a command-line tool and workspaces. It is a personal tool built in the open by one person and a team of agents. It should look and feel like Zed: fast, quiet, keyboard first, very few settings.
@@ -33,6 +36,20 @@ To start Cod from your desktop's app launcher with the Cod icon, run `./cod/inst
 Without a Wayland session (X11), or if the off-screen browser does not work for you, use `./cod/cod-xwayland.sh [url] [folder]` instead. It makes Cod use X11 (through XWayland on a Wayland desktop) with the older WebKitGTK web view.
 
 Both start scripts keep its settings and data in `~/.local/share/cod-preview`, so it never touches your own Zed settings. Zed's log and the program's error output go to `~/.local/share/cod-preview/logs/`, and panics with a backtrace go to `cod-stderr.log` there. If Cod quits unexpectedly, attach the end of `cod-stderr.log` to your report. For a native crash (the window vanishes with no panic in that log), a core dump is available if systemd-coredump is installed and enabled: run `coredumpctl list cod` and `coredumpctl info cod` and attach the `info` output, not the core file. To remove Cod, delete the unpacked `cod` folder and `~/.local/share/cod-preview`.
+
+## macOS (Apple Silicon) preview
+
+The macOS preview is unsigned (ad-hoc signature only, no Apple Developer certificate: code signing and notarization cost money and are a separate decision) and built for Apple Silicon only (no Intel build). The current candidate includes web page tabs and agent-made pages (`codctl open --html`) through the same off-screen browser backend as Linux. Native package acceptance is still required before a new preview is offered for use.
+
+1. Download `cod-macos-aarch64.zip` from the latest macOS preview prerelease on the [Releases](https://github.com/cod-editor/cod/releases) page (a release titled like `macos-preview-N (macOS, Apple Silicon, unsigned)`).
+2. Unzip it and move `Cod.app` to `/Applications`.
+3. Because it is unsigned, the first open needs one extra step: right-click `Cod.app` in Finder, choose Open, then confirm in the dialog. (After that, opening it normally works.) Instead of the right-click, you can also run `xattr -dr com.apple.quarantine /Applications/Cod.app` once in Terminal.
+
+Cod's data lives in `~/Library/Application Support/Cod-preview`, separate from stock Zed's `~/Library/Application Support/Zed`, so installing Cod never touches a stock Zed also on the machine. Zed's log and the app's error output go to `~/Library/Application Support/Cod-preview/logs/cod-stderr.log`.
+
+`codctl` is bundled inside the app, at `/Applications/Cod.app/Contents/MacOS/codctl`. To use it from a terminal, put it on your `PATH`, for example `ln -s /Applications/Cod.app/Contents/MacOS/codctl /usr/local/bin/codctl` (or any folder already on your `PATH`).
+
+The macOS preview is built by `.github/workflows/macos-release.yml`, on a free GitHub-hosted Apple Silicon runner.
 
 ## Building
 

@@ -1,0 +1,1671 @@
+# Builds the Cod preview for Apple Silicon macOS and uploads it to a GitHub prerelease (issue #23).
+# This workflow is separate from linux-release.yml so a macOS build never costs Linux preview
+# minutes, and the other way around.
+#
+# It can only start by hand (workflow_dispatch) or by a push to macos-preview/**: a workflow file
+# that is not yet on the default branch cannot be started by workflow_dispatch alone, so a branch
+# push is the only way to try this workflow itself before it is merged. It never runs on
+# pull_request, so a fork's PR (or any PR) never spends these minutes.
+#
+# The macOS archive is unsigned (ad-hoc signature only, script/bundle-cod-mac): code signing and
+# notarization cost money and need a stakeholder decision (#23 out of scope). It targets Apple
+# Silicon only.
+#
+# #23 round 1 ports Linux's off-screen CEF page-tab backend (cod_browser) to macOS: the CEF
+# runtime is downloaded and cached the same way as linux-release.yml's own CEF steps (CEF_PATH,
+# restored/saved by actions/cache, keyed by CEF version and this platform), and script/bundle-cod-mac
+# packages "Chromium Embedded Framework.framework" plus one helper app bundle inside Cod.app.
+name: macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a macOS preview prerelease when the build and smoke check pass"
+        type: boolean
+        default: false
+      reuse_run_id:
+        description: "Smoke an existing run's unchanged app artifact without compiling or publishing"
+        type: string
+        default: ""
+  push:
+    branches:
+      - "macos-preview/**"
+
+permissions:
+  contents: write
+  actions: read
+
+# Its own group: a macOS run never waits for, or blocks, a Linux release run.
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # No debug info: keeps the link step and the artifact small, as on Linux.
+      CARGO_PROFILE_RELEASE_FAST_DEBUG: "0"
+      # The same two flags as linux-release.yml, minus the Linux-only mold linker flag.
+      RUSTFLAGS: "-C symbol-mangling-version=v0 --cfg tokio_unstable"
+      # The cef crate's build script downloads CEF into here if it is not already present, the
+      # same two variables linux-release.yml uses, so the download is cached the same way.
+      # CEF_VERSION is the distribution version the pinned cef crate resolves to, not the crate's
+      # own semver; it must stay in step with Cargo.toml's `cef = "=154.5.0"` on every platform.
+      CEF_VERSION: 154.0.34
+      CEF_PATH: /Users/runner/cef
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Show disk space
+        run: df -h /
+
+      - name: Recover the unchanged native artifact
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN_ID: ${{ inputs.reuse_run_id }}
+        run: |
+          set -euo pipefail
+          # An observation-only push can consume the corrected package before this
+          # workflow exists on the default branch. No extra build is needed.
+          if [ -z "$REUSE_RUN_ID" ] && [ "$GITHUB_EVENT_NAME" = "push" ] && \
+            [ "$GITHUB_REF" = "refs/heads/macos-preview/remaining-acceptance-20261023" ]; then
+            parent=$(git rev-parse HEAD^)
+            if git diff --quiet "$parent" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py' && \
+              ! git diff --quiet "$parent" HEAD -- .github/workflows/macos-release.yml tests/e2e/macos_candidate_smoke.py; then
+              # Correct the external-file identity observation on the exact7190fac
+              # package. Full application source and bundle identity must still match.
+              REUSE_RUN_ID=39879700726
+            fi
+          fi
+          if [ -z "$REUSE_RUN_ID" ]; then
+            exit 0
+          fi
+          [[ "$REUSE_RUN_ID" =~ ^[0-9]+$ ]]
+          test "${{ inputs.publish }}" != "true"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$REUSE_RUN_ID" > reuse-run.json
+          source_commit=$(python3 -c 'import json; r=json.load(open("reuse-run.json")); assert r["status"] == "completed"; assert r["path"] == ".github/workflows/macos-release.yml"; print(r["head_sha"])')
+          source_number=$(python3 -c 'import json; print(json.load(open("reuse-run.json"))["run_number"])')
+          git fetch --no-tags --depth=1 origin "$source_commit"
+          # Only this workflow and the external smoke driver may differ. Application,
+          # embedded driver, bundler and dependencies must match the retained package.
+          git diff --exit-code "$source_commit" HEAD -- . ':(exclude).github/workflows/macos-release.yml' ':(exclude)tests/e2e/macos_candidate_smoke.py'
+          gh run download "$REUSE_RUN_ID" --repo "$GITHUB_REPOSITORY" --name cod-macos-aarch64
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          mkdir -p dist
+          ditto -x -k cod-macos-aarch64.zip dist
+          echo "commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "run_number=$source_number" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust toolchain
+        if: steps.reuse.outputs.commit == ''
+        run: |
+          rustup toolchain install || rustup show
+          rustc --version
+          cargo --version
+
+      # sccache keeps every compiled crate in the GitHub Actions cache, the same action and
+      # version as linux-release.yml (a different version would need a separate validation).
+      - name: Set up sccache
+        if: steps.reuse.outputs.commit == ''
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.18.0
+
+      # Only the cargo registry and git checkouts, like linux-release.yml; the target folder is
+      # left to sccache. Only a push to macos-preview/** writes the cache (this workflow never
+      # runs on master), so a one-off dispatch run from another branch cannot fill or poison it.
+      - name: Restore the cargo registry cache
+        if: steps.reuse.outputs.commit == ''
+        uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: release-fast
+          cache-targets: false
+          cache-on-failure: true
+          save-if: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') }}
+
+      # remote_server is a Linux-only concern for this preview. cod_browser (the off-screen CEF
+      # page-tab helper) now builds here too (#23 round 1): its cef dependency needs the CEF
+      # download restored below, same as linux-release.yml's own cef-cache step.
+      - name: Restore the CEF download
+        if: steps.reuse.outputs.commit == ''
+        id: cef-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
+      - name: Build (cargo release-fast, sccache)
+        if: steps.reuse.outputs.commit == ''
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          SCCACHE_GHA_RW_MODE: ${{ startsWith(github.ref, 'refs/heads/macos-preview/') && 'READ_WRITE' || 'READ_ONLY' }}
+          RUSTC_WRAPPER: sccache
+        run: |
+          sccache --zero-stats
+          cargo build --locked --profile release-fast -p zed -p codctl -p cod_browser
+          sccache --show-stats
+          df -h /
+
+      - name: Save the CEF download
+        if: steps.reuse.outputs.commit == '' && startsWith(github.ref, 'refs/heads/macos-preview/') && steps.cef-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ env.CEF_VERSION }}-macos-aarch64
+
+      # Finds wherever the cef crate's build script actually put "Chromium Embedded
+      # Framework.framework" under CEF_PATH, instead of assuming its exact subfolder name (that
+      # name is cef-dll-sys's own internal convention, not documented, and guessing it wrong would
+      # fail the bundle step below for a reason this search avoids entirely).
+      - name: Find the downloaded CEF framework
+        if: steps.reuse.outputs.commit == ''
+        run: |
+          set -euo pipefail
+          framework=$(find "$CEF_PATH" -maxdepth 6 -type d -name "Chromium Embedded Framework.framework" | head -n 1)
+          test -n "$framework"
+          echo "Found $framework"
+          echo "CEF_RUNTIME_DIR=$(dirname "$framework")" >> "$GITHUB_ENV"
+
+      - name: Bundle Cod.app (script/bundle-cod-mac)
+        if: steps.reuse.outputs.commit == ''
+        env:
+          COMMIT: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: script/bundle-cod-mac
+
+      # Fails the job on the first problem found, printing enough to diagnose it without a Mac at hand.
+      - name: Bundle checks
+        env:
+          COMMIT: ${{ steps.reuse.outputs.commit || github.sha }}
+          RUN_NUMBER: ${{ steps.reuse.outputs.run_number || github.run_number }}
+        run: |
+          set -euo pipefail
+          app=dist/Cod.app
+
+          echo "== plutil -lint Info.plist =="
+          plutil -lint "$app/Contents/Info.plist"
+
+          echo "== codesign --verify =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # Round 4 diagnosis H3: Chromium derives each subprocess type's own helper path from
+          # Settings::browser_subprocess_path by inserting " (Type)" before ".app" and before the
+          # final path component, regardless of what that path actually names; round 3 shipped
+          # only the plain "Cod Helper.app" and no page ever painted or finished loading, because
+          # every renderer/GPU/plugin/alerts launch silently failed. All five now have to exist.
+          echo "== CEF framework and all five helper bundles are in place (#23 round 1/4) =="
+          framework="$app/Contents/Frameworks/Chromium Embedded Framework.framework"
+          test -d "$framework" || { echo "::error::no CEF framework at $framework"; exit 1; }
+          helpers=()
+          for variant_suffix in "" " (GPU)" " (Renderer)" " (Plugin)" " (Alerts)"; do
+            helper="$app/Contents/Frameworks/Cod Helper$variant_suffix.app/Contents/MacOS/Cod Helper$variant_suffix"
+            test -x "$helper" || { echo "::error::no helper executable at $helper"; exit 1; }
+            helpers+=("$helper")
+          done
+
+          echo "== file: arch must be arm64 =="
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "${helpers[@]}"; do
+            file "$bin"
+            file "$bin" | grep -q "arm64" || {
+              echo "::error::$bin is not an arm64 binary"
+              exit 1
+            }
+          done
+
+          # Besides /System/ and /usr/lib/, a bundled binary may only reference the CEF framework
+          # this same bundle carries, through a path relative to itself (@executable_path, @rpath
+          # or @loader_path); anything else outside the bundle would break once Cod.app moves
+          # (#23 round 1, P3).
+          #
+          # Round 4: only the plain "Cod Helper" is checked here, not the four GPU/Renderer/
+          # Plugin/Alerts copies. They are byte-identical copies of the same cod-browser binary
+          # (script/bundle-cod-mac's make_helper_bundle), so this specific check has nothing more
+          # to learn from them; this runner's otool -L also falls back to a broken "otool-classic"
+          # for a path whose final component has a parenthesized suffix like " (GPU)", reporting
+          # a path with the suffix silently dropped and "No such file or directory" even though
+          # the arch check above (plain `file`, not otool) already found and read the same file
+          # correctly.
+          echo "== otool -L: only /System/, /usr/lib/, and the bundled CEF framework =="
+          for bin in "$app/Contents/MacOS/zed" "$app/Contents/MacOS/codctl" \
+            "$app/Contents/MacOS/cod-browser" "$app/Contents/Frameworks/Cod Helper.app/Contents/MacOS/Cod Helper"; do
+            echo "-- $bin --"
+            otool -L "$bin"
+            other=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
+              | grep -v -E '^(/System/|/usr/lib/|@executable_path/|@rpath/|@loader_path/)' || true)
+            if [ -n "$other" ]; then
+              echo "::error::$bin links libraries outside /System/, /usr/lib/ and the bundle:"
+              printf '%s\n' "$other"
+              exit 1
+            fi
+          done
+
+          echo "== commit stamp =="
+          echo "Expecting commit $COMMIT"
+          count=$(strings "$app/Contents/MacOS/zed" | grep -c "$COMMIT" || true)
+          echo "Found $count occurrence(s) of $COMMIT in the zed binary"
+          [ "$count" -ge 1 ] || { echo "::error::the zed binary does not contain the full commit $COMMIT"; exit 1; }
+          stamped=$(cat "$app/Contents/Resources/cod-commit.txt")
+          [ "$stamped" = "$COMMIT" ] || { echo "::error::cod-commit.txt has '$stamped', expected '$COMMIT'"; exit 1; }
+          plist_commit=$(plutil -extract CodCommit raw "$app/Contents/Info.plist")
+          [ "$plist_commit" = "$COMMIT" ] || { echo "::error::Info.plist's CodCommit has '$plist_commit', expected '$COMMIT'"; exit 1; }
+
+          echo "== version fields (#23 AC-R7: Apple requires CFBundleVersion to be numeric) =="
+          short_version=$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")
+          bundle_version=$(plutil -extract CFBundleVersion raw "$app/Contents/Info.plist")
+          echo "CFBundleShortVersionString=$short_version CFBundleVersion=$bundle_version"
+          [ "$short_version" = "0.0.1" ] || { echo "::error::CFBundleShortVersionString is '$short_version', expected '0.0.1'"; exit 1; }
+          case "$bundle_version" in
+            ''|*[!0-9]*) echo "::error::CFBundleVersion '$bundle_version' is not a plain numeric string"; exit 1 ;;
+          esac
+          [ "$bundle_version" = "$RUN_NUMBER" ] || { echo "::error::CFBundleVersion is '$bundle_version', expected the run number '$RUN_NUMBER'"; exit 1; }
+
+          echo "== zip checksum =="
+          test -f cod-macos-aarch64.zip
+          test -f cod-macos-aarch64.zip.sha256
+          cat cod-macos-aarch64.zip.sha256
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+
+      # Tests the shipped zip, not the build tree: extracts it fresh with ditto (keeping the
+      # signature's extended attributes), verifies the extracted signature, and opens Cod.app the
+      # way Finder does (open -n) with an isolated, temporary data folder, waiting for the window
+      # before poking at it with codctl. A crash report for one of Cod's own executables, created
+      # after this run's own launch, also fails the job, even if the process looked alive below.
+      - name: Smoke test the zip
+        id: smoke
+        run: |
+          set -uo pipefail
+
+          # AC-R5: ditto -x -k (not unzip) restores the code signature's extended attributes, so
+          # codesign --verify below checks the same bits a user's double-click-to-unzip would
+          # produce, not a copy unzip silently stripped the signature from.
+          work=$(mktemp -d)
+          ditto -x -k cod-macos-aarch64.zip "$work"
+          app="$work/Cod.app"
+
+          mkdir -p smoke-artifacts
+          status=0
+
+          echo "== codesign --verify on the extracted bundle =="
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # AC-R1: --user-data-dir must isolate Cod's logs and cache too, not only its config and
+          # application data, so a stock Zed on the same Mac keeps its own
+          # ~/Library/Logs/Zed and ~/Library/Caches/Zed untouched. Checked both before and after
+          # the run: if either already existed before Cod ever started, the after-comparison
+          # below could not tell Cod's own write apart from a pre-existing one.
+          stock_logs="$HOME/Library/Logs/Zed"
+          stock_cache="$HOME/Library/Caches/Zed"
+          echo "== stock Zed folders before launch (must not exist) =="
+          [ -e "$stock_logs" ] && echo "exists: $stock_logs" || echo "absent: $stock_logs"
+          [ -e "$stock_cache" ] && echo "exists: $stock_cache" || echo "absent: $stock_cache"
+          if [ -e "$stock_logs" ] || [ -e "$stock_cache" ]; then
+            echo "::error::a stock Zed folder already exists before Cod even launched; this runner cannot tell Cod's own writes apart from a pre-existing folder"
+            status=1
+          fi
+
+          # AC-R2: a stock Zed Stable on the same Mac, for the same user, must not stop Cod from
+          # starting (and the other way around: Cod must not stop a stock Zed from starting
+          # either). Fakes the stock Zed Stable single-instance listener at the exact port
+          # crates/zed/src/zed/mac_only_instance.rs's address() computes for this user (port base
+          # 43737 + 200, the Stable channel's block, then + the user ID wrapped the same way),
+          # answering with stock Zed's own handshake text, before Cod ever starts.
+          uid=$(id -u)
+          fake_zed_port=$(python3 -c "
+          port = 43737 + 200
+          max_uid = 65535 - port
+          print(port + ($uid % max_uid))
+          ")
+          echo "Faking a stock Zed Stable instance on 127.0.0.1:$fake_zed_port (uid $uid)"
+          python3 -c "
+          import socket
+          s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(('127.0.0.1', $fake_zed_port))
+          s.listen(5)
+          while True:
+              conn, _ = s.accept()
+              try:
+                  conn.sendall(b'Zed Editor Stable Instance Running')
+              finally:
+                  conn.close()
+          " &
+          fake_zed_pid=$!
+
+          # GitHub Actions runs this step as `bash -eo pipefail`, on top of this script's own
+          # `set -uo pipefail`, so `ls <missing dir>` would abort the whole step right here
+          # before Cod is even launched (its own nonzero exit survives a pipe under pipefail,
+          # and -e then exits the script, since it is a plain command, not part of an if/while
+          # condition). `[ -d ... ]` is not: a missing ~/Library/Logs/DiagnosticReports reads as
+          # no reports yet, not as a reason to stop (#23 AC-R4).
+          launch_epoch=$(date +%s)
+
+          # AC-R5: launch it the way Finder does (open -n), not by executing the inner binary
+          # directly. Require per-launch environment support: falling back to plain open
+          # discards the fixture, isolated data path and driver socket. Help's exit status
+          # under pipefail is not a reliable capability probe. Retain an actual launch error.
+          data=$(mktemp -d)/cod-preview-smoke
+          mkdir -p "$data"
+          driver_dir=$(mktemp -d /tmp/cod-mac-XXXXXX)
+          python3 tests/e2e/macos_candidate_smoke.py prepare "$data"
+          if ! open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
+            --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" --args "$data/project" \
+            > smoke-artifacts/open-launch.txt 2>&1; then
+            echo "::error::Cannot launch the isolated native smoke with its driver environment"
+            cat smoke-artifacts/open-launch.txt
+            kill "$fake_zed_pid" 2>/dev/null || true
+            exit 1
+          fi
+          sleep 20
+          if [ ! -S "$driver_dir/driver.sock" ]; then
+            echo "::error::The isolated app did not create its required driver socket"
+            status=1
+          fi
+
+          # open -n returns as soon as launchd takes over, so its own $! is already gone; the
+          # launcher script (Contents/MacOS/cod) execs zed in place (same PID, new process
+          # image), so the running process is found by the extracted bundle's own zed path.
+          pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+          if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::Cod is not running 20 seconds after open -n (no process matches $app/Contents/MacOS/zed); a stock Zed Stable instance on the same port may have been mistaken for Cod itself (AC-R2)"
+            status=1
+          fi
+
+          echo "== stock Zed folders after the run (must still not exist) =="
+          if [ -e "$stock_logs" ]; then
+            echo "::error::$stock_logs exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_logs"
+          fi
+          if [ -e "$stock_cache" ]; then
+            echo "::error::$stock_cache exists after the run; Cod wrote outside its data folder"
+            status=1
+          else
+            echo "absent: $stock_cache"
+          fi
+
+          # AC-R6: only a report for one of Cod's own executables (zed, cod, codctl), created
+          # after this run's launch_epoch, counts; an unrelated background process's crash
+          # report must not fail a healthy Cod run. macOS names a report after the crashed
+          # process (for example zed-2026-01-01-120000.ips), so the file name is matched, not
+          # its content (a crash report can be large, and the name is already specific enough).
+          echo "== crash reports for Cod's own executables since launch =="
+          new_reports=""
+          if [ -d ~/Library/Logs/DiagnosticReports ]; then
+            while IFS= read -r -d '' report; do
+              mtime=$(stat -f %m "$report" 2>/dev/null || echo 0)
+              if [ "$mtime" -ge "$launch_epoch" ]; then
+                new_reports="$new_reports$report"$'\n'
+              fi
+            done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
+              \( -iname 'zed-*' -o -iname 'cod-*' -o -iname 'codctl-*' \) -print0 2>/dev/null)
+          fi
+          if [ -n "$new_reports" ]; then
+            echo "::error::a crash report for one of Cod's own executables appeared since launch:"
+            printf '%s' "$new_reports" | tee smoke-artifacts/new-crash-reports.txt
+            status=1
+          else
+            echo "none"
+          fi
+
+          echo "== codctl workspace list (proves the command server answers) =="
+          if "$app/Contents/MacOS/codctl" workspace list > smoke-artifacts/codctl-workspace-list.txt 2>&1; then
+            echo "codctl answered:"
+            cat smoke-artifacts/codctl-workspace-list.txt
+          else
+            echo "::error::codctl workspace list failed; Cod's command server did not answer"
+            cat smoke-artifacts/codctl-workspace-list.txt || true
+            status=1
+          fi
+
+          # #23 round 1, P4: a real page tab, end to end, through the ported off-screen CEF
+          # backend. The fixture is invented data (no captured real page, per the public-repo
+          # rule), with a distinct title so the read-back cannot be confused with a stale or
+          # unrelated page.
+          #
+          # Round 4 diagnosis H2: opened as a file:// URL, not served over HTTP. python3 -m
+          # http.server, even bound to 127.0.0.1 only (round 2's own fix), still made macOS ask
+          # "Allow Python to find devices on local networks?" in round 3's screenshot, a dialog
+          # that has nothing to do with page tabs; file:// removes that python process entirely.
+          # codctl open's own CLI parsing already treats anything containing "://" as a URL (not a
+          # file path to open as a Zed editor tab), and page_control::open passes it to CEF
+          # unvalidated, the same as any other scheme.
+          echo "== page tab: write a local fixture =="
+          fixture_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac page smoke</title></head>' \
+            '<body><h1>Cod Mac page smoke</h1></body>' \
+            '</html>' \
+            > "$fixture_dir/index.html"
+          fixture_url="file://$fixture_dir/index.html"
+
+          echo "== page tab: codctl open =="
+          page_id=""
+          if "$app/Contents/MacOS/codctl" open "$fixture_url" \
+            > smoke-artifacts/codctl-open.txt 2>&1; then
+            page_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open.txt)
+            echo "codctl open reported page id: $page_id"
+          else
+            echo "::error::codctl open failed to open the local page fixture"
+            cat smoke-artifacts/codctl-open.txt || true
+            status=1
+          fi
+          if [ -z "$page_id" ]; then
+            echo "::error::codctl open printed no page id"
+            status=1
+          fi
+
+          # Round 4 diagnosis H1: a snapshot of cod-browser's and every "Cod Helper" process at
+          # 5s and 20s after codctl open, evidence for whether the renderer/GPU/plugin/alerts
+          # subprocesses actually started (round 4's own fix, H3, bundles all five helper names).
+          snapshot_helpers() {
+            ps -axo pid,ppid,etime,command | grep -iE 'cod-browser|Cod Helper' | grep -v grep \
+              > "smoke-artifacts/ps-${1}s.txt" || echo "(no matching process)" > "smoke-artifacts/ps-${1}s.txt"
+            echo "-- ps at ${1}s --"
+            cat "smoke-artifacts/ps-${1}s.txt"
+          }
+
+          # Round 2 diagnosis Q1: round 1's smoke test read the page back once, a few seconds
+          # after opening it, while it still said state "loading" (and passed anyway, because it
+          # only checked for the title or URL, both already known before the page ever loaded).
+          # This polls for up to 30 s and requires state "loaded" and the fixture's exact title,
+          # so a page that never finishes loading (or whose helper has died) fails here instead of
+          # looking like a pass.
+          echo "== page tab: codctl page get (poll up to 30s for state=loaded) =="
+          loaded=0
+          if [ -n "$page_id" ]; then
+            for _attempt in $(seq 1 30); do
+              if "$app/Contents/MacOS/codctl" page get "$page_id" --json \
+                > smoke-artifacts/codctl-page-get.txt 2>&1; then
+                state=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('state', ''))" 2> /dev/null || echo "")
+                title=$(python3 -c "import json; print(json.load(open('smoke-artifacts/codctl-page-get.txt')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$state" = "loaded" ] && [ "$title" = "Cod Mac page smoke" ]; then
+                  loaded=1
+                  snapshot_helpers "$_attempt"
+                  break
+                fi
+                if [ "$state" = "failed" ]; then
+                  echo "codctl page get reported state=failed, not waiting out the rest of the 30s"
+                  snapshot_helpers "$_attempt"
+                  break
+                fi
+              fi
+              if [ "$_attempt" = "5" ] || [ "$_attempt" = "20" ]; then
+                snapshot_helpers "$_attempt"
+              fi
+              sleep 1
+            done
+          fi
+          echo "codctl page get (last read):"
+          cat smoke-artifacts/codctl-page-get.txt 2> /dev/null || echo "(no output captured)"
+          if [ -z "$page_id" ]; then
+            echo "::error::no page id to read back (codctl open did not report one)"
+            status=1
+          elif [ "$loaded" != "1" ]; then
+            echo "::error::codctl page get never reported state=loaded with title 'Cod Mac page smoke' within 30s"
+            status=1
+          else
+            echo "page tab loaded: state=loaded title='Cod Mac page smoke'"
+          fi
+
+          # Round 2 diagnosis Q1: the screenshot is taken after the poll above, once the page has
+          # either loaded or the 30s have run out, not a few seconds after codctl open.
+          echo "== screenshot =="
+          if screencapture -x smoke-artifacts/screen.png; then
+            echo "Saved smoke-artifacts/screen.png"
+          else
+            echo "::error::screencapture failed: this runner may have no GUI session or no window opened (report this explicitly, do not pass silently)"
+            status=1
+          fi
+
+          # Round 5: a one-shot helper for "poll codctl page get for state=loaded and an exact
+          # title", shared by P1, P3's reload wait and P4, without touching the round 1-4 poll
+          # above (already proven working, left alone).
+          poll_page_loaded() {
+            poll_page_id=$1
+            poll_expected_title=$2
+            poll_outfile=$3
+            poll_timeout=${4:-30}
+            poll_i=0
+            while [ "$poll_i" -lt "$poll_timeout" ]; do
+              if "$app/Contents/MacOS/codctl" page get "$poll_page_id" --json > "$poll_outfile" 2>&1; then
+                poll_state=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('state', ''))" 2> /dev/null || echo "")
+                poll_title=$(python3 -c "import json; print(json.load(open('$poll_outfile')).get('title') or '')" 2> /dev/null || echo "")
+                if [ "$poll_state" = "loaded" ] && [ "$poll_title" = "$poll_expected_title" ]; then
+                  return 0
+                fi
+                if [ "$poll_state" = "failed" ]; then
+                  return 1
+                fi
+              fi
+              sleep 1
+              poll_i=$((poll_i + 1))
+            done
+            return 1
+          }
+
+          # #23 round 5, P1: a page on the open internet, the same way a real agent-made link
+          # would be. Skipped, not failed, if this runner has no internet access.
+          echo "== round 5 P1: internet page (codctl open https://example.com/) =="
+          if curl -s -m 5 -o /dev/null https://example.com/; then
+            if "$app/Contents/MacOS/codctl" open "https://example.com/" \
+              > smoke-artifacts/codctl-open-p1.txt 2>&1; then
+              p1_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p1.txt)
+              if poll_page_loaded "$p1_id" "Example Domain" smoke-artifacts/codctl-page-get-p1.txt 30; then
+                echo "P1 PASS: https://example.com/ reported state=loaded title='Example Domain'"
+              else
+                echo "::error::P1 FAIL: https://example.com/ never reported state=loaded title='Example Domain' within 30s"
+                status=1
+              fi
+              cat smoke-artifacts/codctl-page-get-p1.txt 2> /dev/null || true
+              "$app/Contents/MacOS/codctl" page close "$p1_id" > /dev/null 2>&1 || true
+            else
+              echo "::error::P1 FAIL: codctl open https://example.com/ failed"
+              cat smoke-artifacts/codctl-open-p1.txt || true
+              status=1
+            fi
+          else
+            echo "P1 SKIP: no internet access on this runner (curl could not reach https://example.com/ in 5s)"
+          fi
+
+          # Round 6: the 300 KB total screenshot budget leaves no room for full-size captures of a
+          # large runner display, so every extra capture is scaled down and recompressed in place.
+          shrink_jpg() {
+            sips -Z 1280 -s format jpeg -s formatOptions 50 "$1" --out "$1" > /dev/null 2>&1 \
+              || echo "::warning::could not shrink $1"
+          }
+
+          # Round 6: a stack sample of cod-browser, taken when a page never loads, so the next hang
+          # shows which thread is stuck where instead of only "state=loading".
+          sample_browser() {
+            browser_pid=$(pgrep -f "$app/Contents/MacOS/cod-browser" | head -n 1)
+            if [ -n "$browser_pid" ]; then
+              sample "$browser_pid" 2 -file "smoke-artifacts/cod-browser-sample-$1.txt" > /dev/null 2>&1 \
+                || echo "::warning::sample of cod-browser ($browser_pid) failed"
+            else
+              echo "no cod-browser process to sample"
+            fi
+          }
+
+          # #23 round 5, P2 (round 6: the fixture has its own <title>): an agent-made page (#43).
+          # JS off by default is checked three ways. The inline script would change the title and
+          # call the submit bridge action (which also closes the tab, see
+          # crates/web_view/src/offscreen.rs's run_bridge_action), and an inline onerror handler
+          # would change the title too. So the page must reach state=loaded with the document's
+          # own title, unchanged, and still be open and unchanged after settling.
+          echo "== round 5 P2: agent-made page (#43), JS off by default =="
+          agent_dir=$(mktemp -d)
+          agent_title="Cod Mac agent page smoke"
+          printf '%s\n' \
+            '<!doctype html><html><head><meta charset="utf-8"><title>Cod Mac agent page smoke</title></head>' \
+            '<body style="margin:0">' \
+            '<h1 id="heading">Cod Mac agent page smoke</h1>' \
+            '<input id="answer" type="text" autofocus value="mac-agent-smoke">' \
+            '<button data-cod="erase-everything">Not in the allowlist</button>' \
+            '<button data-cod="submit" data-cod-value-from="#answer">Send</button>' \
+            '<img src="cod-missing.png" alt="" width="1" height="1" onerror="document.title=&quot;handler-ran&quot;">' \
+            '<script>document.title = "script-ran"; if (window.cod) { window.cod.call("submit", {value: "script-ran"}); }</script>' \
+            '</body></html>' \
+            > "$agent_dir/ask.html"
+          p2_id=""
+          if "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" \
+            > smoke-artifacts/codctl-open-p2.txt 2>&1; then
+            p2_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p2.txt)
+            echo "codctl open --html reported page id: $p2_id"
+            if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2.txt 30; then
+              echo "P2 loaded: state=loaded title='$agent_title' (the document's own title)"
+              sleep 3
+              if poll_page_loaded "$p2_id" "$agent_title" smoke-artifacts/codctl-page-get-p2-after-settle.txt 1; then
+                echo "P2 PASS (JS off by default): after settling the agent page is still open, loaded and titled '$agent_title', so neither the inline script nor the inline onerror handler ran"
+              else
+                echo "::error::P2 FAIL: after settling the agent page closed itself, became unreachable or changed its title without --js; page JavaScript may have run"
+                cat smoke-artifacts/codctl-page-get-p2-after-settle.txt 2> /dev/null || true
+                status=1
+              fi
+            else
+              echo "::error::P2 FAIL: the agent page never reported state=loaded with title '$agent_title' within 30s"
+              sample_browser p2
+              status=1
+            fi
+            cat smoke-artifacts/codctl-page-get-p2.txt 2> /dev/null || true
+            echo
+            # -t jpg: the 300 KB total screenshot budget for this round leaves little room for a
+            # second full-resolution PNG next to the existing screen.png.
+            if screencapture -x -t jpg smoke-artifacts/screen-agent-page.jpg 2> /dev/null; then
+              shrink_jpg smoke-artifacts/screen-agent-page.jpg
+            else
+              echo "::warning::P2 screenshot failed"
+            fi
+            "$app/Contents/MacOS/codctl" page close "$p2_id" > /dev/null 2>&1 || true
+          else
+            echo "::error::P2 FAIL: codctl open --html failed"
+            cat smoke-artifacts/codctl-open-p2.txt || true
+            status=1
+          fi
+
+          # #23 round 6, P2b: the same agent page's actions, through `codctl open --html --wait`
+          # and real key presses (System Events), the same Tab and Enter the Linux e2e test's AC2
+          # uses: Tab from the autofocused field to the disallowed "erase-everything" button and
+          # Enter (refused, logged, the page stays open), then Tab to the allowed "submit" button
+          # and Enter (codctl prints the field's value and exits 0). No new input system: the keys
+          # reach the page the ordinary way, through Cod's window. If this runner does not let
+          # osascript send keystrokes, that is reported as a gap, not faked.
+          echo "== round 6 P2b: agent page actions by keyboard (codctl open --html --wait) =="
+          p2b_out=smoke-artifacts/codctl-open-p2b-wait.txt
+          p2b_log=smoke-artifacts/osascript-p2b.txt
+          : > "$p2b_log"
+          "$app/Contents/MacOS/codctl" open --html "$agent_dir/ask.html" --wait \
+            > "$p2b_out" 2> smoke-artifacts/codctl-open-p2b-wait-stderr.txt &
+          p2b_pid=$!
+          # --wait prints no page id; page ids count up within one Cod session, so this page is
+          # the one after P2's.
+          p2b_id=""
+          case "$p2_id" in
+            page-[0-9] | page-[0-9][0-9] | page-[0-9][0-9][0-9]) p2b_id="page-$(( ${p2_id#page-} + 1 ))" ;;
+          esac
+          send_key() {
+            osascript -e "tell application \"System Events\" to key code $1" >> "$p2b_log" 2>&1
+          }
+          zed_log_now() {
+            find "$data" -iname "Zed.log" 2>/dev/null | head -n 1
+          }
+          if [ -z "$p2b_id" ]; then
+            echo "::error::P2b FAIL: no page id from P2 to derive the --wait page's id from"
+            status=1
+          elif ! poll_page_loaded "$p2b_id" "$agent_title" smoke-artifacts/codctl-page-get-p2b.txt 30; then
+            echo "::error::P2b FAIL: the --wait agent page ($p2b_id) never reported state=loaded with title '$agent_title' within 30s"
+            cat smoke-artifacts/codctl-page-get-p2b.txt 2> /dev/null || true
+            sample_browser p2b
+            status=1
+          elif sleep 2 && ! kill -0 "$p2b_pid" 2>/dev/null; then
+            echo "::error::P2b FAIL: codctl open --html --wait exited before any key was pressed; page JavaScript may have submitted on its own"
+            cat "$p2b_out" || true
+            status=1
+          elif ! osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $pid) to true" >> "$p2b_log" 2>&1 \
+            || ! sleep 1 || ! send_key 48 || ! sleep 0.5 || ! send_key 36; then
+            echo "P2b GAP: this runner refused synthetic key presses (osascript/System Events, accessibility permission), so the allowed and the disallowed action could not be triggered here; they need a real click or key press on macOS by QA."
+            cat "$p2b_log"
+          else
+            # Tab, Enter on "erase-everything": refused in Cod and logged, the page stays open.
+            p2b_refused=0
+            for _attempt in $(seq 1 10); do
+              p2b_zed_log=$(zed_log_now)
+              if [ -n "$p2b_zed_log" ] && grep -F "$p2b_id refused the action \"erase-everything\"" "$p2b_zed_log" > smoke-artifacts/p2b-refused.txt 2>/dev/null; then
+                p2b_refused=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_refused" = "1" ] && kill -0 "$p2b_pid" 2>/dev/null; then
+              echo "P2b PASS (disallowed action refused): Cod logged:"
+              cat smoke-artifacts/p2b-refused.txt
+            else
+              echo "::error::P2b FAIL: no refusal of \"erase-everything\" logged for $p2b_id within 10s of Tab, Enter (or codctl --wait exited on it)"
+              status=1
+            fi
+            # Tab, Enter on "submit": codctl prints the field's value and exits 0.
+            send_key 48 && sleep 0.5 && send_key 36 || true
+            p2b_done=0
+            for _attempt in $(seq 1 15); do
+              if ! kill -0 "$p2b_pid" 2>/dev/null; then
+                p2b_done=1
+                break
+              fi
+              sleep 1
+            done
+            if [ "$p2b_done" = "1" ]; then
+              # `|| ...`: GitHub runs this step with bash -e, so a nonzero wait must not end it.
+              p2b_exit=0
+              wait "$p2b_pid" || p2b_exit=$?
+              p2b_value=$(cat "$p2b_out")
+              if [ "$p2b_exit" = "0" ] && [ "$p2b_value" = "mac-agent-smoke" ]; then
+                echo "P2b PASS (allowed action): codctl open --html --wait exited 0 and printed '$p2b_value'"
+              else
+                echo "::error::P2b FAIL: codctl open --html --wait exited $p2b_exit with '$p2b_value', expected 0 and 'mac-agent-smoke'"
+                status=1
+              fi
+            else
+              echo "::error::P2b FAIL: codctl open --html --wait did not exit within 15s of Tab, Enter on the submit button"
+              status=1
+            fi
+            if [ -n "$(cat "$p2b_log")" ]; then
+              echo "osascript said:"
+              cat "$p2b_log"
+            fi
+          fi
+          if kill -0 "$p2b_pid" 2>/dev/null; then
+            kill "$p2b_pid" 2>/dev/null || true
+          fi
+          if [ -n "$p2b_id" ]; then
+            "$app/Contents/MacOS/codctl" page close "$p2b_id" > /dev/null 2>&1 || true
+          fi
+
+          # The shared driver uses native GPUI input, while System Events above is OS input.
+          # Exercise missing paths on this same extracted signed app, before restart.
+          if ! COD_PREVIEW_DIR="$data" python3 tests/e2e/macos_candidate_smoke.py exercise \
+            "$data" "$driver_dir/driver.sock" "$app/Contents/MacOS/codctl" smoke-artifacts \
+            > smoke-artifacts/mac-candidate-smoke.log 2>&1; then
+            echo "::error::Mac candidate input/history/file/chat workflow failed"
+            status=1
+          fi
+          cat smoke-artifacts/mac-candidate-smoke.log
+
+          # Retain the previously lost CLI error without changing the external fixture
+          # or the failing scenario. Compare with the existing visible-project file.
+          if [ -f "$data/reference.txt" ]; then
+            file_exit=0
+            "$app/Contents/MacOS/codctl" open "$data/reference.txt" \
+              > smoke-artifacts/external-file-stdout.txt 2> smoke-artifacts/external-file-stderr.txt || file_exit=$?
+            echo "$file_exit" > smoke-artifacts/external-file-exit.txt
+            echo "External-file diagnostic exit=$file_exit"
+            cat smoke-artifacts/external-file-stderr.txt
+            control_exit=0
+            "$app/Contents/MacOS/codctl" open "$data/project/README.md" \
+              > smoke-artifacts/project-file-stdout.txt 2> smoke-artifacts/project-file-stderr.txt || control_exit=$?
+            echo "$control_exit" > smoke-artifacts/project-file-exit.txt
+            echo "Visible-project control exit=$control_exit"
+          fi
+
+          # #23 round 5, P3: codctl page reload, back, forward and close, reusing the already
+          # loaded page from the P1-round page tab test above.
+          echo "== round 5 P3: codctl parity (reload, back, forward, close) =="
+          if [ -n "$page_id" ] && [ "$loaded" = "1" ]; then
+            if "$app/Contents/MacOS/codctl" page reload "$page_id" > smoke-artifacts/codctl-page-reload.txt 2>&1; then
+              echo "P3 reload: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page reload failed"
+              cat smoke-artifacts/codctl-page-reload.txt
+              status=1
+            fi
+            poll_page_loaded "$page_id" "Cod Mac page smoke" smoke-artifacts/codctl-page-get-after-reload.txt 15 \
+              || echo "::warning::the page did not report state=loaded again within 15s of reload"
+            cat smoke-artifacts/codctl-page-get-after-reload.txt 2> /dev/null || true
+            if "$app/Contents/MacOS/codctl" page back "$page_id" > smoke-artifacts/codctl-page-back.txt 2>&1; then
+              echo "P3 back: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page back failed"
+              cat smoke-artifacts/codctl-page-back.txt
+              status=1
+            fi
+            if "$app/Contents/MacOS/codctl" page forward "$page_id" > smoke-artifacts/codctl-page-forward.txt 2>&1; then
+              echo "P3 forward: exit 0"
+            else
+              echo "::error::P3 FAIL: codctl page forward failed"
+              cat smoke-artifacts/codctl-page-forward.txt
+              status=1
+            fi
+            echo "P3 LIMIT: codctl has no command to navigate an existing page tab to a second URL (open always opens a new tab), so back and forward are only checked here at the command level (exit 0, same result shape as Linux's shared page_control.rs code): real history needs an in-page link click, the same gap P2 reports."
+            if "$app/Contents/MacOS/codctl" page close "$page_id" --json > smoke-artifacts/codctl-page-close.txt 2>&1; then
+              echo "P3 close:"
+              cat smoke-artifacts/codctl-page-close.txt
+            else
+              echo "::error::P3 FAIL: codctl page close failed"
+              cat smoke-artifacts/codctl-page-close.txt
+              status=1
+            fi
+          else
+            echo "::error::P3 FAIL: no loaded page from the P1-round page tab test to exercise reload/back/forward/close on"
+            status=1
+          fi
+
+          # #23 round 5, P4: persistence across a restart. Opened now, while Cod is still running
+          # from this run's first launch, then checked again after quitting and relaunching Cod
+          # with the same --user-data-dir (the restore mechanism is not a test-only path: it is
+          # the ordinary default behavior of a real restart).
+          echo "== round 5 P4: open a page to check after a restart =="
+          snapshot_restart() {
+            snapshot_status=0
+            python3 - "$data" "$driver_dir/driver.sock" "$app/Contents/MacOS/codctl" "$1" <<'PY'
+          import json, pathlib, signal, sqlite3, subprocess, sys, time
+          sys.path.insert(0, 'tests/e2e')
+          from cod_e2e import Driver
+          data, socket, codctl, label = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+          out = pathlib.Path('smoke-artifacts') / ('restart-' + label)
+          out.mkdir(exist_ok=True)
+          report = {'data': str(data.resolve()), 'socket': str(socket), 'databases': [], 'errors': []}
+          def expired(*_):
+              raise TimeoutError('20s diagnostic snapshot deadline')
+          deadline = time.monotonic() + 20
+          def backup_progress(*_):
+              if time.monotonic() >= deadline:
+                  expired()
+          signal.signal(signal.SIGALRM, expired)
+          signal.alarm(20)
+          try:
+              report['settings'] = (data / 'config/settings.json').read_text()
+              try:
+                  result = subprocess.run([codctl, 'workspace', 'list', '--json'], capture_output=True, text=True, timeout=5)
+                  report['workspaces'] = {'exit': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+              except Exception as error:
+                  report['workspaces_error'] = repr(error)
+              if socket.exists():
+                  driver = None
+                  try:
+                      driver = Driver(socket)
+                      (out / 'driver-state.json').write_text(json.dumps(driver.state(), indent=2))
+                  except Exception as error:
+                      report['driver_error'] = repr(error)
+                  finally:
+                      if driver is not None:
+                          driver.close()
+              for index, path in enumerate(sorted((data / 'db').rglob('*'))):
+                  source = saved = None
+                  entry = {'path': str(path.relative_to(data)), 'tables': {}}
+                  try:
+                      backup_progress()
+                      if not path.is_file():
+                          continue
+                      with path.open('rb') as stream:
+                          if stream.read(16) != b'SQLite format 3\x00':
+                              continue
+                      report['databases'].append(entry)
+                      source = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=3)
+                      saved = sqlite3.connect(out / ('database-' + str(index) + '.sqlite'))
+                      source.backup(saved, pages=128, progress=backup_progress)
+                      tables = {row[0] for row in saved.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                      for table in ('cod_pages', 'workspaces', 'items', 'panes', 'kv_store', 'scoped_kv_store'):
+                          if table in tables:
+                              cursor = saved.execute('SELECT * FROM "' + table + '"')
+                              entry['tables'][table] = {'columns': [c[0] for c in cursor.description], 'rows': cursor.fetchall()}
+                  except Exception as error:
+                      report['errors'].append({'path': str(path), 'error': repr(error)})
+                      if isinstance(error, TimeoutError):
+                          break
+                  finally:
+                      if source is not None:
+                          source.close()
+                      if saved is not None:
+                          saved.close()
+          except Exception as error:
+              report['errors'].append({'error': repr(error)})
+          finally:
+              signal.alarm(0)
+              (out / 'persistence.json').write_text(json.dumps(report, indent=2, default=str))
+          print('Retained restart snapshot', label, 'databases=', len(report['databases']), 'errors=', report['errors'])
+          sys.exit(int(bool(report['errors'])))
+          PY
+            snapshot_status=$?
+            return "$snapshot_status"
+          }
+          persist_dir=$(mktemp -d)
+          printf '%s\n' \
+            '<!DOCTYPE html>' \
+            '<html>' \
+            '<head><title>Cod Mac restart smoke</title></head>' \
+            '<body><h1>Cod Mac restart smoke</h1></body>' \
+            '</html>' \
+            > "$persist_dir/index.html"
+          persist_id=""
+          if "$app/Contents/MacOS/codctl" open "file://$persist_dir/index.html" \
+            > smoke-artifacts/codctl-open-p4.txt 2>&1; then
+            persist_id=$(tr -d '[:space:]' < smoke-artifacts/codctl-open-p4.txt)
+            if poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-before.txt 30; then
+              echo "P4 setup: the restart-check page is loaded ($persist_id), before quitting"
+            else
+              echo "::error::P4 FAIL: the restart-check page never loaded before the restart"
+              status=1
+            fi
+          else
+            echo "::error::P4 FAIL: codctl open file://$persist_dir/index.html failed"
+            cat smoke-artifacts/codctl-open-p4.txt || true
+            status=1
+          fi
+
+          snapshot_restart before-quit || status=1
+          cp "$data/logs/Zed.log" smoke-artifacts/restart-before-quit/zed.log 2>/dev/null || true
+          old_pid="$pid"
+          quit_started=$(date +%s)
+          quit_request_exit=0
+          # Bundle-addressed quit was observed to stop cod-browser while leaving
+          # the editor alive. Send normal Cmd-Q to the exact editor process, as
+          # the existing System Events input proof does, and require actual exit.
+          ps -p "$old_pid" -o pid=,ppid=,command= > smoke-artifacts/restart-editor-process.txt
+          osascript \
+            -e 'tell application "System Events"' \
+            -e "set editor_process to first process whose unix id is $old_pid" \
+            -e 'set frontmost of editor_process to true' \
+            -e 'tell editor_process to keystroke "q" using command down' \
+            -e 'end tell' \
+            > smoke-artifacts/restart-quit-stdout.txt 2> smoke-artifacts/restart-quit-stderr.txt || quit_request_exit=$?
+          graceful_exit=0
+          for _attempt in $(seq 1 30); do
+            if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+              graceful_exit=1
+              break
+            fi
+            sleep 1
+          done
+          echo "method=editor-pid-command-q old_pid=$old_pid request_exit=$quit_request_exit process_exited=$graceful_exit elapsed_seconds=$(( $(date +%s) - quit_started )) forced_signal=none" \
+            | tee smoke-artifacts/restart-quit-result.txt
+          snapshot_restart after-quit || status=1
+          cp "$data/logs/Zed.log" smoke-artifacts/restart-after-quit/zed.log 2>/dev/null || true
+          if [ "$graceful_exit" != "1" ] || [ "$quit_request_exit" != "0" ]; then
+            echo "::error::P4 FAIL: graceful quit did not complete; no restore acceptance from a forced shutdown"
+            status=1
+          fi
+
+          if [ -n "$persist_id" ] && [ "$graceful_exit" = "1" ] && [ "$quit_request_exit" = "0" ]; then
+            echo "== round 5 P4: relaunch and check the page was restored =="
+            open -n --env "COD_PREVIEW_DIR=$data" --env "COD_BROWSER_LOG_VERBOSE=1" \
+              --env "COD_E2E_SOCKET=$driver_dir/driver.sock" "$app" \
+              > smoke-artifacts/open-relaunch.txt 2>&1
+            sleep 20
+            pid=$(pgrep -f "$app/Contents/MacOS/zed" | head -n 1)
+            if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+              echo "::error::P4 FAIL: Cod is not running 20s after the relaunch"
+              status=1
+            elif poll_page_loaded "$persist_id" "Cod Mac restart smoke" smoke-artifacts/codctl-page-get-p4-after.txt 30; then
+              echo "P4 PASS: the page tab was restored and loaded after the restart, same id $persist_id"
+              if screencapture -x -t jpg smoke-artifacts/screen-after-restart.jpg 2> /dev/null; then
+                shrink_jpg smoke-artifacts/screen-after-restart.jpg
+              else
+                echo "::warning::P4 screenshot failed"
+              fi
+            else
+              echo "::error::P4 FAIL: the page was not restored as state=loaded title='Cod Mac restart smoke' within 30s of the relaunch"
+              cat smoke-artifacts/codctl-page-get-p4-after.txt 2> /dev/null || true
+              status=1
+            fi
+            snapshot_restart after-relaunch || status=1
+            if screencapture -x -t jpg smoke-artifacts/restart-actual-window.jpg 2>/dev/null; then
+              shrink_jpg smoke-artifacts/restart-actual-window.jpg
+            fi
+          fi
+
+          # Chat/file links, typed input and real in-page history were exercised above by
+          # macos_candidate_smoke.py with readouts and representative full-screen captures.
+
+          if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            osascript -e 'tell application "Cod" to quit' 2>/dev/null || kill "$pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+          kill "$fake_zed_pid" 2>/dev/null || true
+
+          cp "$data/logs/cod-stderr.log" smoke-artifacts/cod-stderr.log 2>/dev/null \
+            || echo "no cod-stderr.log was written" > smoke-artifacts/cod-stderr.log
+
+          # Round 2 diagnosis Q2: CEF's own log (crates/cod_browser/src/engine.rs sets
+          # Settings::log_file to <cache>/cef.log the same way on every platform, cache being
+          # data_dir.join("cef"), i.e. $data/cef/cef.log here) was never collected before, so any
+          # CEF-side CHECK/DCHECK or renderer-launch failure never reached the uploaded artifacts.
+          # Round 4 diagnosis H1 raises it to verbose (COD_BROWSER_LOG_VERBOSE=1 above) for this
+          # run; capped at 2 MB (tail, the most recent lines) in case verbose logging makes it large.
+          if [ -f "$data/cef/cef.log" ]; then
+            tail -c 2000000 "$data/cef/cef.log" > smoke-artifacts/cef.log
+          else
+            echo "no cef.log was written" > smoke-artifacts/cef.log
+          fi
+
+          # Round 2 diagnosis Q2: a crash report for cod-browser or its "Cod Helper" subprocess
+          # bundle, created after this run's launch, with its full content (unlike the zed/cod/
+          # codctl check above, kept name-only): this is a background helper this smoke test
+          # itself starts well after launch_epoch, through codctl open above, so its own crash
+          # reports need their own check, after that point, not the earlier one.
+          echo "== crash reports for cod-browser or Cod Helper since launch =="
+          if [ -d ~/Library/Logs/DiagnosticReports ]; then
+            found=0
+            while IFS= read -r -d '' report; do
+              mtime=$(stat -f %m "$report" 2>/dev/null || echo 0)
+              if [ "$mtime" -ge "$launch_epoch" ]; then
+                found=1
+                echo "::error::a crash report for cod-browser or Cod Helper appeared: $report"
+                cp "$report" "smoke-artifacts/$(basename "$report")"
+                cat "$report"
+                status=1
+              fi
+            done < <(find ~/Library/Logs/DiagnosticReports -maxdepth 1 -type f \
+              \( -iname 'cod-browser-*' -o -iname 'Cod Helper*' \) -print0 2>/dev/null)
+            [ "$found" = 1 ] || echo "none"
+          else
+            echo "none (no DiagnosticReports directory)"
+          fi
+
+          # AC-R1: Zed.log must be under $data, not under stock Zed's ~/Library/Logs/Zed
+          # (already checked above); a missing Zed.log here is itself a failure, not silently
+          # ignored, since it would mean the smoke test cannot tell whether Cod ever wrote one.
+          zed_log=$(find "$data" -iname "Zed.log" 2>/dev/null | head -n 1)
+          if [ -n "$zed_log" ]; then
+            cp "$zed_log" smoke-artifacts/zed.log
+          else
+            echo "::error::no Zed.log was found under $data"
+            status=1
+          fi
+
+          exit $status
+
+      # Retain the existing ordinary QA and planning beta on the changed package.
+      - name: Ordinary native package QA and focused beta
+        timeout-minutes: 8
+        env:
+          PYTHONPATH: tests/e2e
+          EXPECTED_COD_COMMIT: ${{ steps.reuse.outputs.commit || github.sha }}
+          EXPECTED_COD_VERSION: ${{ steps.reuse.outputs.run_number || github.run_number }}
+        run: |
+          set -euo pipefail
+          status=0
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          package=$(mktemp -d "${RUNNER_TEMP}/cod-ordinary-qa.XXXXXX")
+          ditto -x -k cod-macos-aarch64.zip "$package"
+          caffeinate -dimsu python3 - "$package/Cod.app" "$PWD/smoke-artifacts/ordinary-qa" \
+            > smoke-artifacts/ordinary-qa.log 2>&1 <<'PY' || status=$?
+          """Prepared ordinary macOS package walkthrough using the existing smoke Driver.
+
+          Run only inside the existing reviewed artifact-reuse workflow after its smoke
+          app has exited. No builds, provider sessions, new workflow or live credentials.
+          """
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import re
+          import shlex
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          from cod_e2e import Driver, cod_settings, make_repo, palette_problem
+          from test_25_workspace_tabs import contains_bounds
+
+          APP_HEAD = os.environ["EXPECTED_COD_COMMIT"]
+          APP_VERSION = os.environ["EXPECTED_COD_VERSION"]
+
+
+          def ordinary(app, output, theme, fresh):
+              output.mkdir(parents=True, exist_ok=False)
+              # Keep CEF cache and the whole temporary profile outside the artifact tree.
+              # The ephemeral runner owns this profile; preserve it for diagnosis until exit.
+              data = Path(tempfile.mkdtemp(prefix="cod-ordinary-profile-")).resolve()
+              repo = make_repo(data, "ordinary-notes", {"README.txt": "Existing release notes.\n"})
+              settings = cod_settings()
+              settings["theme"] = theme
+              (data / "config").mkdir()
+              (data / "config/settings.json").write_text(json.dumps(settings))
+              (output / "settings.json").write_text(json.dumps(settings, indent=2))
+              (output / "identity.json").write_text(json.dumps({
+                  "package_commit": APP_HEAD, "bundle_version": APP_VERSION, "app": str(app),
+                  "profile": str(data), "theme": theme, "scenario": "fresh QA" if fresh else "nonempty planning beta",
+                  "ordinary_window": [1000, 660], "narrow_window": [640, 600],
+              }, indent=2))
+              page = data / "reference.html"
+              page.write_text("<title>Ordinary release reference</title><h1>Release reference</h1>")
+              # Keep socket paths under Darwin's Unix socket length limit.
+              socket_dir = Path(tempfile.mkdtemp(prefix="cod-qa-", dir="/tmp"))
+              socket_path = socket_dir / "driver.sock"
+              command = ["open", "-n", "--env", f"COD_PREVIEW_DIR={data}",
+                         "--env", f"COD_E2E_SOCKET={socket_path}", str(app)]
+              if not fresh:
+                  command += ["--args", str(repo)]
+              subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
+              deadline = time.monotonic() + 30
+              while not socket_path.exists() and time.monotonic() < deadline:
+                  time.sleep(.1)
+              driver = Driver(socket_path)
+              pid_text = subprocess.check_output(["pgrep", "-f", str(app / "Contents/MacOS/zed")], text=True)
+              pids = [int(x) for x in pid_text.split()]
+              (output / "initial-pgrep-pids.json").write_text(json.dumps(pids))
+              assert 0 < len(pids) <= 32, ("unexpected package process count", pids)
+              # One snapshot avoids requiring a short-lived helper to survive between
+              # pgrep and ps. Retain only this bundle's commands, never unrelated processes.
+              process_snapshot = subprocess.run(
+                  ["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,command="],
+                  capture_output=True, text=True, timeout=10)
+              (output / "process-snapshot-stderr.txt").write_text(process_snapshot.stderr[-4096:])
+              process_snapshot.check_returncode()
+              expected_executable = str(app / "Contents/MacOS/zed")
+              observed = {}
+              editors = []
+              excluded = []
+              matching_lines = [line for line in process_snapshot.stdout.splitlines() if expected_executable in line]
+              (output / "initial-processes.txt").write_text("\n".join(matching_lines) + "\n")
+              for line in matching_lines:
+                  process_id, parent_id, command_line = line.split(None, 2)
+                  process_id = int(process_id)
+                  observed[process_id] = {"ppid": int(parent_id), "command": command_line}
+                  # The package also runs zed --printenv in a login-shell worker. Source
+                  # main.rs exits that explicit mode before UI startup. Keep its evidence.
+                  if re.search(r"(?:^|\s)--printenv(?:\s|$)", command_line):
+                      excluded.append(process_id)
+                  else:
+                      arguments = shlex.split(command_line)
+                      assert arguments[0] == expected_executable, ("unexpected package match", observed[process_id])
+                      assert arguments[1:3] == ["--user-data-dir", str(data)], ("unexpected profile", observed[process_id])
+                      editors.append(process_id)
+              (output / "process-selection.json").write_text(json.dumps({
+                  "initial_pids": pids, "observed": observed, "excluded_printenv": excluded, "editors": editors,
+                  "initial_pids_no_longer_present": sorted(set(pids) - set(observed)),
+              }, indent=2))
+              assert 0 < len(observed) <= 32, ("unexpected snapshot process count", observed)
+              assert len(editors) == 1, ("expected exactly one package UI editor", editors, observed)
+              pid = editors[0]
+
+              def os_window(statement):
+                  script = (f'tell application "System Events" to tell first process whose unix id is {pid} '
+                            f'to {statement}')
+                  return subprocess.check_output(["osascript", "-e", script], text=True, timeout=15).strip()
+
+              def wait(predicate, description, timeout=20):
+                  end = time.monotonic() + timeout
+                  state = None
+                  while time.monotonic() < end:
+                      state = driver.state()
+                      if predicate(state):
+                          return state
+                      time.sleep(.1)
+                  raise AssertionError((description, state))
+
+              def keys(value):
+                  driver.keys(value)
+
+              def action(name):
+                  keys("super-shift-p")
+                  wait(lambda s: s["modal"] == "command_palette", "palette")
+                  driver.type(name)
+                  wait(lambda s: palette_problem(name, s) is None, name)
+                  keys("enter")
+                  wait(lambda s: s["modal"] != "command_palette", "palette closed")
+
+              def tab_point(index, close=False):
+                  initial = driver.state()
+                  expected = [(workspace["id"], workspace["name"]) for workspace in initial["workspaces"]]
+                  assert initial["workspace_count"] == len(expected) and 0 <= index < len(expected), (index, initial)
+                  assert all(name is not None for _, name in expected), expected
+                  field = "close_bounds" if close else "bounds"
+
+                  def requested_tab_drawn(state):
+                      # Logical activation may precede this workspace title bar's paint.
+                      # Wait for exact identities and names, never use another tab's bounds.
+                      if state["workspace_count"] != len(expected) or state["active_workspace"] != initial["active_workspace"]:
+                          return False
+                      if [(workspace["id"], workspace["name"]) for workspace in state["workspaces"]] != expected:
+                          return False
+                      bar = state.get("title_bar") or {}
+                      tabs = bar.get("tabs", [])
+                      if [tab["name"] for tab in tabs] != [name for _, name in expected]:
+                          return False
+                      tab = tabs[index]
+                      bounds = tab.get(field)
+                      return (bounds is not None and bounds["width"] > 0 and bounds["height"] > 0
+                              and contains_bounds(bar["tabs_viewport"], tab["bounds"])
+                              and (not close or contains_bounds(tab["bounds"], bounds)))
+
+                  state = wait(requested_tab_drawn, f"named drawn workspace tab {index}")
+                  bounds = state["title_bar"]["tabs"][index][field]
+                  return dict(x=bounds["x"] + bounds["width"] / 2,
+                              y=bounds["y"] + bounds["height"] / 2)
+
+              def click_tab(index):
+                  driver.request("click", **tab_point(index))
+
+              def rename(name):
+                  action("workspace: rename workspace")
+                  wait(lambda s: s["rename_input"] is not None, "rename")
+                  driver.type(name)
+                  keys("enter")
+                  wait(lambda s: s["rename_input"] is None
+                       and s["workspaces"][s["active_workspace"]]["name"] == name, "renamed")
+
+              def capture(name):
+                  time.sleep(.7)
+                  state = driver.state()
+                  (output / (name + ".json")).write_text(json.dumps(state, indent=2))
+                  subprocess.run(["screencapture", "-x", "-t", "jpg", str(output / (name + ".jpg"))],
+                                 check=True, timeout=15)
+                  bar = state["title_bar"]
+                  active_tabs = [tab for tab in bar["tabs"] if tab["active"]]
+                  assert len(active_tabs) == 1, (name, bar)
+                  # Overflow may clip background tabs. The selected tab must be revealed,
+                  # matching the accepted narrow-window semantics of test_25_workspace_tabs.
+                  assert contains_bounds(bar["tabs_viewport"], active_tabs[0]["bounds"]), (name, active_tabs[0])
+                  for tab in bar["tabs"]:
+                      assert contains_bounds(tab["bounds"], tab["close_bounds"]), (name, tab)
+                  add = bar["add_button"]["bounds"]
+                  viewport = bar["tabs_viewport"]
+                  width = int(os_window("get size of front window").split(",")[0])
+                  assert add["x"] + add["width"] <= width + .5, (name, add, width)
+                  assert abs(add["x"] - viewport["x"] - viewport["width"]) <= 1, (name, bar)
+                  print("CAPTURE", theme, "fresh" if fresh else "nonempty", name, flush=True)
+
+              def retain_case_evidence():
+                  documents = {}
+                  for filename in ("README.txt", "release-notes.txt"):
+                      document = repo / filename
+                      documents[filename] = document.read_text() if document.is_file() else None
+                  (output / "saved-documents.json").write_text(json.dumps(documents, indent=2))
+                  for filename, limit in (("Zed.log", 512 * 1024), ("cod-stderr.log", 128 * 1024)):
+                      source = data / "logs" / filename
+                      if source.is_file():
+                          with source.open("rb") as log:
+                              log.seek(0, 2)
+                              log.seek(max(0, log.tell() - limit))
+                              (output / filename).write_bytes(log.read(limit))
+
+              def quit_and_retain():
+                  started = time.monotonic()
+                  receipt = {"method": "exact-editor-pid-command-q", "old_pid": pid,
+                             "request_exit": None, "process_exited": False, "forced_signal": "none"}
+                  try:
+                      # Same exact editor PID quit method proven by the existing workflow.
+                      request = subprocess.run([
+                          "osascript", "-e", f'tell application "System Events" to set frontmost of '
+                          f'(first process whose unix id is {pid}) to true', "-e",
+                          'tell application "System Events" to keystroke "q" using command down'],
+                          capture_output=True, text=True, timeout=15)
+                      receipt["request_exit"] = request.returncode
+                      receipt["request_stdout"] = request.stdout[-4096:]
+                      receipt["request_stderr"] = request.stderr[-4096:]
+                      end = time.monotonic() + 30
+                      while time.monotonic() < end:
+                          try:
+                              os.kill(pid, 0)
+                          except ProcessLookupError:
+                              receipt["process_exited"] = True
+                              break
+                          time.sleep(.1)
+                      assert request.returncode == 0 and receipt["process_exited"], (
+                          "ordinary QA editor must exit after Cmd-Q; no force-kill acceptance", receipt)
+                  finally:
+                      receipt["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                      (output / "quit-receipt.json").write_text(json.dumps(receipt, indent=2))
+                      driver.close()
+                      retain_case_evidence()
+
+              try:
+                  os_window("set frontmost to true")
+                  os_window("set position of front window to {0, 25}")
+                  # At y25, height660 ends at685 on the observed768px display, above its Dock.
+                  os_window("set size of front window to {1000, 660}")
+                  wait(lambda s: s["window_active"], "native window activation")
+                  if fresh:
+                      wait(lambda s: s["active_tab"] == "Onboarding", "fresh setup")
+                      capture("01-fresh-onboarding")
+                      # default-macos.json advertises cmd-enter for onboarding::Finish.
+                      keys("super-enter")
+                      wait(lambda s: s["active_tab"] != "Onboarding" and s["onboarding_header"] is None,
+                           "finish setup")
+                      action("workspace: add folder to project")
+                      wait(lambda s: s["path_prompt"] is not None, "folder picker")
+                      keys("super-a")
+                      driver.type(str(repo))
+                      wait(lambda s: s["path_prompt"] is not None and s["path_prompt"]["query"] == str(repo)
+                           and s["path_prompt"]["match_count"] == 1, "exact folder match")
+                      keys("enter")
+                      wait(lambda s: s["path_prompt"] is None and len(s["worktrees"]) == 1, "folder opened")
+                  keys("super-p")
+                  wait(lambda s: s["file_finder_ready"], "ordinary file finder")
+                  driver.type("README.txt")
+                  keys("enter")
+                  wait(lambda s: s["active_tab"] == "README.txt" and s["modal"] is None, "README opened")
+                  driver.type("QA draft: ")
+                  keys("super-s")
+                  wait(lambda s: not s["dirty_tabs"], "saved README")
+                  assert (repo / "README.txt").read_text() == "QA draft: Existing release notes.\n"
+                  # User creates a real file in the selected project, not a fixture write.
+                  keys("super-shift-e")
+                  wait(lambda s: s["project_panel"]["focused"], "project focus")
+                  keys("home super-n")
+                  driver.type("release-notes.txt")
+                  keys("enter")
+                  wait(lambda s: s["active_tab"] == "release-notes.txt", "created file")
+                  driver.type("Created in ordinary package QA.\n")
+                  keys("super-s")
+                  wait(lambda s: not s["dirty_tabs"], "created file saved")
+                  assert (repo / "release-notes.txt").read_text() == "Created in ordinary package QA.\n"
+                  rename("Release preparation and documentation notes")
+                  capture("02-created-saved-file")
+                  add = driver.state()["title_bar"]["add_button"]["bounds"]
+                  driver.request("click", x=add["x"] + add["width"] / 2, y=add["y"] + add["height"] / 2)
+                  wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "new workspace")
+                  rename("Planning and reference page review notes")
+                  action("web: open url")
+                  wait(lambda s: s["pages"]["prompt"] is not None, "URL prompt")
+                  driver.type(page.as_uri())
+                  keys("enter")
+                  state = wait(lambda s: any(p["active"] and p["state"] == "loaded"
+                                            and p["title"] == "Ordinary release reference" for p in s["pages"]["open"]),
+                               "ordinary reference page")
+                  page_id = next(p["id"] for p in state["pages"]["open"] if p["active"])
+                  capture("03-page-and-long-names")
+                  os_window("set size of front window to {640, 600}")
+                  assert os_window("get size of front window").split(",")[0].strip() == "640"
+                  driver.request("hover", **tab_point(0))
+                  capture("04-narrow-long-name")
+                  os_window("set size of front window to {1000, 660}")
+                  action("workspace: previous workspace")
+                  wait(lambda s: s["active_workspace"] == 0 and s["active_tab"] == "release-notes.txt", "file switch")
+                  if not fresh:
+                      # Focused beta persona: a planner returns from the reference to draft
+                      # a note, then tests whether canceling background close preserves it.
+                      driver.type("Beta planning draft.\n")
+                      wait(lambda s: s["dirty_tabs"] == ["release-notes.txt"], "beta unsaved planning note")
+                  click_tab(1)
+                  wait(lambda s: s["active_workspace"] == 1 and any(p["id"] == page_id and p["active"]
+                       and p["state"] == "loaded" for p in s["pages"]["open"]), "same page switch")
+                  if not fresh:
+                      driver.request("hover", **tab_point(0))
+                      driver.request("click", **tab_point(0, close=True))
+                      wait(lambda s: s["prompt"] is not None, "beta dirty-close consent")
+                      capture("05a-beta-dirty-close-consent")
+                      keys("escape")
+                      wait(lambda s: s["prompt"] is None and s["workspace_count"] == 2
+                           and s["active_workspace"] == 1 and s["active_tab"] == "Ordinary release reference",
+                           "beta Cancel preserves reference and both workspaces")
+                      assert (repo / "release-notes.txt").read_text() == "Created in ordinary package QA.\n"
+                      click_tab(0)
+                      state = wait(lambda s: s["active_workspace"] == 0 and s["active_tab"] == "release-notes.txt",
+                                   "beta draft still reachable")
+                      assert [entry["text"] for entry in state["unsaved_texts"]] == [
+                          "Created in ordinary package QA.\nBeta planning draft.\n"]
+                      keys("super-s")
+                      wait(lambda s: not s["dirty_tabs"], "beta explicit save")
+                      assert (repo / "release-notes.txt").read_text() == (
+                          "Created in ordinary package QA.\nBeta planning draft.\n")
+                      click_tab(1)
+                      wait(lambda s: s["active_workspace"] == 1 and s["active_tab"] == "Ordinary release reference",
+                           "beta reference after save")
+                  driver.request("hover", **tab_point(0))
+                  driver.request("click", **tab_point(0, close=True))
+                  wait(lambda s: s["workspace_count"] == 1 and s["active_tab"] == "Ordinary release reference",
+                       "clean background UI close")
+                  capture("05-after-close")
+                  print("PASS prepared scenario executed:", theme, "fresh focused QA" if fresh else "nonempty planning beta",
+                        flush=True)
+              finally:
+                  try:
+                      capture("final")
+                  finally:
+                      quit_and_retain()
+
+
+          if __name__ == "__main__":
+              app = Path(sys.argv[1]).resolve()
+              output = Path(sys.argv[2]).resolve()
+              assert (app / "Contents/Resources/cod-commit.txt").read_text().strip() == APP_HEAD
+              plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+              assert plist["CodCommit"] == APP_HEAD and plist["CFBundleVersion"] == APP_VERSION
+              assert sys.argv[3:] in ([], ["--nonempty-only"]), "optional --nonempty-only only"
+              cases = (("One Light", False),) if sys.argv[3:] else (("One Dark", True), ("One Light", False))
+              for theme, fresh in cases:
+                  ordinary(app, output / (theme.replace(" ", "-") + ("-fresh" if fresh else "-nonempty")), theme, fresh)
+          PY
+          cat smoke-artifacts/ordinary-qa.log
+          exit "$status"
+
+      - name: Working close provider lifetime on the extracted package
+        env:
+          EXPECTED_COD_COMMIT: ${{ steps.reuse.outputs.commit || github.sha }}
+          EXPECTED_COD_VERSION: ${{ steps.reuse.outputs.run_number || github.run_number }}
+        run: |
+          set -euo pipefail
+          export PYTHONPATH="$PWD/tests/e2e"
+          shasum -a 256 -c cod-macos-aarch64.zip.sha256
+          package=$(mktemp -d "${RUNNER_TEMP}/cod-provider-close.XXXXXX")
+          ditto -x -k cod-macos-aarch64.zip "$package"
+          python3 - "$package/Cod.app" "$PWD/smoke-artifacts/provider-close" <<'PY'
+          """Only explicit Working Close and provider process observation on retained Mac bytes."""
+          import json
+          import os
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          import time
+
+          from cod_e2e import Driver, cod_settings, make_repo, palette_problem
+          from fake_acp_agent import fake_agent_settings
+
+          app, output = (Path(x).resolve() for x in sys.argv[1:])
+          output.mkdir(parents=True, exist_ok=False)
+          head = os.environ["EXPECTED_COD_COMMIT"]
+          version = os.environ["EXPECTED_COD_VERSION"]
+          assert (app / "Contents/Resources/cod-commit.txt").read_text().strip() == head
+          plist = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+          assert plist["CodCommit"] == head and plist["CFBundleVersion"] == version
+          data = Path(tempfile.mkdtemp(prefix="cod-remaining-")).resolve()
+          repo = make_repo(data, "agent-safety-notes", {"README.txt": "Working close observation.\n"})
+          control = data / "advance-to-permission"
+          script = data / "agent.json"
+          script.write_text(json.dumps({"session_ids": ["mac-safety-session"], "turns": [{"steps": [
+              {"chunk": "Reviewing the release notes."}, {"wait": str(control)},
+              {"end": "end_turn"}]}]}))
+          settings = cod_settings()
+          settings["theme"] = "One Dark"
+          settings["agent_servers"] = {"claude-acp": fake_agent_settings(script, log=output / "fake-agent.log")}
+          (data / "config").mkdir()
+          (data / "config/settings.json").write_text(json.dumps(settings))
+          socket = Path(tempfile.mkdtemp(prefix="cod-rem-", dir="/tmp")) / "d.sock"
+          subprocess.run(["open", "-n", "--env", f"COD_PREVIEW_DIR={data}", "--env",
+                          f"COD_E2E_SOCKET={socket}", str(app), "--args", str(repo)],
+                         check=True, capture_output=True, text=True, timeout=30)
+          deadline = time.monotonic() + 30
+          while not socket.exists() and time.monotonic() < deadline:
+              time.sleep(.1)
+          driver = Driver(socket)
+          snapshot = subprocess.check_output(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,command="], text=True)
+          import shlex
+          editors = []
+          for line in snapshot.splitlines():
+              process_id, command = line.strip().split(None, 1)
+              args = shlex.split(command)
+              if args and args[0] == str(app / "Contents/MacOS/zed") and "--printenv" not in args:
+                  assert args[1:3] == ["--user-data-dir", str(data)], args
+                  editors.append(int(process_id))
+          assert len(editors) == 1, editors
+          pid = editors[0]
+          tracked = {}
+          (output / "identity.json").write_text(json.dumps({"source_commit": head, "version": version, "pid": pid,
+              "profile": str(data), "provider": "scripted fake ACP; no real-provider restore claim",
+              "shortcut_input": "native GPUI in-process driver keys/hover/click; System Events Cmd-Q only"}, indent=2))
+
+          def wait(predicate, description, timeout=25):
+              end = time.monotonic() + timeout
+              state = None
+              while time.monotonic() < end:
+                  state = driver.state()
+                  if predicate(state):
+                      return state
+                  time.sleep(.1)
+              raise AssertionError((description, state))
+
+          def keys(value):
+              driver.keys(value)
+
+          def action(name):
+              keys("super-shift-p")
+              wait(lambda s: s["modal"] == "command_palette", "palette")
+              driver.type(name)
+              wait(lambda s: palette_problem(name, s) is None, name)
+              keys("enter")
+              wait(lambda s: s["modal"] != "command_palette", "palette closed")
+
+          def os_key(letter):
+              subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
+                              f'(first process whose unix id is {pid}) to true', "-e",
+                              f'tell application "System Events" to keystroke "{letter}" using command down'],
+                             check=True, capture_output=True, text=True, timeout=15)
+
+          def capture(name):
+              time.sleep(.5)
+              (output / (name + ".json")).write_text(json.dumps(driver.state(), indent=2))
+              subprocess.run(["screencapture", "-x", "-t", "jpg", str(output / (name + ".jpg"))],
+                             check=True, timeout=15)
+              print("CAPTURE", name, flush=True)
+
+          def point(index, field="bounds"):
+              state = wait(lambda s: len(s["title_bar"]["tabs"]) == s["workspace_count"]
+                           and len(s["title_bar"]["tabs"]) > index
+                           and s["title_bar"]["tabs"][index][field]["width"] > 0, "drawn tab")
+              bounds = state["title_bar"]["tabs"][index][field]
+              return {"x": bounds["x"] + bounds["width"] / 2, "y": bounds["y"] + bounds["height"] / 2}
+
+          def close_background(status, label):
+              driver.request("hover", **point(0))
+              driver.request("click", **point(0, "close_bounds"))
+              state = wait(lambda s: s["prompt"] is not None, label + " prompt")
+              prompt = state["prompt"]
+              assert prompt["answers"] == ["Cancel", "Close"] and prompt["answers"][prompt["highlighted"]] == "Cancel", prompt
+              assert "agent-safety-notes" in prompt["message"] and "still working" in prompt["message"], prompt
+              assert state["workspaces"][0]["status"] == status, state["workspaces"]
+              capture(label + "-consent")
+
+          def processes():
+              rows = {}
+              raw = subprocess.check_output(["ps", "-ww", "-U", str(os.getuid()), "-o", "pid=,ppid=,lstart=,command="], text=True)
+              for line in raw.splitlines():
+                  fields = line.split(None, 7)
+                  if len(fields) == 8:
+                      rows[int(fields[0])] = {"pid": int(fields[0]), "ppid": int(fields[1]),
+                                            "started": " ".join(fields[2:7]), "command": fields[7]}
+              return rows
+
+          def provider_tree():
+              rows = processes()
+              provider = [p for p, row in rows.items() if "fake_acp_agent.py" in row["command"] and row["ppid"] == pid]
+              assert len(provider) == 1, {"matching_direct_providers": provider}
+              selected = set(provider)
+              while True:
+                  expanded = selected | {p for p, row in rows.items() if row["ppid"] in selected}
+                  if expanded == selected:
+                      break
+                  selected = expanded
+              return {p: rows[p] for p in selected}
+
+          try:
+              wait(lambda s: s["window_active"] and len(s["worktrees"]) == 1, "ordinary project window")
+              subprocess.run(["osascript", "-e", 'tell application "System Events" to tell '
+                              f'(first process whose unix id is {pid}) to set position of front window to {{0, 25}}',
+                              "-e", 'tell application "System Events" to tell '
+                              f'(first process whose unix id is {pid}) to set size of front window to {{1000, 660}}'], check=True)
+              wait(lambda s: s.get("agent_panel_ready") is True, "agent panel ready")
+              action("agent: toggle focus")
+              action("agent: toggle new thread menu")
+              keys("end up enter")
+              wait(lambda s: (s.get("chat") or {}).get("agent") == "claude-acp", "scripted ACP agent")
+              driver.type("Review these notes.")
+              keys("enter")
+              wait(lambda s: (s.get("chat") or {}).get("status") == "working"
+                   and "Reviewing the release notes." in (s.get("chat") or {}).get("transcript", ""), "real ACP working state")
+              agent_workspace = driver.state()["workspaces"][0]["id"]
+              action("workspace: new workspace")
+              state = wait(lambda s: s["workspace_count"] == 2 and s["active_workspace"] == 1, "second workspace")
+              shown = state["workspaces"][1]["id"]
+              close_background("working", "01-working-close")
+              tracked = provider_tree()
+              (output / "provider-before.json").write_text(json.dumps(list(tracked.values()), indent=2))
+              keys("right")
+              wait(lambda s: s["prompt"]["answers"][s["prompt"]["highlighted"]] == "Close", "Close selected")
+              keys("enter")
+              wait(lambda s: s["workspace_count"] == 1 and s["workspaces"][0]["id"] == shown, "explicit Close removes only target")
+              capture("02-surviving-workspace")
+              observation_start = time.monotonic()
+              end = observation_start + 12
+              survivors = tracked
+              while time.monotonic() < end:
+                  rows = processes()
+                  survivors = {p: rows[p] for p, before in tracked.items() if p in rows and rows[p]["started"] == before["started"]}
+                  # Include newly spawned children while a tracked process is still alive.
+                  for p, row in rows.items():
+                      if row["ppid"] in survivors and p not in tracked:
+                          tracked[p] = row
+                          survivors[p] = row
+                  if not survivors:
+                      break
+                  time.sleep(.1)
+              receipt = {"provider": "scripted fake ACP", "editor_pid": pid, "target_workspace": agent_workspace,
+                         "surviving_workspace": shown, "tracked": list(tracked.values()),
+                         "survivors_before_app_quit": list(survivors.values()), "budget_seconds": 12,
+                         "elapsed_seconds": time.monotonic() - observation_start,
+                         "forced_provider_signal": "none", "control_released": control.exists()}
+              (output / "provider-close-receipt.json").write_text(json.dumps(receipt, indent=2))
+              assert not survivors, receipt
+              assert not control.exists(), receipt
+              print("PASS explicit Working Close and observed provider tree gone before app quit; scripted ACP", flush=True)
+          finally:
+              try:
+                  capture("final")
+              finally:
+                  quit_started = time.monotonic()
+                  receipt = {"method": "exact-editor-native-Cmd-Q", "pid": pid, "forced_signal": "none"}
+                  try:
+                      os_key("q")
+                      end = time.monotonic() + 30
+                      while time.monotonic() < end:
+                          try:
+                              os.kill(pid, 0)
+                          except ProcessLookupError:
+                              receipt["exited"] = True
+                              break
+                          time.sleep(.1)
+                      assert receipt.get("exited"), receipt
+                  finally:
+                      receipt["elapsed_seconds"] = time.monotonic() - quit_started
+                      rows = processes()
+                      receipt["tracked_provider_survivors"] = [rows[p] for p, before in tracked.items()
+                          if p in rows and rows[p]["started"] == before["started"]]
+                      (output / "quit-receipt.json").write_text(json.dumps(receipt, indent=2))
+                      driver.close()
+                      for name in ("Zed.log", "cod-stderr.log"):
+                          source = data / "logs" / name
+                          if source.is_file():
+                              (output / name).write_bytes(source.read_bytes()[-512 * 1024:])
+          PY
+
+      - name: Upload the zip and its checksum
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-aarch64
+          path: |
+            cod-macos-aarch64.zip
+            cod-macos-aarch64.zip.sha256
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload app logs and smoke outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cod-macos-smoke
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Only a push event whose ref is exactly macos-preview/publish, or a workflow_dispatch run
+      # with its publish input set to true, makes a prerelease; both halves of each arm are
+      # required, so a manual dispatch that merely targets the macos-preview/publish branch
+      # without publish=true does not publish (a dispatch run's github.ref already equals
+      # whatever branch it is run against, which is exactly what let that happen before this
+      # fix). Every other run (macos-preview/dev and any other macos-preview/* branch) only
+      # builds, checks and smoke-tests, so trying this workflow never creates a release by itself.
+      # The tag always carries the run number, so this step only ever creates a new release: it
+      # never edits or deletes one that exists already.
+      - name: Publish a macOS preview prerelease
+        if: >-
+          !steps.reuse.outputs.commit &&
+          ((github.event_name == 'push' && github.ref == 'refs/heads/macos-preview/publish') ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish == true))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="macos-preview-${{ github.run_number }}"
+          gh release create "$tag" cod-macos-aarch64.zip cod-macos-aarch64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "$tag (macOS, Apple Silicon, unsigned)" \
+            --notes "Cod preview for Apple Silicon macOS, built from $GITHUB_SHA. Unsigned (ad-hoc signature only): see the README for how to open it. Apple Silicon only, no Intel build. Page tabs and restricted agent-made HTML pages use the same off-screen CEF backend as Linux."

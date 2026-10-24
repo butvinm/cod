@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::item::test::TestItem;
+use crate::multi_workspace::{cod_clear_last_focused_window, cod_set_last_focused_window};
 use agent_settings::AgentSettings;
 use client::proto;
 use fs::{FakeFs, Fs};
@@ -1918,4 +1920,125 @@ async fn test_cod_pending_tab_press_matches_its_loaded_tab(cx: &mut TestAppConte
     multi_workspace.read_with(cx, |multi_workspace, _| {
         assert_eq!(multi_workspace.workspace(), &pay);
     });
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_goes_to_the_last_focused_window(cx: &mut TestAppContext) {
+    // Issue #77 C3: with two windows and no active window (nothing has keyboard focus, as in
+    // the headless test compositor that first found this), a shared action like "zed: show
+    // welcome" must reach the window that was focused most recently, not whichever `cx.windows()`
+    // happens to enumerate last.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let workspace_b = window_b
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let windows_before = cx.update(|cx| cx.windows().len());
+
+    // The test platform makes the newest window active; leave no window active so the fallbacks are what is tested.
+    if let Some(active) = cx.update(|cx| cx.active_window()) {
+        VisualTestContext::from_window(active, cx).deactivate_window();
+    }
+
+    // B was focused, then the OLDER window A. The last-resort fallback (the last window `cx.windows()` lists) picks B here, so only the last-focused record can make the action reach A.
+    cx.update(|cx| cod_set_last_focused_window(window_b, cx));
+    cx.update(|cx| cod_set_last_focused_window(window_a, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the last-focused older window A, not the fallback window B"
+    );
+
+    // Clearing B's record (as B's window releasing would) while A is the current record must not clear A's.
+    cx.update(|cx| cod_clear_last_focused_window(window_b, cx));
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "clearing a different window's record must not clear the current one"
+    );
+
+    // Once A's own record is cleared (A releasing), nothing is recorded: the action still reaches an already-open window (which one is slot order, not a promise), never a new one.
+    cx.update(|cx| cod_clear_last_focused_window(window_a, cx));
+    let reached = cod_workspace_reached_without_active_window(cx);
+    assert!(
+        reached == workspace_a || reached == workspace_b,
+        "with no record the action falls back to an open window's workspace"
+    );
+    assert_eq!(
+        cx.update(|cx| cx.windows().len()),
+        windows_before,
+        "no new window may be opened while a Cod window is open"
+    );
+}
+
+#[gpui::test]
+async fn test_with_active_or_new_workspace_follows_real_window_activation(
+    cx: &mut TestAppContext,
+) {
+    // Issue #77 C3, end to end through the activation observer `MultiWorkspace::new` registers: the platform reports B active and then the older A active, then focus leaves every window (as when a command palette entry closes). The action must reach A.
+    init_test(cx);
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+    let project_a = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let project_b = Project::test(app_state.fs.clone(), [path!("/project_b").as_ref()], cx).await;
+
+    let window_a = cx.add_window(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let window_b = cx.add_window(|window, cx| MultiWorkspace::test_new(project_b, window, cx));
+    cx.run_until_parked();
+    let workspace_a = window_a
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+
+    window_b
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    window_a
+        .update(cx, |_, window, _| window.activate_window())
+        .unwrap();
+    cx.run_until_parked();
+    VisualTestContext::from_window(window_a.into(), cx).deactivate_window();
+
+    assert_eq!(
+        cod_workspace_reached_without_active_window(cx),
+        workspace_a,
+        "expected the action to reach the window the platform last reported active (A)"
+    );
+}
+
+/// Runs `with_active_or_new_workspace` while no window is active and returns the workspace the action reached.
+fn cod_workspace_reached_without_active_window(cx: &mut TestAppContext) -> Entity<Workspace> {
+    assert_eq!(
+        cx.update(|cx| cx.active_window()),
+        None,
+        "precondition: no window is active, so the fallbacks are what is tested"
+    );
+    // `with_active_or_new_workspace` requires a `Send` callback, so the result travels through an `Arc<Mutex<_>>`.
+    let seen: Arc<Mutex<Option<Entity<Workspace>>>> = Arc::new(Mutex::new(None));
+    cx.update(|cx| {
+        let seen = seen.clone();
+        with_active_or_new_workspace(cx, move |_workspace, _window, cx| {
+            seen.lock().unwrap().replace(cx.entity().clone());
+        });
+    });
+    cx.run_until_parked();
+    seen.lock().unwrap().take().expect("the action reached a workspace")
 }

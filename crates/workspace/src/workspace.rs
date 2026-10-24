@@ -32,6 +32,10 @@ mod workspace_settings;
 
 pub use dock::Panel;
 pub use multi_workspace::{
+    COD_UNNAMED_WORKSPACE, CodShownName, is_unnamed_default, member_name_and_folders,
+    tab_display_name,
+};
+pub use multi_workspace::{
     CloseWorkspace, CodMember, NewWorkspace, NextWorkspace, PreviousWorkspace, RenameWorkspace,
     RenameWorkspaceModal, cod_workspace_name, cod_workspace_name_by_id,
 };
@@ -10007,6 +10011,14 @@ impl Render for Workspace {
                         .tab_group()
                         .role(gpui::Role::Toolbar)
                         .aria_label("Title bar")
+                        .on_action(cx.listener(|_, _: &menu::SelectNext, window, cx| {
+                            window.focus_next(cx);
+                            cx.notify();
+                        }))
+                        .on_action(cx.listener(|_, _: &menu::SelectPrevious, window, cx| {
+                            window.focus_prev(cx);
+                            cx.notify();
+                        }))
                         .on_key_down(cx.listener(
                             |workspace, event: &gpui::KeyDownEvent, window, cx| {
                                 if event.keystroke.modifiers.modified() {
@@ -13280,10 +13292,27 @@ pub fn with_active_or_new_workspace(
     cx: &mut App,
     f: impl FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send + 'static,
 ) {
-    match cx
+    // Cod #77 V1/C3: `cx.active_window()` is the window with keyboard focus, which the platform
+    // does not always report right away (for example right after a command palette entry closes
+    // and before focus returns to the window behind it); a headless compositor with no keyboard
+    // never reports one. Opening a new window then gave a fresh profile a second, mostly-empty
+    // window on its first command (Show Welcome after closing onboarding). The first fallback is
+    // the last Cod window the platform reported active that is still open
+    // (`multi_workspace::cod_last_focused_window`). The last resort, when no window was ever
+    // reported active, is any open `MultiWorkspace` window: the last one `cx.windows()` lists,
+    // which is slot order, not focus or creation order. Any open window is a safer target than
+    // a new one for a shared, window-agnostic action like this.
+    let multi_workspace = cx
         .active_window()
         .and_then(|w| w.downcast::<MultiWorkspace>())
-    {
+        .or_else(|| multi_workspace::cod_last_focused_window(cx))
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .rev()
+                .find_map(|window| window.downcast::<MultiWorkspace>())
+        });
+    match multi_workspace {
         Some(multi_workspace) => {
             cx.defer(move |cx| {
                 multi_workspace

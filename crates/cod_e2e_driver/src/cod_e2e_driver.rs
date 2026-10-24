@@ -23,6 +23,7 @@ mod cod_chat_state;
 mod cod_markdown_preview_state;
 mod cod_overview_state;
 mod cod_tabs_state;
+mod cod_welcome_state;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -124,6 +125,15 @@ pub enum Request {
     /// A left click at a window position, with the control key held when `ctrl` is set (#25, see
     /// `cod_tabs_state`; the control modifier was added for #32 AC3's Ctrl-click on a URL).
     Click { x: f32, y: f32, ctrl: bool },
+    /// Moves the mouse to a window position without pressing a button, so a test can check a
+    /// hover style (issue #77: the workspace tabs' hover background and close control).
+    Hover { x: f32, y: f32 },
+    /// Presses the left button at a window position without releasing it (issue #77 C1: a test
+    /// changes what the release would act on, for example removing another workspace through
+    /// codctl, between this and `MouseUp`).
+    MouseDown { x: f32, y: f32 },
+    /// Releases the left button at a window position, the other half of `MouseDown`.
+    MouseUp { x: f32, y: f32 },
     /// The test fixture that sets a session or page status (#25, see `cod_tabs_state`).
     SetEntry(cod_tabs_state::SetEntry),
 }
@@ -140,6 +150,18 @@ enum WireRequest {
         #[serde(default)]
         ctrl: bool,
     },
+    Hover {
+        x: f32,
+        y: f32,
+    },
+    MouseDown {
+        x: f32,
+        y: f32,
+    },
+    MouseUp {
+        x: f32,
+        y: f32,
+    },
     SetEntry(cod_tabs_state::SetEntry),
 }
 
@@ -154,6 +176,18 @@ pub fn parse_request(line: &str) -> Result<Request> {
         WireRequest::Click { x, y, ctrl } => {
             cod_tabs_state::check_click(x, y)?;
             Request::Click { x, y, ctrl }
+        }
+        WireRequest::Hover { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::Hover { x, y }
+        }
+        WireRequest::MouseDown { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::MouseDown { x, y }
+        }
+        WireRequest::MouseUp { x, y } => {
+            cod_tabs_state::check_click(x, y)?;
+            Request::MouseUp { x, y }
         }
         WireRequest::SetEntry(entry) => {
             cod_tabs_state::check_set_entry(&entry)?;
@@ -413,6 +447,9 @@ async fn run(
         Request::Click { x, y, ctrl } => {
             cod_tabs_state::click(x, y, ctrl, memory, cx).await.map(|()| None)
         }
+        Request::Hover { x, y } => cod_tabs_state::hover(x, y, memory, cx).await.map(|()| None),
+        Request::MouseDown { x, y } => cod_tabs_state::mouse_down(x, y, memory, cx).await.map(|()| None),
+        Request::MouseUp { x, y } => cod_tabs_state::mouse_up(x, y, memory, cx).await.map(|()| None),
         Request::SetEntry(entry) => cod_tabs_state::set_entry(entry, memory, cx).map(|()| None),
         Request::State => {
             // Counted outside update_window: while a window is being updated, App::windows leaves it out.
@@ -664,6 +701,9 @@ fn read_state(
                         .map(|path| path.to_string_lossy().into_owned())
                         .collect();
                     return json!({
+                        // #77 C5: a stable identity, so a test can tell two workspaces of the
+                        // same (or now-numbered) name apart instead of asserting by position.
+                        "id": i64::from(*id),
                         "name": workspace::cod_workspace_name_by_id(*id, cx),
                         "worktrees": worktrees,
                         "drawn": false,
@@ -680,6 +720,7 @@ fn read_state(
                 }
             }
             json!({
+                "id": MultiWorkspace::cod_member_id(member, cx).map(i64::from),
                 "name": workspace_name(workspace, cx),
                 "worktrees": worktrees_of(workspace.read(cx), cx),
                 "drawn": drawn,
@@ -895,6 +936,8 @@ fn read_state(
     state["chat_tabs"] = cod_chat_state::chat_tabs_state(workspace, cx);
     state["agent_panel_ready"] = json!(cod_chat_state::agent_panel_ready(window, cx));
     state["agent_panel_focused"] = json!(cod_chat_state::agent_panel_focused(workspace, window, cx));
+    state["welcome"] = cod_welcome_state::state(workspace, cx);
+    state["onboarding_header"] = cod_welcome_state::onboarding_header(workspace, cx);
     Ok(state)
 }
 
@@ -1230,6 +1273,14 @@ mod tests {
         assert_eq!(
             parse_request(r#"{"cmd":"click","x":12.5,"y":4,"ctrl":true}"#).unwrap(),
             Request::Click { x: 12.5, y: 4., ctrl: true }
+        );
+    }
+
+    #[test]
+    fn parses_hover() {
+        assert_eq!(
+            parse_request(r#"{"cmd":"hover","x":12.5,"y":4}"#).unwrap(),
+            Request::Hover { x: 12.5, y: 4. }
         );
     }
 

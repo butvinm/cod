@@ -802,7 +802,7 @@ impl OffscreenView {
         let Some(code) = windows_key_code(keystroke) else {
             return;
         };
-        page.key(protocol::KEY_RAW_DOWN, code, 0, flags);
+        page.key(protocol::KEY_RAW_DOWN, code, raw_key_character(keystroke), flags);
         let typed = if keystroke.modifiers.control
             || keystroke.modifiers.alt
             || keystroke.modifiers.platform
@@ -833,7 +833,7 @@ impl OffscreenView {
         page.key(
             protocol::KEY_UP,
             code,
-            0,
+            raw_key_character(&event.keystroke),
             modifier_flags(&event.keystroke.modifiers, None),
         );
         cx.stop_propagation();
@@ -1143,6 +1143,59 @@ fn windows_key_code(keystroke: &Keystroke) -> Option<i32> {
         }
     };
     Some(code)
+}
+
+/// The character of a key-down or key-up event sent to the page: none (0) on Linux, as always;
+/// on macOS the character macOS itself gives that key (#23 macOS key input). CEF on macOS builds
+/// its key event from that character and a macOS key code (`cod_browser`'s engine derives the
+/// key code from it), and takes an event with no character at all for a modifier change, so
+/// without it Tab, Enter, Backspace and the arrows never reached a page there.
+fn raw_key_character(keystroke: &Keystroke) -> u16 {
+    if cfg!(target_os = "macos") {
+        mac_key_character(keystroke)
+    } else {
+        0
+    }
+}
+
+/// The character macOS puts in a key event for this key: the `NS*FunctionKey` private-use
+/// characters for arrows, Home, End, Page Up and Down, forward Delete, Insert (Help) and F1 to
+/// F12, 0x7F for Backspace, and the typed character (or the key itself) for every other single
+/// character key. 0 for a key with none.
+fn mac_key_character(keystroke: &Keystroke) -> u16 {
+    match keystroke.key.as_str() {
+        "backspace" => 0x7F,
+        "tab" => 0x09,
+        "enter" => 0x0D,
+        "escape" => 0x1B,
+        "space" => 0x20,
+        "up" => 0xF700,
+        "down" => 0xF701,
+        "left" => 0xF702,
+        "right" => 0xF703,
+        "insert" => 0xF746,
+        "delete" => 0xF728,
+        "home" => 0xF729,
+        "end" => 0xF72B,
+        "pageup" => 0xF72C,
+        "pagedown" => 0xF72D,
+        key if function_key_number(key).is_some() => {
+            function_key_number(key).map_or(0, |number| 0xF703 + number as u16)
+        }
+        key => {
+            let single = |text: &str| {
+                let mut units = text.encode_utf16();
+                let first = units.next()?;
+                units.next().is_none().then_some(first)
+            };
+            keystroke
+                .key_char
+                .as_deref()
+                .and_then(single)
+                .or_else(|| single(key))
+                .unwrap_or(0)
+        }
+    }
 }
 
 /// 1 to 12 for "f1" to "f12".
@@ -1754,6 +1807,39 @@ mod tests {
         assert_eq!(windows_key_code(&keystroke("f1")), Some(0x70));
         assert_eq!(windows_key_code(&keystroke("f5")), Some(0x74));
         assert_eq!(windows_key_code(&keystroke("f12")), Some(0x7B));
+    }
+
+    // #23 macOS key input: CEF on macOS takes a key event with no character for a modifier
+    // change, so every key Cod forwards there carries the character macOS gives it.
+    #[test]
+    fn macos_key_characters_are_the_ones_macos_itself_gives() {
+        assert_eq!(mac_key_character(&keystroke("tab")), 0x09);
+        assert_eq!(mac_key_character(&keystroke("enter")), 0x0D);
+        assert_eq!(mac_key_character(&keystroke("backspace")), 0x7F);
+        assert_eq!(mac_key_character(&keystroke("left")), 0xF702);
+        assert_eq!(mac_key_character(&keystroke("delete")), 0xF728);
+        assert_eq!(mac_key_character(&keystroke("f1")), 0xF704);
+        assert_eq!(mac_key_character(&keystroke("f12")), 0xF70F);
+        assert_eq!(mac_key_character(&keystroke("a")), u16::from(b'a'));
+        let shifted = Keystroke {
+            modifiers: Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            key: "a".into(),
+            key_char: Some("A".into()),
+        };
+        assert_eq!(mac_key_character(&shifted), u16::from(b'A'));
+        assert_eq!(mac_key_character(&keystroke("shift")), 0);
+    }
+
+    // Linux keeps sending no character with a key-down or key-up, exactly as before.
+    #[test]
+    fn raw_key_events_carry_no_character_off_macos() {
+        if !cfg!(target_os = "macos") {
+            assert_eq!(raw_key_character(&keystroke("tab")), 0);
+            assert_eq!(raw_key_character(&keystroke("a")), 0);
+        }
     }
 
     #[test]

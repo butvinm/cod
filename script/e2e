@@ -163,8 +163,17 @@ trap 'exit 130' INT TERM HUP
 
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET SWAYSOCK I3SOCK
 export XDG_RUNTIME_DIR="$runtime"
+# Cod #77 reproduction: COD_E2E_OUTPUT_MODE overrides the output line of sway.conf, for example
+# "1280x800" or "2560x1600 scale 2", so a test can check a specific window size. Unset, the
+# tracked tests/e2e/sway.conf (1440x900 scale 1) is used as before.
+sway_conf="$root/tests/e2e/sway.conf"
+if [ -n "${COD_E2E_OUTPUT_MODE:-}" ]; then
+    sway_conf="$work/sway.conf"
+    sed "s/^output HEADLESS-1 resolution .*/output HEADLESS-1 resolution ${COD_E2E_OUTPUT_MODE}/" \
+        "$root/tests/e2e/sway.conf" > "$sway_conf"
+fi
 WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
-    sway --unsupported-gpu -c "$root/tests/e2e/sway.conf" > "$COD_E2E_ARTIFACTS/sway.log" 2>&1 &
+    sway --unsupported-gpu -c "$sway_conf" > "$COD_E2E_ARTIFACTS/sway.log" 2>&1 &
 sway_pid=$!
 socket=
 for _ in $(seq 1 100); do

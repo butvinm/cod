@@ -101,8 +101,8 @@ pub(crate) fn bounds_json(bounds: Option<Bounds<Pixels>>) -> Value {
 }
 
 /// The title bar of the active workspace as it was last drawn: `{"tabs": [{"name", "active",
-/// "dot", "pulsing", "tooltip", "truncated", "bounds"}], "add_button": {"bounds"}, "items": [...]}`,
-/// or null when the workspace has no Cod title bar.
+/// "dot", "pulsing", "tooltip", "truncated", "visible", "bounds", "close_bounds"}], "add_button":
+/// {"bounds"}, "items": [...]}`, or null when the workspace has no Cod title bar.
 pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value {
     let Some(title_bar) = workspace
         .read(cx)
@@ -120,6 +120,8 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
             json!({
                 "name": tab.name,
                 "active": tab.active,
+                "focused": tab.focused,
+                "close_focused": tab.close_focused,
                 // Review #25/#26: the dot's color and pulsing come from what the title bar
                 // actually prepainted and animated in the last frame, not from the workspace's
                 // status (crates/title_bar/src/cod_workspace_tabs.rs::status_dot).
@@ -127,12 +129,17 @@ pub(crate) fn title_bar_state(workspace: &Entity<Workspace>, cx: &App) -> Value 
                 "pulsing": tab.pulsing,
                 "tooltip": tab.tooltip,
                 "truncated": tab.truncated(),
+                // #81: the label as drawn, with an ellipsis where it was cut.
+                "visible": tab.visible,
                 "bounds": bounds_json(tab.bounds),
+                // #77 F3: None for a pending (not yet loaded) member, which has no close button.
+                "close_bounds": bounds_json(tab.close_bounds),
             })
         })
         .collect();
     json!({
         "tabs": tabs,
+        "tabs_viewport": bounds_json(layout.tabs_viewport),
         "add_button": { "bounds": bounds_json(layout.add_button) },
         "items": title_bar.cod_visible_items(cx),
     })
@@ -196,6 +203,98 @@ pub(crate) async fn click(
         })
         .context("the workspace window closed")?;
     }
+    Ok(())
+}
+
+/// Moves the mouse to the position and presses the left button there, without releasing it
+/// (issue #77 C1: a test needs to change what is under a held press, for example removing
+/// another workspace through codctl, before the matching `mouse_up`).
+#[cfg(unix)]
+pub(crate) async fn mouse_down(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    for event in [
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }),
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+    ] {
+        let window = cx
+            .update(|cx| super::workspace_window(cx, &memory.borrow()))
+            .context("Cod has no workspace window")?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.dispatch_event(event, cx);
+        })
+        .context("the workspace window closed")?;
+    }
+    Ok(())
+}
+
+/// Releases the left button at the position, the other half of `mouse_down`.
+#[cfg(unix)]
+pub(crate) async fn mouse_up(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    let window = cx
+        .update(|cx| super::workspace_window(cx, &memory.borrow()))
+        .context("Cod has no workspace window")?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    })
+    .context("the workspace window closed")?;
+    Ok(())
+}
+
+/// Moves the mouse to the position without pressing a button, the way a person rests the pointer
+/// over a tab before clicking it.
+#[cfg(unix)]
+pub(crate) async fn hover(
+    x: f32,
+    y: f32,
+    memory: &std::rc::Rc<std::cell::RefCell<super::Memory>>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let position = point(px(x), px(y));
+    let event = PlatformInput::MouseMove(MouseMoveEvent {
+        position,
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    });
+    let window = cx
+        .update(|cx| super::workspace_window(cx, &memory.borrow()))
+        .context("Cod has no workspace window")?;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.dispatch_event(event, cx);
+    })
+    .context("the workspace window closed")?;
+    // #77 C5: waits for the window to actually draw the hover style, the same frame-completion
+    // wait `settle_frames` already gives key presses, instead of a fixed delay that does not
+    // establish the frame reached the compositor before a pixel-sampling assertion runs.
+    super::settle_frames(memory, cx).await;
     Ok(())
 }
 
